@@ -7,6 +7,7 @@ import csv
 import html
 import json
 import mimetypes
+import math
 import os
 import secrets
 import sqlite3
@@ -32,6 +33,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
+from backend.ai.providers import AIProviderError
 from backend.ai.config import PROFILE_NAMES
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
@@ -320,7 +322,35 @@ def process_next_job() -> bool:
                 while chunk := source.read(1024 * 1024): digest.update(chunk)
             if digest.hexdigest() != evidence["sha256"]: raise ValueError("integrity_mismatch")
             now = utc_now()
-            if job["job_type"] == "document_extract":
+            if job["job_type"] == "semantic_embed":
+                chunks = db.execute("SELECT id,text,text_sha256 FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=? ORDER BY section_index,chunk_index", (job["evidence_id"], job["tenant_id"], job["case_id"])).fetchall()
+                if not chunks:
+                    raise ValueError("extracted_chunks_missing")
+                provider = ai_provider()
+                vectors: list[list[float]] = []
+                for offset in range(0, len(chunks), 16):
+                    vectors.extend(provider.create_embeddings([chunk["text"] for chunk in chunks[offset:offset + 16]], AI_CONFIG.embedding_model))
+                if len(vectors) != len(chunks):
+                    raise ValueError("embedding_count_mismatch")
+                db.execute("DELETE FROM evidence_chunk_embeddings WHERE evidence_id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+                dimensions = 0
+                for chunk, vector in zip(chunks, vectors):
+                    clean_vector = [float(value) for value in vector]
+                    if not clean_vector or not all(math.isfinite(value) for value in clean_vector):
+                        raise ValueError("invalid_embedding_vector")
+                    if dimensions and len(clean_vector) != dimensions:
+                        raise ValueError("embedding_dimension_mismatch")
+                    dimensions = len(clean_vector)
+                    norm = math.sqrt(sum(value * value for value in clean_vector))
+                    if norm <= 0:
+                        raise ValueError("zero_embedding_vector")
+                    db.execute(
+                        "INSERT INTO evidence_chunk_embeddings (chunk_id,evidence_id,tenant_id,case_id,model,dimensions,vector_json,vector_norm,source_text_sha256,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (chunk["id"], job["evidence_id"], job["tenant_id"], job["case_id"], AI_CONFIG.embedding_model, dimensions, json.dumps(clean_vector, separators=(",", ":")), norm, chunk["text_sha256"], now, now),
+                    )
+                db.execute("UPDATE evidence SET embedding_status='ready',embedding_error='' WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "EVIDENCE_SEMANTIC_INDEXED", "evidence", job["evidence_id"], {"job_id": job["id"], "chunks": len(chunks), "dimensions": dimensions, "model": AI_CONFIG.embedding_model}, scope)
+            elif job["job_type"] == "document_extract":
                 sections = extract_document(path, evidence["media_type"])
                 db.execute("DELETE FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
                 character_count = 0
@@ -343,6 +373,11 @@ def process_next_job() -> bool:
                     (job["evidence_id"], job["tenant_id"], job["case_id"], extraction_status, character_count, len(sections), engine, evidence["sha256"], "", now, now),
                 )
                 db.execute("UPDATE evidence SET extraction_status=?,extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (extraction_status, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                if chunk_count:
+                    active_embedding = db.execute("SELECT 1 FROM processing_jobs WHERE evidence_id=? AND job_type='semantic_embed' AND status IN ('pending','processing')", (job["evidence_id"],)).fetchone()
+                    if not active_embedding:
+                        enqueue_processing_job(db, job["evidence_id"], scope, "semantic_embed")
+                    db.execute("UPDATE evidence SET embedding_status='queued',embedding_error='' WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
                 audit(db, "EVIDENCE_TEXT_EXTRACTED", "evidence", job["evidence_id"], {"job_id": job["id"], "characters": character_count, "chunks": chunk_count, "sections": len(sections), "engine": engine}, scope)
             else:
                 db.execute("UPDATE evidence SET processing_status='ready',processing_error='',detected_media_type=CASE WHEN detected_media_type='' THEN media_type ELSE detected_media_type END WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
@@ -360,7 +395,11 @@ def process_next_job() -> bool:
             terminal = current["attempts"] >= current["max_attempts"] or code == "integrity_mismatch"
             status = "failed" if terminal else "pending"
             db.execute("UPDATE processing_jobs SET status=?,error_code=?,available_at=?,updated_at=? WHERE id=?", (status, code, utc_now(), utc_now(), job["id"]))
-            if job["job_type"] == "document_extract":
+            if job["job_type"] == "semantic_embed":
+                embedding_status = "failed" if terminal else "queued"
+                db.execute("UPDATE evidence SET embedding_status=?,embedding_error=? WHERE id=? AND tenant_id=? AND case_id=?", (embedding_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "EVIDENCE_SEMANTIC_INDEX_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
+            elif job["job_type"] == "document_extract":
                 extraction_status = "failed" if terminal else "queued"
                 db.execute("UPDATE evidence SET extraction_status=?,extraction_error=? WHERE id=? AND tenant_id=? AND case_id=?", (extraction_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
                 audit(db, "EVIDENCE_TEXT_EXTRACTION_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
@@ -435,6 +474,11 @@ class AISettingsUpdate(BaseModel):
     activeProfile: str
 
 
+class SemanticSearchPayload(BaseModel):
+    query: str = Field(min_length=2, max_length=1000)
+    limit: int = Field(default=8, ge=1, le=20)
+
+
 def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
     return {
         "id": row["id"], "date": row["date"], "time": row["time"],
@@ -461,6 +505,8 @@ def evidence_dict(row: sqlite3.Row) -> dict:
     if "processing_error" in keys: result["processingError"] = row["processing_error"]
     if "extraction_status" in keys: result["extractionStatus"] = row["extraction_status"]
     if "extraction_error" in keys: result["extractionError"] = row["extraction_error"]
+    if "embedding_status" in keys: result["embeddingStatus"] = row["embedding_status"]
+    if "embedding_error" in keys: result["embeddingError"] = row["embedding_error"]
     return result
 
 
@@ -651,6 +697,68 @@ def update_ai_settings(payload: AISettingsUpdate, request: Request) -> dict:
         db.execute("UPDATE ai_settings SET active_profile=?,updated_at=? WHERE id=1", (profile, utc_now()))
         audit(db, "AI_PROFILE_CHANGED", "ai_settings", "local", {"profile": profile, "model": selected["model"]})
     return ai_status_payload()
+
+
+@app.post("/api/ai/search")
+def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
+    query = payload.query.strip()
+    with database() as db:
+        scope = authorized_scope(request, db)
+    try:
+        query_vector = ai_provider().create_embeddings([query], AI_CONFIG.embedding_model)[0]
+    except (AIProviderError, IndexError, ValueError) as error:
+        raise HTTPException(503, "La búsqueda local no está disponible. Comprobá que Ollama y el modelo de embeddings estén activos") from error
+    query_vector = [float(value) for value in query_vector]
+    query_norm = math.sqrt(sum(value * value for value in query_vector))
+    if not query_vector or query_norm <= 0:
+        raise HTTPException(503, "El modelo local no pudo interpretar la consulta")
+    with database() as db:
+        rows = db.execute(
+            """SELECT x.vector_json,x.vector_norm,x.dimensions,c.text,c.text_sha256,c.section_label,c.section_index,c.chunk_index,c.extraction_method,
+                      e.id evidence_id,e.original_name,e.sha256 evidence_sha256,e.fact_date,e.event_id
+               FROM evidence_chunk_embeddings x
+               JOIN evidence_text_chunks c ON c.id=x.chunk_id AND c.text_sha256=x.source_text_sha256
+               JOIN evidence e ON e.id=x.evidence_id AND e.tenant_id=x.tenant_id AND e.case_id=x.case_id
+               WHERE x.tenant_id=? AND x.case_id=? AND x.model=? AND e.embedding_status='ready'""",
+            (scope["tenant_id"], scope["case_id"], AI_CONFIG.embedding_model),
+        ).fetchall()
+        results = []
+        for row in rows:
+            if row["dimensions"] != len(query_vector) or row["vector_norm"] <= 0:
+                continue
+            vector = json.loads(row["vector_json"])
+            score = sum(left * float(right) for left, right in zip(query_vector, vector)) / (query_norm * row["vector_norm"])
+            results.append({
+                "score": round(max(-1.0, min(1.0, score)), 6),
+                "evidenceId": row["evidence_id"], "evidenceName": row["original_name"], "evidenceHash": row["evidence_sha256"],
+                "factDate": row["fact_date"], "eventId": row["event_id"], "sectionLabel": row["section_label"],
+                "sectionIndex": row["section_index"], "chunkIndex": row["chunk_index"], "text": row["text"],
+                "textHash": row["text_sha256"], "method": row["extraction_method"],
+            })
+        results.sort(key=lambda item: item["score"], reverse=True)
+        selected = results[:payload.limit]
+        audit(db, "SEMANTIC_SEARCH_EXECUTED", "case", scope["case_id"], {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(), "results": len(selected), "model": AI_CONFIG.embedding_model}, scope)
+        indexed_evidence = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND embedding_status='ready'", (scope["tenant_id"], scope["case_id"])).fetchone()[0]
+        return {"query": query, "model": AI_CONFIG.embedding_model, "indexedEvidence": indexed_evidence, "results": selected}
+
+
+@app.post("/api/ai/index/retry")
+def retry_semantic_index(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        candidates = db.execute(
+            """SELECT e.id FROM evidence e
+               WHERE e.tenant_id=? AND e.case_id=? AND e.extraction_status='ready'
+               AND EXISTS (SELECT 1 FROM evidence_text_chunks c WHERE c.evidence_id=e.id)
+               AND NOT EXISTS (SELECT 1 FROM processing_jobs j WHERE j.evidence_id=e.id AND j.job_type='semantic_embed' AND j.status IN ('pending','processing'))
+               AND NOT EXISTS (SELECT 1 FROM evidence_chunk_embeddings x WHERE x.evidence_id=e.id AND x.model=?)""",
+            (scope["tenant_id"], scope["case_id"], AI_CONFIG.embedding_model),
+        ).fetchall()
+        for candidate in candidates:
+            enqueue_processing_job(db, candidate["id"], scope, "semantic_embed")
+            db.execute("UPDATE evidence SET embedding_status='queued',embedding_error='' WHERE id=? AND tenant_id=? AND case_id=?", (candidate["id"], scope["tenant_id"], scope["case_id"]))
+        audit(db, "SEMANTIC_INDEX_RETRY_REQUESTED", "case", scope["case_id"], {"queued": len(candidates), "model": AI_CONFIG.embedding_model}, scope)
+        return {"queued": len(candidates), "model": AI_CONFIG.embedding_model}
 
 
 @app.get("/api/events")

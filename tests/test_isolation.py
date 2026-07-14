@@ -10,6 +10,7 @@ class IsolationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         os.environ["GORE_DATA_DIR"] = cls.temp.name
+        os.environ["AI_PROVIDER"] = "mock"
         from backend import app as app_module
         from fastapi.testclient import TestClient
 
@@ -81,6 +82,18 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(extraction_status, "ready")
         self.assertIn("Texto de prueba juridica", extracted.json()["chunks"][0]["text"])
         self.assertEqual(extracted.json()["summary"]["source_sha256"], first.json()["hash"])
+        embedding_status = "queued"
+        for _ in range(80):
+            indexed = self.client.get("/api/evidence").json()
+            embedding_status = next(item for item in indexed if item["id"] == evidence_id)["embeddingStatus"]
+            if embedding_status == "ready":
+                break
+            time.sleep(0.05)
+        self.assertEqual(embedding_status, "ready")
+        search = self.client.post("/api/ai/search", json={"query": "prueba juridica", "limit": 5})
+        self.assertEqual(search.status_code, 200, search.text)
+        self.assertEqual(search.json()["results"][0]["evidenceId"], evidence_id)
+        self.assertEqual(search.json()["results"][0]["textHash"], extracted.json()["chunks"][0]["text_sha256"])
 
         duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
         self.assertEqual(duplicate.status_code, 201, duplicate.text)

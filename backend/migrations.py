@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 def _utc_now() -> str:
@@ -218,10 +218,48 @@ def _migration_003_document_extraction(db: sqlite3.Connection) -> None:
         )
 
 
+def _migration_004_semantic_embeddings(db: sqlite3.Connection) -> None:
+    now = _utc_now()
+    _add_column(db, "evidence", "embedding_status TEXT NOT NULL DEFAULT 'not_applicable'")
+    _add_column(db, "evidence", "embedding_error TEXT NOT NULL DEFAULT ''")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_chunk_embeddings (
+            chunk_id TEXT PRIMARY KEY REFERENCES evidence_text_chunks(id) ON DELETE CASCADE,
+            evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id),
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            vector_json TEXT NOT NULL,
+            vector_norm REAL NOT NULL,
+            source_text_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_scope
+            ON evidence_chunk_embeddings (tenant_id,case_id,evidence_id,model);
+        """
+    )
+    columns = _columns(db, "evidence")
+    required = {"id", "tenant_id", "case_id", "created_by", "extraction_status"}
+    if required.issubset(columns) and _table_exists(db, "evidence_text_chunks"):
+        db.execute("UPDATE evidence SET embedding_status='queued' WHERE extraction_status='ready' AND EXISTS (SELECT 1 FROM evidence_text_chunks c WHERE c.evidence_id=evidence.id)")
+        db.execute(
+            """INSERT OR IGNORE INTO processing_jobs
+                (id,tenant_id,case_id,evidence_id,job_type,status,available_at,created_by,created_at,updated_at)
+                SELECT 'JOB-EMBED-' || id,tenant_id,case_id,id,'semantic_embed','pending',?,created_by,?,?
+                FROM evidence WHERE extraction_status='ready'
+                AND EXISTS (SELECT 1 FROM evidence_text_chunks c WHERE c.evidence_id=evidence.id)""",
+            (now, now, now),
+        )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
     3: _migration_003_document_extraction,
+    4: _migration_004_semantic_embeddings,
 }
 
 
