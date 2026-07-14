@@ -48,6 +48,10 @@ WHISPER_MODEL = None
 WHISPER_MODEL_NAME = "small"
 WHISPER_LOCK = threading.Lock()
 AI_CONFIG = load_ai_config()
+MAX_EVIDENCE_BYTES = max(1, min(int(os.environ.get("GORE_MAX_EVIDENCE_MB", "500")), 2048)) * 1024 * 1024
+ALLOWED_EVIDENCE_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".opus", ".ogg", ".oga", ".mp3", ".m4a", ".aac", ".wav", ".amr", ".webm", ".mp4", ".mov", ".avi"}
+PROCESSING_WORKER_STARTED = False
+PROCESSING_WORKER_LOCK = threading.Lock()
 
 app = FastAPI(
     title="GORE API",
@@ -115,6 +119,32 @@ def authorized_scope(request: Request, db: sqlite3.Connection) -> dict:
     if not membership:
         raise HTTPException(403, "No tenés acceso al expediente solicitado")
     return {**session, "case_role": membership["role"]}
+
+
+def detect_media_type(filename: str, prefix: bytes) -> str:
+    extension = Path(filename).suffix.lower()
+    if extension not in ALLOWED_EVIDENCE_EXTENSIONS:
+        raise HTTPException(415, "El formato del archivo no está permitido")
+    if prefix.startswith(b"%PDF-") and extension == ".pdf": return "application/pdf"
+    if prefix.startswith(b"PK\x03\x04") and extension == ".docx": return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if prefix.startswith(b"PK\x03\x04") and extension == ".xlsx": return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if prefix.startswith(b"\xff\xd8\xff") and extension in {".jpg", ".jpeg"}: return "image/jpeg"
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n") and extension == ".png": return "image/png"
+    if prefix.startswith((b"GIF87a", b"GIF89a")) and extension == ".gif": return "image/gif"
+    if prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP" and extension == ".webp": return "image/webp"
+    if prefix.startswith(b"OggS") and extension in {".opus", ".ogg", ".oga"}: return "audio/ogg"
+    if prefix.startswith(b"RIFF") and prefix[8:12] == b"WAVE" and extension == ".wav": return "audio/wav"
+    if (prefix.startswith(b"ID3") or prefix[:2] in {b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"}) and extension == ".mp3": return "audio/mpeg"
+    if prefix.startswith(b"#!AMR") and extension == ".amr": return "audio/amr"
+    if len(prefix) >= 12 and prefix[4:8] == b"ftyp" and extension in {".m4a", ".aac"}: return "audio/mp4"
+    if len(prefix) >= 12 and prefix[4:8] == b"ftyp" and extension in {".mp4", ".mov"}: return "video/mp4"
+    if prefix.startswith(b"\x1a\x45\xdf\xa3") and extension == ".webm": return "video/webm"
+    if extension == ".avi" and prefix.startswith(b"RIFF") and prefix[8:12] == b"AVI ": return "video/x-msvideo"
+    if extension == ".txt" and b"\x00" not in prefix:
+        try: prefix.decode("utf-8")
+        except UnicodeDecodeError: pass
+        else: return "text/plain"
+    raise HTTPException(415, "La extensión no coincide con el contenido real del archivo")
 
 
 def init_database() -> None:
@@ -238,17 +268,88 @@ def init_database() -> None:
         apply_migrations(db, DB_PATH, DATA_DIR / "backups")
 
 
-def audit(db: sqlite3.Connection, action: str, entity_type: str, entity_id: str, details: dict | None = None) -> None:
+def audit(db: sqlite3.Connection, action: str, entity_type: str, entity_id: str, details: dict | None = None, scope: dict | None = None) -> None:
     last = db.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
     previous_hash = last["entry_hash"] if last else "GENESIS"
     occurred_at = utc_now()
     details_json = json.dumps(details or {}, sort_keys=True, ensure_ascii=False)
     material = "|".join([previous_hash, occurred_at, "Propietario", action, entity_type, entity_id, details_json])
     entry_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    tenant_id = scope["tenant_id"] if scope else DEFAULT_TENANT_ID
+    user_id = scope["user_id"] if scope else DEFAULT_USER_ID
+    case_id = scope["case_id"] if scope else DEFAULT_CASE_ID
     db.execute(
         "INSERT INTO audit_log (occurred_at, actor, action, entity_type, entity_id, details_json, previous_hash, entry_hash, tenant_id, user_id, case_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (occurred_at, "Propietario", action, entity_type, entity_id, details_json, previous_hash, entry_hash, DEFAULT_TENANT_ID, DEFAULT_USER_ID, DEFAULT_CASE_ID),
+        (occurred_at, "Propietario", action, entity_type, entity_id, details_json, previous_hash, entry_hash, tenant_id, user_id, case_id),
     )
+
+
+def enqueue_processing_job(db: sqlite3.Connection, evidence_id: str, scope: dict, job_type: str = "secure_intake") -> str:
+    job_id = f"JOB-{uuid.uuid4().hex[:16].upper()}"
+    now = utc_now()
+    db.execute(
+        "INSERT INTO processing_jobs (id,tenant_id,case_id,evidence_id,job_type,status,available_at,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (job_id, scope["tenant_id"], scope["case_id"], evidence_id, job_type, "pending", now, scope["user_id"], now, now),
+    )
+    return job_id
+
+
+def process_next_job() -> bool:
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        job = db.execute("SELECT * FROM processing_jobs WHERE status='pending' AND available_at<=? ORDER BY created_at LIMIT 1", (utc_now(),)).fetchone()
+        if not job:
+            db.rollback()
+            return False
+        now = utc_now()
+        updated = db.execute("UPDATE processing_jobs SET status='processing',attempts=attempts+1,started_at=?,updated_at=? WHERE id=? AND status='pending'", (now, now, job["id"])).rowcount
+        if not updated:
+            db.rollback()
+            return False
+        db.commit()
+    scope = {"tenant_id": job["tenant_id"], "case_id": job["case_id"], "user_id": job["created_by"]}
+    try:
+        with database() as db:
+            evidence = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"])).fetchone()
+            if not evidence: raise FileNotFoundError("evidence_missing")
+            path = FILES_DIR / evidence["stored_name"]
+            if not path.is_file(): raise FileNotFoundError("original_missing")
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024): digest.update(chunk)
+            if digest.hexdigest() != evidence["sha256"]: raise ValueError("integrity_mismatch")
+            now = utc_now()
+            db.execute("UPDATE evidence SET processing_status='ready',processing_error='',detected_media_type=CASE WHEN detected_media_type='' THEN media_type ELSE detected_media_type END WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+            db.execute("UPDATE processing_jobs SET status='completed',completed_at=?,updated_at=?,error_code='' WHERE id=?", (now, now, job["id"]))
+            audit(db, "EVIDENCE_INTAKE_VERIFIED", "evidence", job["evidence_id"], {"job_id": job["id"], "sha256_verified": True}, scope)
+    except Exception as error:
+        code = str(error) if str(error) in {"evidence_missing", "original_missing", "integrity_mismatch"} else type(error).__name__
+        with database() as db:
+            current = db.execute("SELECT attempts,max_attempts FROM processing_jobs WHERE id=?", (job["id"],)).fetchone()
+            terminal = current["attempts"] >= current["max_attempts"] or code == "integrity_mismatch"
+            status = "failed" if terminal else "pending"
+            evidence_status = "quarantined" if code == "integrity_mismatch" else ("failed" if terminal else "pending")
+            db.execute("UPDATE processing_jobs SET status=?,error_code=?,available_at=?,updated_at=? WHERE id=?", (status, code, utc_now(), utc_now(), job["id"]))
+            db.execute("UPDATE evidence SET processing_status=?,processing_error=? WHERE id=? AND tenant_id=? AND case_id=?", (evidence_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
+            audit(db, "EVIDENCE_INTAKE_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
+    return True
+
+
+def processing_worker() -> None:
+    while True:
+        try:
+            worked = process_next_job()
+        except Exception:
+            worked = False
+        time.sleep(0.25 if worked else 1.5)
+
+
+def start_processing_worker() -> None:
+    global PROCESSING_WORKER_STARTED
+    with PROCESSING_WORKER_LOCK:
+        if PROCESSING_WORKER_STARTED: return
+        PROCESSING_WORKER_STARTED = True
+        threading.Thread(target=processing_worker, name="gore-processing-worker", daemon=True).start()
 
 
 class EventCreate(BaseModel):
@@ -309,7 +410,7 @@ def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
 
 
 def evidence_dict(row: sqlite3.Row) -> dict:
-    return {
+    result = {
         "id": row["id"], "name": row["original_name"], "size": row["size"],
         "type": row["media_type"], "hash": row["sha256"], "addedAt": row["added_at"],
         "eventId": row["event_id"], "deviceOrigin": row["device_origin"],
@@ -318,6 +419,11 @@ def evidence_dict(row: sqlite3.Row) -> dict:
         "matchDetails": row["match_details"],
         "incorporatedBy": row["incorporated_by"],
     }
+    keys = set(row.keys())
+    if "processing_status" in keys: result["processingStatus"] = row["processing_status"]
+    if "detected_media_type" in keys: result["detectedType"] = row["detected_media_type"]
+    if "processing_error" in keys: result["processingError"] = row["processing_error"]
+    return result
 
 
 def whatsapp_chat_dict(row: sqlite3.Row, include_content: bool = True) -> dict:
@@ -335,6 +441,7 @@ def whatsapp_chat_dict(row: sqlite3.Row, include_content: bool = True) -> dict:
 @app.on_event("startup")
 def startup() -> None:
     init_database()
+    start_processing_worker()
 
 
 @app.get("/api/health")
@@ -582,9 +689,12 @@ async def upload_evidence(
 ) -> dict:
     if not file.filename:
         raise HTTPException(400, "El archivo debe conservar su nombre original")
+    if Path(file.filename).suffix.lower() not in ALLOWED_EVIDENCE_EXTENSIONS:
+        raise HTTPException(415, "El formato del archivo no está permitido")
+    with database() as db:
+        scope = authorized_scope(request, db)
     if chat_message_ref:
         with database() as db:
-            scope = authorized_scope(request, db)
             existing = db.execute("SELECT * FROM evidence WHERE chat_message_ref=? AND tenant_id=? AND case_id=?", (chat_message_ref, scope["tenant_id"], scope["case_id"])).fetchone()
             if existing:
                 return evidence_dict(existing)
@@ -593,28 +703,41 @@ async def upload_evidence(
     destination = FILES_DIR / stored_name
     digest = hashlib.sha256()
     size = 0
+    prefix = b""
     try:
         with destination.open("xb") as output:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
+                if size > MAX_EVIDENCE_BYTES:
+                    raise HTTPException(413, f"El archivo supera el límite de {MAX_EVIDENCE_BYTES // 1024 // 1024} MB")
+                if len(prefix) < 4096: prefix += chunk[:4096 - len(prefix)]
                 digest.update(chunk)
                 output.write(chunk)
     except Exception:
         destination.unlink(missing_ok=True)
         raise
     sha256 = digest.hexdigest()
-    media_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+    try:
+        media_type = detect_media_type(file.filename, prefix)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
     added_at = utc_now()
     with database() as db:
-        scope = authorized_scope(request, db)
+        duplicate = db.execute("SELECT * FROM evidence WHERE tenant_id=? AND case_id=? AND sha256=? ORDER BY added_at LIMIT 1", (scope["tenant_id"], scope["case_id"], sha256)).fetchone()
+        if duplicate:
+            destination.unlink(missing_ok=True)
+            audit(db, "EVIDENCE_DUPLICATE_DETECTED", "evidence", duplicate["id"], {"name": file.filename, "sha256": sha256}, scope)
+            return evidence_dict(duplicate)
         if event_id and not db.execute("SELECT 1 FROM events WHERE id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone():
             destination.unlink(missing_ok=True)
             raise HTTPException(404, "El acontecimiento relacionado no existe")
         db.execute(
-            "INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (evidence_id, file.filename, stored_name, media_type, size, sha256, device_origin, event_id, added_at, fact_date, chat_message_ref, match_confidence, match_details, scope["tenant_id"], scope["case_id"], scope["user_id"]),
+            "INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details,tenant_id,case_id,created_by,detected_media_type,processing_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (evidence_id, file.filename, stored_name, media_type, size, sha256, device_origin, event_id, added_at, fact_date, chat_message_ref, match_confidence, match_details, scope["tenant_id"], scope["case_id"], scope["user_id"], media_type, "pending"),
         )
-        audit(db, "EVIDENCE_INCORPORATED", "evidence", evidence_id, {"name": file.filename, "size": size, "sha256": sha256, "source_ip": request.client.host if request.client else "unknown"})
+        job_id = enqueue_processing_job(db, evidence_id, scope)
+        audit(db, "EVIDENCE_INCORPORATED", "evidence", evidence_id, {"name": file.filename, "size": size, "sha256": sha256, "job_id": job_id, "source_ip": request.client.host if request.client else "unknown"}, scope)
         row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
         return evidence_dict(row)
 
@@ -635,6 +758,30 @@ def download_evidence(evidence_id: str, request: Request) -> FileResponse:
             raise HTTPException(409, "Falló la verificación de integridad del original")
         audit(db, "EVIDENCE_DOWNLOADED", "evidence", evidence_id, {"sha256_verified": True})
         return FileResponse(path, media_type=row["media_type"], filename=row["original_name"])
+
+
+@app.get("/api/evidence/{evidence_id}/processing")
+def get_evidence_processing(evidence_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        evidence = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not evidence: raise HTTPException(404, "Evidencia no encontrada")
+        jobs = db.execute("SELECT id,job_type,status,attempts,max_attempts,created_at,started_at,completed_at,error_code FROM processing_jobs WHERE evidence_id=? AND tenant_id=? AND case_id=? ORDER BY created_at DESC", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchall()
+        return {"evidence": evidence_dict(evidence), "jobs": [dict(job) for job in jobs]}
+
+
+@app.post("/api/evidence/{evidence_id}/processing/retry")
+def retry_evidence_processing(evidence_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        evidence = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not evidence: raise HTTPException(404, "Evidencia no encontrada")
+        active = db.execute("SELECT id FROM processing_jobs WHERE evidence_id=? AND tenant_id=? AND case_id=? AND status IN ('pending','processing')", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if active: return {"jobId": active["id"], "status": "already_pending"}
+        job_id = enqueue_processing_job(db, evidence_id, scope)
+        db.execute("UPDATE evidence SET processing_status='pending',processing_error='' WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"]))
+        audit(db, "EVIDENCE_PROCESSING_RETRIED", "evidence", evidence_id, {"job_id": job_id}, scope)
+        return {"jobId": job_id, "status": "pending"}
 
 
 @app.post("/api/imports/whatsapp-package", status_code=201)
@@ -694,7 +841,8 @@ async def import_whatsapp_package(request: Request, file: Annotated[UploadFile, 
                 media_type = str(media_item.get("mimeType") or mimetypes.guess_type(original_name)[0] or "application/octet-stream"); added_at = utc_now()
                 details = f"Capturado secuencialmente desde una burbuja específica por la extensión GORE {source.get('extensionVersion', '')}; manifiesto y SHA-256 verificados por el servidor."
                 db.execute("INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (evidence_id, original_name, stored_name, media_type, len(entry["content"]), media_item["sha256"], "Extensión GORE para Chrome", None, added_at, entry["fact_date"], message_ref, "captured", details, scope["tenant_id"], scope["case_id"], scope["user_id"]))
-                audit(db, "WHATSAPP_AUDIO_CAPTURED", "evidence", evidence_id, {"message_ref": message_ref, "sha256": media_item["sha256"], "source_ip": request.client.host if request.client else "unknown"})
+                job_id = enqueue_processing_job(db, evidence_id, scope)
+                audit(db, "WHATSAPP_AUDIO_CAPTURED", "evidence", evidence_id, {"message_ref": message_ref, "sha256": media_item["sha256"], "job_id": job_id, "source_ip": request.client.host if request.client else "unknown"}, scope)
                 row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone(); imported.append({"messageId": message.get("id"), "evidence": evidence_dict(row)})
             audit(db, "WHATSAPP_PACKAGE_IMPORTED", "whatsapp_chat", chat_key, {"package": Path(file.filename).name, "audio_count": len(imported), "schema_version": 1})
     except Exception:

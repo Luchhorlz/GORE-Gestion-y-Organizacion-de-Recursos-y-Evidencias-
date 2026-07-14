@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -52,6 +53,33 @@ class IsolationTests(unittest.TestCase):
             self.assertEqual(self.client.get("/api/workspace").status_code, 403)
         finally:
             session["case_id"] = original_case
+
+    def test_secure_upload_is_verified_and_duplicate_is_reused(self):
+        content = b"Texto de prueba juridica para verificar el original."
+        first = self.client.post("/api/evidence", files={"file": ("prueba.txt", content, "application/octet-stream")})
+        self.assertEqual(first.status_code, 201, first.text)
+        evidence_id = first.json()["id"]
+        status = "pending"
+        for _ in range(40):
+            processing = self.client.get(f"/api/evidence/{evidence_id}/processing")
+            self.assertEqual(processing.status_code, 200, processing.text)
+            status = processing.json()["evidence"]["processingStatus"]
+            if status == "ready":
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, "ready")
+        self.assertEqual(processing.json()["jobs"][0]["status"], "completed")
+
+        duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
+        self.assertEqual(duplicate.status_code, 201, duplicate.text)
+        self.assertEqual(duplicate.json()["id"], evidence_id)
+        self.assertEqual(len(self.client.get("/api/evidence").json()), 1)
+
+    def test_disguised_or_unsupported_file_is_rejected(self):
+        fake_pdf = self.client.post("/api/evidence", files={"file": ("falso.pdf", b"esto no es un PDF", "application/pdf")})
+        self.assertEqual(fake_pdf.status_code, 415)
+        executable = self.client.post("/api/evidence", files={"file": ("programa.exe", b"MZ", "application/octet-stream")})
+        self.assertEqual(executable.status_code, 415)
 
 
 if __name__ == "__main__":

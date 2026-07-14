@@ -22,7 +22,7 @@ type EventItem = {
   description: string; privateNotes?: string; expected?: string; actual?: string;
   evidenceCount: number; status: 'Borrador' | 'Pendiente de revisión' | 'Revisado'
 }
-type Evidence = { id: string; name: string; size: number; type: string; hash: string; addedAt: string; eventId?: string; factDate?: string; chatMessageRef?: string; matchConfidence?: string; matchDetails?: string }
+type Evidence = { id: string; name: string; size: number; type: string; hash: string; addedAt: string; eventId?: string; factDate?: string; chatMessageRef?: string; matchConfidence?: string; matchDetails?: string; processingStatus?: string; detectedType?: string; processingError?: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -166,7 +166,7 @@ function App() {
         </div>
       </main>
       {eventModal && <EventModal initial={selectedEvent} initialDate={newEventDate} close={() => setEventModal(false)} save={async (event) => { await saveEvent(event); setEventModal(false) }} />}
-      {selectedDay && <DayModal date={selectedDay} events={events} evidence={evidence} close={() => setSelectedDay(null)} openEvent={(event) => { setSelectedDay(null); openEvent(event) }} newEvent={() => { setNewEventDate(selectedDay); setSelectedDay(null); setSelectedEvent(null); setEventModal(true) }} onEvidence={(item) => setEvidence(prev => [item, ...prev])} />}
+      {selectedDay && <DayModal date={selectedDay} events={events} evidence={evidence} close={() => setSelectedDay(null)} openEvent={(event) => { setSelectedDay(null); openEvent(event) }} newEvent={() => { setNewEventDate(selectedDay); setSelectedDay(null); setSelectedEvent(null); setEventModal(true) }} onEvidence={(item) => setEvidence(prev => [item, ...prev.filter(existing => existing.id !== item.id)])} />}
     </div>
   )
 }
@@ -245,41 +245,54 @@ function DayModal({ date, events, evidence, close, openEvent, newEvent, onEviden
   const dayEvidence = evidence.filter(item => item.factDate === date || (item.eventId && eventIds.has(item.eventId)))
   const [relatedEvent, setRelatedEvent] = useState(dayEvents[0]?.id ?? '')
   const [processing, setProcessing] = useState(false)
+  const [uploadError, setUploadError] = useState('')
   async function upload(files: FileList | null) {
     if (!files?.length) return
-    setProcessing(true)
+    setProcessing(true); setUploadError('')
     try { for (const file of Array.from(files)) onEvidence(await apiUpload<Evidence>('/api/evidence', file, relatedEvent || undefined, date)) }
+    catch { setUploadError('El archivo fue rechazado por las reglas de seguridad o no pudo incorporarse.') }
     finally { setProcessing(false) }
   }
   const readable = format(new Date(`${date}T12:00:00`), "EEEE d 'de' MMMM 'de' yyyy", { locale: es })
-  return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && close()}><div className="modal day-modal"><div className="modal-head"><div><span className="eyebrow accent">VISTA DIARIA</span><h2>{readable}</h2><p>{dayEvents.length} acontecimiento{dayEvents.length === 1 ? '' : 's'} · {dayEvidence.length} evidencia{dayEvidence.length === 1 ? '' : 's'}</p></div><button type="button" onClick={close}><X /></button></div><div className="day-modal-content"><section><div className="day-section-head"><div><h3>Acontecimientos del día</h3><span>Todo lo registrado para esta fecha</span></div><button className="text-button" onClick={newEvent}><Plus size={16} /> Agregar</button></div>{dayEvents.length ? <div className="day-event-list">{dayEvents.map((event, index) => <EventRow event={event} last={index === dayEvents.length - 1} onOpen={openEvent} key={event.id} />)}</div> : <div className="day-empty"><CalendarDays /><strong>No hay acontecimientos cargados</strong><p>Podés crear el primero manteniendo seleccionada esta fecha.</p><button className="primary-button" onClick={newEvent}><Plus size={16} /> Crear acontecimiento</button></div>}</section><section><div className="day-section-head"><div><h3>Evidencias del día</h3><span>Fotos, documentos, audios o conversaciones</span></div></div>{dayEvents.length > 0 && <label className="day-related">Asociar también con<select value={relatedEvent} onChange={event => setRelatedEvent(event.target.value)}><option value="">Solo con la fecha</option>{dayEvents.map(event => <option value={event.id} key={event.id}>{event.title}</option>)}</select></label>}<label className={`day-upload ${processing ? 'processing' : ''}`}><input type="file" multiple onChange={event => upload(event.target.files)} /><Upload /><div><strong>{processing ? 'Preservando originales…' : 'Adjuntar evidencias'}</strong><span>Imágenes, documentos, audios, videos o exportaciones</span></div></label>{dayEvidence.length > 0 && <div className="day-files">{dayEvidence.map(item => <div key={item.id}><FileCheck2 /><span><strong>{item.name}</strong><small>SHA-256 registrado</small></span><a href={evidenceDownloadUrl(item.id)}><Download /></a></div>)}</div>}</section></div></div></div>
+  return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && close()}><div className="modal day-modal"><div className="modal-head"><div><span className="eyebrow accent">VISTA DIARIA</span><h2>{readable}</h2><p>{dayEvents.length} acontecimiento{dayEvents.length === 1 ? '' : 's'} · {dayEvidence.length} evidencia{dayEvidence.length === 1 ? '' : 's'}</p></div><button type="button" onClick={close}><X /></button></div><div className="day-modal-content"><section><div className="day-section-head"><div><h3>Acontecimientos del día</h3><span>Todo lo registrado para esta fecha</span></div><button className="text-button" onClick={newEvent}><Plus size={16} /> Agregar</button></div>{dayEvents.length ? <div className="day-event-list">{dayEvents.map((event, index) => <EventRow event={event} last={index === dayEvents.length - 1} onOpen={openEvent} key={event.id} />)}</div> : <div className="day-empty"><CalendarDays /><strong>No hay acontecimientos cargados</strong><p>Podés crear el primero manteniendo seleccionada esta fecha.</p><button className="primary-button" onClick={newEvent}><Plus size={16} /> Crear acontecimiento</button></div>}</section><section><div className="day-section-head"><div><h3>Evidencias del día</h3><span>Fotos, documentos, audios o conversaciones</span></div></div>{dayEvents.length > 0 && <label className="day-related">Asociar también con<select value={relatedEvent} onChange={event => setRelatedEvent(event.target.value)}><option value="">Solo con la fecha</option>{dayEvents.map(event => <option value={event.id} key={event.id}>{event.title}</option>)}</select></label>}<label className={`day-upload ${processing ? 'processing' : ''}`}><input type="file" multiple onChange={event => upload(event.target.files)} /><Upload /><div><strong>{processing ? 'Preservando originales…' : 'Adjuntar evidencias'}</strong><span>Imágenes, documentos, audios, videos o exportaciones</span></div></label>{uploadError && <div className="login-error">{uploadError}</div>}{dayEvidence.length > 0 && <div className="day-files">{dayEvidence.map(item => <div key={item.id}><FileCheck2 /><span><strong>{item.name}</strong><small>SHA-256 registrado</small></span><a href={evidenceDownloadUrl(item.id)}><Download /></a></div>)}</div>}</section></div></div></div>
 }
 
 function EvidenceView({ evidence, setEvidence, setBackendOnline, events }: { evidence: Evidence[]; setEvidence: React.Dispatch<React.SetStateAction<Evidence[]>>; setBackendOnline: (value: boolean) => void; events: EventItem[] }) {
   const [processing, setProcessing] = useState(false)
   const [relatedEvent, setRelatedEvent] = useState('')
+  const [uploadMessage, setUploadMessage] = useState('')
   async function upload(files: FileList | null) {
     if (!files?.length) return
-    setProcessing(true)
+    setProcessing(true); setUploadMessage('')
     const rows: Evidence[] = []
+    let serverAccepted = false
     for (const file of Array.from(files)) {
       try {
         rows.push(await apiUpload<Evidence>('/api/evidence', file, relatedEvent || undefined))
+        serverAccepted = true
         setBackendOnline(true)
-      } catch {
+      } catch (problem) {
+        if (problem instanceof Error && problem.message.startsWith('API ')) {
+          setUploadMessage('Uno de los archivos fue rechazado porque su formato, contenido o tamaño no cumple las reglas de seguridad.')
+          continue
+        }
         const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer())
         const hash = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')
         rows.push({ id: `LOCAL-${Date.now()}-${rows.length + 1}`, name: file.name, size: file.size, type: file.type || 'Archivo', hash, addedAt: new Date().toISOString() })
         setBackendOnline(false)
       }
     }
-    setEvidence(prev => [...rows, ...prev]); setProcessing(false)
+    if (serverAccepted) {
+      await new Promise(resolve => window.setTimeout(resolve, 1_500))
+      try { setEvidence(await apiGet<Evidence[]>('/api/evidence')) } catch { setEvidence(prev => [...rows, ...prev.filter(item => !rows.some(row => row.id === item.id))]) }
+    } else setEvidence(prev => [...rows, ...prev.filter(item => !rows.some(row => row.id === item.id))])
+    setProcessing(false)
   }
   return <><section className="page-heading compact"><div><span className="eyebrow accent">ORIGINALES PROTEGIDOS</span><h1>Bóveda de evidencias</h1><p>Cada archivo incorporado recibe automáticamente una huella SHA-256 para detectar cualquier modificación.</p></div></section>
     <div className="evidence-linker"><label>Relacionar la próxima carga con un acontecimiento<select value={relatedEvent} onChange={e => setRelatedEvent(e.target.value)}><option value="">Sin relación por ahora</option>{events.map(event => <option value={event.id} key={event.id}>{event.date} · {event.title}</option>)}</select></label><span><Info size={15} /> La relación permite encontrar rápidamente qué original respalda cada hecho.</span></div>
-    <label className={`upload-zone ${processing ? 'processing' : ''}`}><input type="file" multiple onChange={e => upload(e.target.files)} /><div className="upload-icon"><Upload /></div><strong>{processing ? 'Calculando huellas digitales…' : 'Incorporar archivos originales'}</strong><p>Arrastrá archivos aquí o hacé clic para seleccionarlos</p><span>Los archivos se procesan localmente en esta primera versión</span></label>
+    <label className={`upload-zone ${processing ? 'processing' : ''}`}><input type="file" multiple onChange={e => upload(e.target.files)} /><div className="upload-icon"><Upload /></div><strong>{processing ? 'Verificando el archivo original…' : 'Incorporar archivos originales'}</strong><p>Arrastrá archivos aquí o hacé clic para seleccionarlos</p><span>Formatos permitidos con verificación de contenido real · máximo 500 MB</span></label>{uploadMessage && <div className="login-error evidence-upload-error">{uploadMessage}</div>}
     <article className="panel evidence-panel"><div className="panel-head"><div><h2>Archivos incorporados</h2><p>{evidence.length} original{evidence.length === 1 ? '' : 'es'} registrado{evidence.length === 1 ? '' : 's'}</p></div><span className="safe-badge"><ShieldCheck size={16} /> SHA-256 activo</span></div>
-      {evidence.length === 0 ? <div className="vault-empty"><FolderLock /><strong>La bóveda está preparada</strong><p>El primer archivo que incorpores aparecerá aquí con su identificación y hash.</p></div> : <div className="file-list">{evidence.map(file => <div className="file-row" key={file.id}><div className="file-icon"><FileText /></div><div className="file-info"><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB · Incorporado {format(new Date(file.addedAt), "dd/MM/yyyy 'a las' HH:mm")}</span><code title={file.hash}>{file.hash}</code></div><span className="verified"><Check size={14} /> {file.id.startsWith('LOCAL-') ? 'Huella local' : 'Original preservado'}</span>{file.id.startsWith('LOCAL-') ? <button title="Archivo local"><MoreHorizontal /></button> : <a className="download-file" href={evidenceDownloadUrl(file.id)} title="Descargar original"><Download /></a>}</div>)}</div>}
+      {evidence.length === 0 ? <div className="vault-empty"><FolderLock /><strong>La bóveda está preparada</strong><p>El primer archivo que incorpores aparecerá aquí con su identificación y hash.</p></div> : <div className="file-list">{evidence.map(file => <div className="file-row" key={file.id}><div className="file-icon"><FileText /></div><div className="file-info"><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB · Incorporado {format(new Date(file.addedAt), "dd/MM/yyyy 'a las' HH:mm")}</span><code title={file.hash}>{file.hash}</code></div><span className={`verified processing-${file.processingStatus || 'ready'}`}>{file.processingStatus === 'pending' || file.processingStatus === 'processing' ? <Clock3 size={14} /> : file.processingStatus === 'quarantined' || file.processingStatus === 'failed' ? <X size={14} /> : <Check size={14} />} {file.id.startsWith('LOCAL-') ? 'Huella local' : file.processingStatus === 'pending' ? 'Pendiente' : file.processingStatus === 'processing' ? 'Verificando' : file.processingStatus === 'quarantined' ? 'En cuarentena' : file.processingStatus === 'failed' ? 'Revisión necesaria' : 'Original verificado'}</span>{file.id.startsWith('LOCAL-') ? <button title="Archivo local"><MoreHorizontal /></button> : <a className="download-file" href={evidenceDownloadUrl(file.id)} title="Descargar original"><Download /></a>}</div>)}</div>}
     </article></>
 }
 

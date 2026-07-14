@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
@@ -117,7 +117,44 @@ def _migration_001_workspace_isolation(db: sqlite3.Connection) -> None:
         db.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_scope ON audit_log (tenant_id, case_id)")
 
 
-MIGRATIONS = {1: _migration_001_workspace_isolation}
+def _migration_002_evidence_processing_queue(db: sqlite3.Connection) -> None:
+    _add_column(db, "evidence", "detected_media_type TEXT NOT NULL DEFAULT ''")
+    _add_column(db, "evidence", "processing_status TEXT NOT NULL DEFAULT 'pending'")
+    _add_column(db, "evidence", "processing_error TEXT NOT NULL DEFAULT ''")
+    if _table_exists(db, "evidence"):
+        if "media_type" in _columns(db, "evidence"):
+            db.execute("UPDATE evidence SET detected_media_type=media_type WHERE detected_media_type='' AND media_type<>''")
+        db.execute("UPDATE evidence SET processing_status='ready' WHERE processing_status='pending'")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_evidence_hash_scope ON evidence (tenant_id,case_id,sha256)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_evidence_processing ON evidence (tenant_id,case_id,processing_status)")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS processing_jobs (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id),
+            evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+            job_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            available_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            error_code TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_processing_jobs_queue
+            ON processing_jobs (status,available_at,created_at);
+        CREATE INDEX IF NOT EXISTS idx_processing_jobs_scope
+            ON processing_jobs (tenant_id,case_id,evidence_id);
+        """
+    )
+
+
+MIGRATIONS = {1: _migration_001_workspace_isolation, 2: _migration_002_evidence_processing_queue}
 
 
 def apply_migrations(db: sqlite3.Connection, db_path: Path, backup_dir: Path) -> list[int]:
