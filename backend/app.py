@@ -506,10 +506,27 @@ def process_next_ai_chat_job() -> bool:
         job = db.execute("SELECT * FROM ai_chat_jobs WHERE status='pending' ORDER BY created_at LIMIT 1").fetchone()
         if not job: return False
         now = utc_now()
-        if not db.execute("UPDATE ai_chat_jobs SET status='processing',progress=40,stage='Preparando el modelo avanzado',started_at=?,updated_at=? WHERE id=? AND status='pending'", (now, now, job["id"])).rowcount: return True
+        if not db.execute("UPDATE ai_chat_jobs SET status='processing',progress=30,stage='Preparando fuentes y adjuntos',started_at=?,updated_at=? WHERE id=? AND status='pending'", (now, now, job["id"])).rowcount: return True
         db.execute("UPDATE ai_chat_messages SET status='processing',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
         history = db.execute("SELECT role,content,user_provided FROM ai_chat_messages WHERE conversation_id=? AND id<>? ORDER BY created_at DESC LIMIT 12", (job["conversation_id"], job["assistant_message_id"])).fetchall()
     context_items = json.loads(job["context_json"])
+    attachments = context_items.get("attachments", [])
+    if attachments:
+        with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=35,stage='Extrayendo texto de los adjuntos',updated_at=? WHERE id=?", (utc_now(), job["id"]))
+        deadline = time.time() + 240
+        while time.time() < deadline:
+            with database() as db:
+                states = [db.execute("SELECT extraction_status FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (item["evidenceId"], job["tenant_id"], job["case_id"])).fetchone() for item in attachments]
+            if all(state and state["extraction_status"] in {"ready", "empty", "failed", "not_applicable"} for state in states): break
+            time.sleep(2)
+        source_ids = {item["evidenceId"] for item in context_items.get("sources", [])}
+        with database() as db:
+            for attachment in attachments:
+                if attachment["evidenceId"] in source_ids: continue
+                chunks = db.execute("SELECT section_label,text,text_sha256,extraction_method FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=? ORDER BY section_index,chunk_index LIMIT 2", (attachment["evidenceId"], job["tenant_id"], job["case_id"])).fetchall()
+                if not chunks: continue
+                context_items.setdefault("sources", []).append({"sourceId": f"S{len(context_items.get('sources', []))+1}", **attachment, "factDate": "", "sectionLabel": chunks[0]["section_label"], "text": "\n".join(chunk["text"] for chunk in chunks)[:1400], "textHash": chunks[0]["text_sha256"], "method": chunks[0]["extraction_method"], "score": 1.0})
+        with database() as db: db.execute("UPDATE ai_chat_jobs SET context_json=?,progress=42,stage='Adjuntos preparados',updated_at=? WHERE id=?", (json.dumps(context_items, ensure_ascii=False), utc_now(), job["id"]))
     evidence_context = "\n\n".join(f"[{item['sourceId']}] {item['evidenceName']} | SHA {item['textHash']}\n{item['text'][:700]}" for item in context_items.get("sources", []))
     analysis_context = "\n".join(context_items.get("analyses", []))
     conversation = "\n".join(("[DATO APORTADO POR EL USUARIO] " if row["role"] == "user" else "[RESPUESTA PREVIA DE GORE] ") + row["content"] for row in reversed(history))
@@ -535,7 +552,7 @@ CONVERSACIÓN:
     stop = threading.Event(); ticker = threading.Thread(target=ai_chat_progress_ticker, args=(job["id"], stop), daemon=True); ticker.start()
     try:
         with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=50,stage='Analizando con el modelo local',updated_at=? WHERE id=?", (utc_now(), job["id"]))
-        answer = ai_provider().generate(prompt, job["model"], think=False)
+        answer = ai_provider().generate(prompt, job["model"], think=False, context_size=16_384)
         if not answer: raise AIProviderError("Respuesta vacía")
         now = utc_now()
         with database() as db:
@@ -644,7 +661,8 @@ class AIDraftPayload(BaseModel):
 
 class AIChatMessagePayload(BaseModel):
     conversationId: str | None = Field(default=None, max_length=80)
-    message: str = Field(min_length=1, max_length=5000)
+    message: str = Field(min_length=1, max_length=50_000)
+    evidenceIds: list[str] = Field(default_factory=list, max_length=10)
 
 
 def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
@@ -1442,6 +1460,14 @@ def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> di
     now = utc_now()
     with database() as db:
         scope = authorized_scope(request, db)
+        attachment_ids = list(dict.fromkeys(payload.evidenceIds))
+        attachments: list[dict] = []
+        if attachment_ids:
+            placeholders = ",".join("?" for _ in attachment_ids)
+            rows = db.execute(f"SELECT id,original_name,sha256,extraction_status FROM evidence WHERE tenant_id=? AND case_id=? AND id IN ({placeholders})", (scope["tenant_id"], scope["case_id"], *attachment_ids)).fetchall()
+            if len(rows) != len(attachment_ids): raise HTTPException(404, "Uno o más adjuntos no pertenecen al expediente activo")
+            by_id = {row["id"]: row for row in rows}
+            attachments = [{"evidenceId": evidence_id, "evidenceName": by_id[evidence_id]["original_name"], "evidenceHash": by_id[evidence_id]["sha256"]} for evidence_id in attachment_ids]
         conversation = None
         if payload.conversationId:
             conversation = db.execute("SELECT * FROM ai_conversations WHERE id=? AND tenant_id=? AND case_id=?", (payload.conversationId, scope["tenant_id"], scope["case_id"])).fetchone()
@@ -1454,7 +1480,7 @@ def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> di
         user_id, assistant_id, job_id = f"MSG-{uuid.uuid4().hex[:12].upper()}", f"MSG-{uuid.uuid4().hex[:12].upper()}", f"AIJ-{uuid.uuid4().hex[:12].upper()}"
         db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (user_id, conversation_id, scope["tenant_id"], scope["case_id"], "user", message, 1, "[]", "completed", now, now))
         db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (assistant_id, conversation_id, scope["tenant_id"], scope["case_id"], "assistant", "", 0, "[]", "queued", now, now))
-        context_json = json.dumps({"sources": sources, "analyses": analysis_context}, ensure_ascii=False)
+        context_json = json.dumps({"sources": sources, "analyses": analysis_context, "attachments": attachments}, ensure_ascii=False)
         model = AI_CONFIG.model_for("quality")
         db.execute("INSERT INTO ai_chat_jobs (id,conversation_id,user_message_id,assistant_message_id,tenant_id,case_id,status,progress,stage,model,context_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, conversation_id, user_id, assistant_id, scope["tenant_id"], scope["case_id"], "pending", 20, "En cola para análisis local", model, context_json, now, now))
         db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, conversation_id))

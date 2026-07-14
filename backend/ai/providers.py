@@ -22,7 +22,7 @@ class AIProvider(ABC):
     def list_available_models(self) -> list[str]: ...
 
     @abstractmethod
-    def generate(self, prompt: str, model: str, *, think: bool = False) -> str: ...
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072) -> str: ...
 
     @abstractmethod
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]: ...
@@ -59,11 +59,11 @@ class LocalAIProvider(AIProvider):
         result = self._request("/api/tags", timeout=10)
         return sorted(str(item.get("name", "")) for item in result.get("models", []) if item.get("name"))
 
-    def generate(self, prompt: str, model: str, *, think: bool = False) -> str:
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072) -> str:
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": think,
             "keep_alive": "30s",
-            "options": {"temperature": 0, "num_predict": 240, "num_ctx": 3072, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
+            "options": {"temperature": 0, "num_predict": 240, "num_ctx": context_size, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
         })
         return str(result.get("response", "")).strip()
 
@@ -97,7 +97,7 @@ class MockAIProvider(AIProvider):
     def list_available_models(self) -> list[str]:
         return ["mock-chat", "mock-embedding"]
 
-    def generate(self, prompt: str, model: str, *, think: bool = False) -> str:
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072) -> str:
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
