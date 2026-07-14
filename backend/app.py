@@ -52,6 +52,7 @@ WHISPER_MODEL_NAME = "small"
 WHISPER_LOCK = threading.Lock()
 AI_CONFIG = load_ai_config()
 MAX_EVIDENCE_BYTES = max(1, min(int(os.environ.get("GORE_MAX_EVIDENCE_MB", "500")), 2048)) * 1024 * 1024
+SEMANTIC_MIN_SCORE = max(0.0, min(float(os.environ.get("GORE_SEMANTIC_MIN_SCORE", "0.30")), 1.0))
 ALLOWED_EVIDENCE_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".opus", ".ogg", ".oga", ".mp3", ".m4a", ".aac", ".wav", ".amr", ".webm", ".mp4", ".mov", ".avi"}
 PROCESSING_WORKER_STARTED = False
 PROCESSING_WORKER_LOCK = threading.Lock()
@@ -489,6 +490,17 @@ def start_processing_worker() -> None:
         threading.Thread(target=processing_worker, name="gore-processing-worker", daemon=True).start()
 
 
+def recover_interrupted_processing() -> None:
+    with database() as db:
+        now = utc_now()
+        interrupted = db.execute("SELECT COUNT(*) FROM processing_jobs WHERE status='processing'").fetchone()[0]
+        if not interrupted:
+            return
+        db.execute("UPDATE processing_jobs SET status='pending',available_at=?,updated_at=?,error_code='interrupted_recovered' WHERE status='processing'", (now, now))
+        db.execute("UPDATE audio_transcriptions SET status='queued',updated_at=? WHERE status='processing'", (now,))
+        audit(db, "PROCESSING_JOBS_RECOVERED", "system", "worker", {"jobs": interrupted})
+
+
 class EventCreate(BaseModel):
     date: str
     time: str
@@ -587,6 +599,7 @@ def whatsapp_chat_dict(row: sqlite3.Row, include_content: bool = True) -> dict:
 @app.on_event("startup")
 def startup() -> None:
     init_database()
+    recover_interrupted_processing()
     start_processing_worker()
 
 
@@ -798,10 +811,10 @@ def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
                 "textHash": row["text_sha256"], "method": row["extraction_method"],
             })
         results.sort(key=lambda item: item["score"], reverse=True)
-        selected = results[:payload.limit]
+        selected = [item for item in results if item["score"] >= SEMANTIC_MIN_SCORE][:payload.limit]
         audit(db, "SEMANTIC_SEARCH_EXECUTED", "case", scope["case_id"], {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(), "results": len(selected), "model": AI_CONFIG.embedding_model}, scope)
         indexed_evidence = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND embedding_status='ready'", (scope["tenant_id"], scope["case_id"])).fetchone()[0]
-        return {"query": query, "model": AI_CONFIG.embedding_model, "indexedEvidence": indexed_evidence, "results": selected}
+        return {"query": query, "model": AI_CONFIG.embedding_model, "indexedEvidence": indexed_evidence, "minimumScore": SEMANTIC_MIN_SCORE, "results": selected}
 
 
 @app.post("/api/ai/index/retry")
@@ -827,13 +840,7 @@ def retry_semantic_index(request: Request) -> dict:
 def audio_index_status(request: Request) -> dict:
     with database() as db:
         scope = authorized_scope(request, db)
-        params = (scope["tenant_id"], scope["case_id"])
-        total = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%'", params).fetchone()[0]
-        transcribed = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='completed' AND trim(text)<>''", params).fetchone()[0]
-        indexed = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%' AND embedding_status='ready'", params).fetchone()[0]
-        queued = db.execute("SELECT COUNT(*) FROM processing_jobs WHERE tenant_id=? AND case_id=? AND job_type='audio_transcribe' AND status IN ('pending','processing')", params).fetchone()[0]
-        failed = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='failed'", params).fetchone()[0]
-        return {"total": total, "transcribed": transcribed, "indexed": indexed, "queued": queued, "failed": failed}
+        return audio_index_status_from_db(db, scope)
 
 
 @app.post("/api/ai/audio-index/prepare")
@@ -860,13 +867,15 @@ def prepare_audio_index(request: Request) -> dict:
 
 def audio_index_status_from_db(db: sqlite3.Connection, scope: dict) -> dict:
     params = (scope["tenant_id"], scope["case_id"])
-    return {
-        "total": db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%'", params).fetchone()[0],
-        "transcribed": db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='completed' AND trim(text)<>''", params).fetchone()[0],
-        "indexed": db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%' AND embedding_status='ready'", params).fetchone()[0],
-        "queued": db.execute("SELECT COUNT(*) FROM processing_jobs WHERE tenant_id=? AND case_id=? AND job_type='audio_transcribe' AND status IN ('pending','processing')", params).fetchone()[0],
-        "failed": db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='failed'", params).fetchone()[0],
-    }
+    total = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%'", params).fetchone()[0]
+    transcribed = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='completed' AND trim(text)<>''", params).fetchone()[0]
+    empty = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='empty'", params).fetchone()[0]
+    indexed = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%' AND embedding_status='ready'", params).fetchone()[0]
+    queued = db.execute("SELECT COUNT(*) FROM processing_jobs WHERE tenant_id=? AND case_id=? AND job_type='audio_transcribe' AND status IN ('pending','processing')", params).fetchone()[0]
+    failed = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='failed'", params).fetchone()[0]
+    completed = transcribed + empty
+    percent = round((completed + failed) * 100 / total) if total else 100
+    return {"total": total, "transcribed": transcribed, "empty": empty, "completed": completed, "indexed": indexed, "queued": queued, "failed": failed, "percent": percent, "finished": total > 0 and queued == 0 and completed + failed >= total}
 
 
 @app.get("/api/events")

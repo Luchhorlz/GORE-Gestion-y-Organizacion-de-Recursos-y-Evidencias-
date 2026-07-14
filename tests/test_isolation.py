@@ -94,6 +94,7 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(embedding_status, "ready")
         search = self.client.post("/api/ai/search", json={"query": "prueba juridica", "limit": 5})
         self.assertEqual(search.status_code, 200, search.text)
+        self.assertTrue(all(result["score"] >= search.json()["minimumScore"] for result in search.json()["results"]))
         self.assertEqual(search.json()["results"][0]["evidenceId"], evidence_id)
         self.assertEqual(search.json()["results"][0]["textHash"], extracted.json()["chunks"][0]["text_sha256"])
 

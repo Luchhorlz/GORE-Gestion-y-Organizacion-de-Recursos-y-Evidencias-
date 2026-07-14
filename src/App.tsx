@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Archive, ArrowRight, CalendarDays, Check, ChevronLeft, ChevronRight,
   Clock3, Download, Eye, FileCheck2, FileText, FolderLock, Gavel,
@@ -26,7 +26,7 @@ type Evidence = { id: string; name: string; size: number; type: string; hash: st
 type ExtractedText = { evidenceId: string; status: string; error: string; summary: { character_count: number; section_count: number; engine: string; source_sha256: string } | null; chunks: { section_label: string; section_index: number; chunk_index: number; text: string; text_sha256: string; extraction_method: string }[] }
 type SemanticSearchResult = { score: number; evidenceId: string; evidenceName: string; evidenceHash: string; factDate: string; eventId?: string; sectionLabel: string; sectionIndex: number; chunkIndex: number; text: string; textHash: string; method: string }
 type SemanticSearchResponse = { query: string; model: string; indexedEvidence: number; results: SemanticSearchResult[] }
-type AudioIndexStatus = { total: number; transcribed: number; indexed: number; queued: number; failed: number }
+type AudioIndexStatus = { total: number; transcribed: number; empty: number; completed: number; indexed: number; queued: number; failed: number; percent: number; finished: boolean }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -76,6 +76,9 @@ function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null)
   const [caseConfig, setCaseConfig] = useState<CaseConfig>({ caseCode: 'GORE-2026-001', title: 'Organización familiar', status: 'En documentación', mainMilestone: '2026-07-01', previousModality: 'Organización semanal alternada' })
   const [workspace, setWorkspace] = useState<Workspace | null>(null)
+  const [audioProgress, setAudioProgress] = useState<AudioIndexStatus | null>(null)
+  const [audioNotice, setAudioNotice] = useState('')
+  const previousAudioProgress = useRef<AudioIndexStatus | null>(null)
 
   useEffect(() => localStorage.setItem('gore-events', JSON.stringify(events)), [events])
   useEffect(() => localStorage.setItem('gore-evidence', JSON.stringify(evidence)), [evidence])
@@ -89,6 +92,23 @@ function App() {
     Promise.all([apiGet<EventItem[]>('/api/events'), apiGet<Evidence[]>('/api/evidence'), apiGet<CaseConfig>('/api/case'), apiGet<Workspace>('/api/workspace')])
       .then(([serverEvents, serverEvidence, serverCase, serverWorkspace]) => { setBackendOnline(true); setEvents(serverEvents); setEvidence(serverEvidence); setCaseConfig(serverCase); setWorkspace(serverWorkspace) })
       .catch(() => setBackendOnline(false))
+  }, [authenticated])
+  useEffect(() => {
+    if (!authenticated) return
+    let active = true
+    const refresh = () => apiGet<AudioIndexStatus>('/api/ai/audio-index/status').then(result => {
+      if (!active) return
+      const previous = previousAudioProgress.current
+      setAudioProgress(result); previousAudioProgress.current = result
+      const completionKey = `gore-audio-complete-${result.total}-${result.completed}-${result.failed}`
+      if (result.finished && previous?.queued && !sessionStorage.getItem(completionKey)) {
+        const message = result.failed ? `Finalizó la preparación: ${result.completed} audios listos y ${result.failed} requieren revisión.` : `Finalizó la transcripción de los ${result.completed} audios.`
+        setAudioNotice(message); sessionStorage.setItem(completionKey, '1')
+        if ('Notification' in window && Notification.permission === 'granted') new Notification('GORE · Audios preparados', { body: message })
+      }
+    }).catch(() => undefined)
+    refresh(); const timer = window.setInterval(refresh, 3_000)
+    return () => { active = false; window.clearInterval(timer) }
   }, [authenticated])
 
   async function saveEvent(event: EventItem) {
@@ -105,6 +125,11 @@ function App() {
 
   async function logout() {
     try { await apiPost('/api/auth/logout', {}) } finally { setAuthenticated(false); setEvents([]); setEvidence([]) }
+  }
+  async function prepareAllAudios() {
+    if ('Notification' in window && Notification.permission === 'default') void Notification.requestPermission()
+    const result = await apiPost<{ status: AudioIndexStatus }>('/api/ai/audio-index/prepare', {})
+    setAudioProgress(result.status); previousAudioProgress.current = result.status
   }
 
   const go = (next: View) => { setView(next); setMobileOpen(false) }
@@ -163,7 +188,7 @@ function App() {
           {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
-          {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} />}
+          {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} audioProgress={audioProgress} prepareAllAudios={prepareAllAudios} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
           {view === 'auditoria' && <AuditView />}
           {view === 'configuracion' && <><AISettingsCard /><SettingsView config={caseConfig} onSaved={setCaseConfig} onLogout={logout} /></>}
@@ -171,6 +196,7 @@ function App() {
       </main>
       {eventModal && <EventModal initial={selectedEvent} initialDate={newEventDate} close={() => setEventModal(false)} save={async (event) => { await saveEvent(event); setEventModal(false) }} />}
       {selectedDay && <DayModal date={selectedDay} events={events} evidence={evidence} close={() => setSelectedDay(null)} openEvent={(event) => { setSelectedDay(null); openEvent(event) }} newEvent={() => { setNewEventDate(selectedDay); setSelectedDay(null); setSelectedEvent(null); setEventModal(true) }} onEvidence={(item) => setEvidence(prev => [item, ...prev.filter(existing => existing.id !== item.id)])} />}
+      {audioNotice && <button className="global-notice" onClick={() => setAudioNotice('')}><Check size={18} /><span>{audioNotice}</span><X size={15} /></button>}
     </div>
   )
 }
@@ -433,7 +459,7 @@ function automaticallyMatchAudio(messages: ChatMessage[], files: File[]): AudioM
   return results
 }
 
-function WhatsAppSimulator({ evidence, onEvidence }: { evidence: Evidence[]; onEvidence: (item: Evidence) => void }) {
+function WhatsAppSimulator({ evidence, onEvidence, audioProgress, prepareAllAudios }: { evidence: Evidence[]; onEvidence: (item: Evidence) => void; audioProgress: AudioIndexStatus | null; prepareAllAudios: () => Promise<void> }) {
   const [raw, setRaw] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [self, setSelf] = useState('')
@@ -444,6 +470,7 @@ function WhatsAppSimulator({ evidence, onEvidence }: { evidence: Evidence[]; onE
   const [audioStatus, setAudioStatus] = useState('')
   const [savedChats, setSavedChats] = useState<StoredChatSummary[]>([])
   const [transcriptions, setTranscriptions] = useState<Record<string, AudioTranscription>>({})
+  const [bulkStarting, setBulkStarting] = useState(false)
   const senders = useMemo(() => Array.from(new Set(messages.filter(message => !message.system).map(message => message.sender))), [messages])
   async function refreshSavedChats(openLatest = false) { try { const rows = await apiGet<StoredChatSummary[]>('/api/whatsapp/chats'); setSavedChats(rows); if (openLatest && rows[0]) await loadSavedChat(rows[0].id) } catch { /* modo local */ } }
   async function persistChat(id: string, display: string, ownName: string, sourceRaw: string, chatMessages: ChatMessage[], matches: AudioMatch[], sourceType = 'whatsapp_export') {
@@ -604,6 +631,7 @@ function WhatsAppSimulator({ evidence, onEvidence }: { evidence: Evidence[]; onE
   useEffect(() => { const other = senders.find(sender => sender !== self); if (other) setContactName(other) }, [self, senders])
   return <>
     <section className="page-heading compact"><div><span className="eyebrow accent">RECONSTRUCCIÓN VISUAL AUXILIAR</span><h1>Simulador de chats de WhatsApp</h1><p>Importá el ZIP o TXT original, o pegá un fragmento, para reconstruirlo visualmente sin modificar la fuente.</p></div></section>
+    {audioProgress && audioProgress.total > 0 && <section className="wa-transcription-progress"><div className="wa-progress-head"><div><strong>Transcripción de todos los audios</strong><span>{audioProgress.completed} de {audioProgress.total} procesados{audioProgress.failed ? ` · ${audioProgress.failed} requieren revisión` : ''}</span></div><button type="button" disabled={bulkStarting || audioProgress.queued > 0 || audioProgress.finished} onClick={async () => { setBulkStarting(true); try { await prepareAllAudios() } finally { setBulkStarting(false) } }}>{audioProgress.finished ? 'Completado' : audioProgress.queued ? 'Trabajando en segundo plano' : bulkStarting ? 'Preparando…' : 'Transcribir todos los audios'}</button></div><div className="wa-progress-track"><span style={{ width: `${audioProgress.percent}%` }} /></div><small>{audioProgress.percent}% · Podés cambiar de pestaña o cerrar esta página. El servidor conservará y retomará el progreso.</small></section>}
     <div className="wa-workspace">
       <aside className="panel wa-import">
         <div className="panel-head"><div><h2>Conversación original</h2><p>El procesamiento se realiza dentro de GORE</p></div><FileArchive /></div>
