@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'borradores' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'cronologia-ia' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'borradores' | 'chat-ia' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -37,6 +37,10 @@ type EvidenceAnalysisItem = { sourceId: string; classification: 'favorable' | 'd
 type EvidenceAnalysis = { id: string; items: EvidenceAnalysisItem[]; missingEvidence: string[]; sources: AssistantCitation[]; insufficientEvidence: boolean; model: string; profile: string; generatedAt: string }
 type DateProposal = { id: string; date: string; time: string; type: string; reason: string; dateBasis: 'explicit' | 'inferred' | 'file_date'; certainty: number; sources: AssistantCitation[]; warning: string; status: 'pending_review' | 'approved' | 'rejected'; approvedEventId?: string }
 type AIDraft = { id: string; draftType: string; draftTypeLabel: string; title: string; body: string; unconfirmedInformation: string[]; reviewFields: string[]; sources: AssistantCitation[]; disclaimer: string; model: string; profile: string; generatedAt: string }
+type AIChatJob = { id: string; progress: number; stage: string; status: string; model: string }
+type AIChatMessage = { id: string; role: 'user' | 'assistant'; content: string; userProvided: boolean; sources: AssistantCitation[]; status: string; job?: AIChatJob; createdAt: string }
+type AIConversation = { id: string; title: string; createdAt: string; updatedAt: string; messages: AIChatMessage[] }
+type AIConversationSummary = Omit<AIConversation, 'messages'>
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -57,17 +61,23 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'inicio', label: 'Inicio', icon: Home },
   { id: 'calendario', label: 'Calendario', icon: CalendarDays },
   { id: 'acontecimientos', label: 'Acontecimientos', icon: Clock3 },
-  { id: 'fechas', label: 'Fechas y compromisos', icon: CalendarDays },
   { id: 'evidencias', label: 'Bóveda de evidencias', icon: FolderLock },
-  { id: 'analisis-evidencia', label: 'Análisis de evidencias', icon: FileCheck2 },
-  { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
-  { id: 'contradicciones', label: 'Posibles contradicciones', icon: Scale },
-  { id: 'borradores', label: 'Borradores asistidos', icon: FileText },
   { id: 'comunicaciones', label: 'Comunicaciones', icon: MessageCircle },
   { id: 'whatsapp', label: 'Simulador WhatsApp', icon: Phone },
   { id: 'informes', label: 'Informes', icon: FileText },
   { id: 'auditoria', label: 'Auditoría', icon: ShieldCheck },
   { id: 'configuracion', label: 'Configuración', icon: Settings },
+]
+const aiNavItems: { id: View; label: string; icon: typeof Home }[] = [
+  { id: 'chat-ia', label: 'Chat con Ollama', icon: MessageCircle },
+  { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
+  { id: 'evidencias', label: 'Búsqueda inteligente', icon: Search },
+  { id: 'informes', label: 'Resumen del expediente', icon: FileText },
+  { id: 'cronologia-ia', label: 'Cronología asistida', icon: Clock3 },
+  { id: 'analisis-evidencia', label: 'Análisis de evidencias', icon: FileCheck2 },
+  { id: 'contradicciones', label: 'Posibles contradicciones', icon: Scale },
+  { id: 'fechas', label: 'Fechas y compromisos', icon: CalendarDays },
+  { id: 'borradores', label: 'Borradores asistidos', icon: FileText },
 ]
 
 const categories = ['Comunicación', 'Cambio propuesto', 'Permanencia', 'Entrega o retiro', 'Videollamada', 'Salud', 'Escuela', 'Actividad especial', 'Actuación judicial']
@@ -87,6 +97,7 @@ function App() {
   const [newEventDate, setNewEventDate] = useState<string | null>(null)
   const [presentation, setPresentation] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [aiToolsOpen, setAiToolsOpen] = useState(false)
   const [backendOnline, setBackendOnline] = useState(false)
   const [authenticated, setAuthenticated] = useState<boolean | null>(null)
   const [caseConfig, setCaseConfig] = useState<CaseConfig>({ caseCode: 'GORE-2026-001', title: 'Organización familiar', status: 'En documentación', mainMilestone: '2026-07-01', previousModality: 'Organización semanal alternada' })
@@ -150,7 +161,7 @@ function App() {
   const go = (next: View) => { setView(next); setMobileOpen(false) }
   const openNewEvent = () => { setSelectedEvent(null); setNewEventDate(null); setEventModal(true) }
   const openEvent = (event: EventItem) => { setSelectedEvent(event); setEventModal(true) }
-  const title = navItems.find(item => item.id === view)?.label ?? 'Inicio'
+  const title = [...navItems, ...aiNavItems].find(item => item.id === view)?.label ?? 'Inicio'
 
   if (authenticated === null) return <div className="auth-screen"><div className="auth-loading"><ShieldCheck /><span>Protegiendo el expediente…</span></div></div>
   if (!authenticated) return <LoginScreen onAuthenticated={() => setAuthenticated(true)} />
@@ -176,6 +187,8 @@ function App() {
               <Icon size={19} strokeWidth={1.8} /><span>{label}</span>{id === 'evidencias' && evidence.length > 0 && <b>{evidence.length}</b>}
             </button>
           ))}
+          <button className={`ai-tools-toggle ${aiToolsOpen ? 'open' : ''}`} onClick={() => setAiToolsOpen(value => !value)}><Sparkles size={19} /><span>Herramientas IA</span><ChevronRight className="ai-tools-chevron" size={16} /></button>
+          {aiToolsOpen && <div className="ai-tools-menu">{aiNavItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => go(id)}><Icon size={17} /><span>{label}</span></button>)}</div>}
         </nav>
         <div className="sidebar-bottom">
           <button><Users size={19} /> Personas autorizadas</button>
@@ -200,13 +213,15 @@ function App() {
         <div className="content">
           {view === 'inicio' && <Dashboard events={events} evidence={evidence} go={go} openModal={openNewEvent} backendOnline={backendOnline} openEvent={openEvent} />}
           {view === 'calendario' && <CalendarView month={month} setMonth={setMonth} events={events} openDay={setSelectedDay} milestoneDate={caseConfig.mainMilestone} />}
-          {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
+          {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} />}
+          {view === 'cronologia-ia' && <ChronologyAIView onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
           {view === 'fechas' && <DatesView onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
           {view === 'analisis-evidencia' && <EvidenceAnalysisView />}
           {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
           {view === 'contradicciones' && <ContradictionsView />}
           {view === 'borradores' && <DraftsView />}
+          {view === 'chat-ia' && <AIChatView />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
           {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} audioProgress={audioProgress} prepareAllAudios={prepareAllAudios} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
@@ -301,28 +316,21 @@ function DatesView({ onEventApproved }: { onEventApproved: (event: EventItem) =>
   return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">AGENDA ASISTIDA · APROBACIÓN OBLIGATORIA</span><h1>Fechas y compromisos</h1><p>Detecta fechas asociadas con acciones concretas sin calcular vencimientos legales definitivos.</p></div><button className="primary-button" onClick={generate} disabled={loading}><CalendarDays size={17} /> {loading ? 'Revisando fuentes…' : 'Detectar fechas'}</button></section><div className="contradiction-warning"><Gavel /><div><strong>Nunca es un cálculo jurídico definitivo</strong><span>Confirmá fecha, alcance, días hábiles y reglas aplicables con un profesional antes de aprobar.</span></div></div>{error && <div className="login-error">{error}</div>}<div className="date-proposals">{proposals.map(proposal => <article className={`panel date-proposal ${proposal.status}`} key={proposal.id}><div className="date-proposal-calendar"><strong>{format(new Date(`${proposal.date}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${proposal.date}T12:00:00`), 'MMM yyyy', { locale: es })}</span><small>{proposal.time || 'Sin hora'}</small></div><div className="date-proposal-body"><div><b>{proposal.type}</b><span>{proposal.dateBasis === 'explicit' ? 'Fecha explícita' : proposal.dateBasis === 'file_date' ? 'Fecha del archivo' : 'Fecha inferida'}</span><span>Confianza {(proposal.certainty * 100).toFixed(0)}%</span></div><h2>{proposal.reason}</h2><p>{proposal.warning}</p><div className="proposal-sources">{proposal.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}>{source.sourceId} · {source.evidenceName}</a>)}</div></div><div className="proposal-actions">{proposal.status === 'pending_review' ? <><button onClick={() => review(proposal, 'reject')}>Descartar</button><button className="approve" onClick={() => review(proposal, 'approve')}><Check size={15} /> Aprobar y agendar</button></> : <span>{proposal.status === 'approved' ? 'Incorporado al calendario' : 'Descartado'}</span>}</div></article>)}{proposals.length === 0 && <article className="panel vault-empty"><CalendarDays /><strong>No hay fechas propuestas</strong><p>GORE sólo propondrá fechas vinculadas con una acción concreta y una fuente identificable.</p></article>}</div></>
 }
 
-function EventsView({ events, openModal, openEvent, caseConfig, onEventApproved }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void; caseConfig: CaseConfig; onEventApproved: (event: EventItem) => void }) {
-  const [query, setQuery] = useState('')
+function ChronologyAIView({ onEventApproved }: { onEventApproved: (event: EventItem) => void }) {
   const [proposals, setProposals] = useState<ChronologyProposal[]>([])
-  const [chronologyLoading, setChronologyLoading] = useState(false)
-  const [chronologyError, setChronologyError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
   useEffect(() => { apiGet<ChronologyProposal[]>('/api/ai/chronology/proposals').then(setProposals).catch(() => undefined) }, [])
-  async function generateChronology() {
-    setChronologyLoading(true); setChronologyError('')
-    try { const result = await apiPost<{ proposals: ChronologyProposal[] }>('/api/ai/chronology/generate', {}); setProposals(previous => [...result.proposals, ...previous]) }
-    catch { setChronologyError('No se pudieron generar propuestas. Verificá Ollama y las evidencias indexadas.') }
-    finally { setChronologyLoading(false) }
-  }
-  async function reviewProposal(proposal: ChronologyProposal, action: 'approve' | 'reject') {
-    try {
-      if (action === 'approve') { const result = await apiPost<{ proposal: ChronologyProposal; event: EventItem }>(`/api/ai/chronology/proposals/${proposal.id}/approve`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result.proposal : item)); onEventApproved(result.event) }
-      else { const result = await apiPost<ChronologyProposal>(`/api/ai/chronology/proposals/${proposal.id}/reject`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result : item)) }
-    } catch { setChronologyError('No se pudo registrar la revisión de esa propuesta.') }
-  }
+  async function generate() { setLoading(true); setError(''); try { const result = await apiPost<{ proposals: ChronologyProposal[] }>('/api/ai/chronology/generate', {}); setProposals(previous => [...result.proposals, ...previous]) } catch { setError('No se pudieron generar propuestas. Verificá Ollama y las evidencias indexadas.') } finally { setLoading(false) } }
+  async function review(proposal: ChronologyProposal, action: 'approve' | 'reject') { try { if (action === 'approve') { const result = await apiPost<{ proposal: ChronologyProposal; event: EventItem }>(`/api/ai/chronology/proposals/${proposal.id}/approve`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result.proposal : item)); onEventApproved(result.event) } else { const result = await apiPost<ChronologyProposal>(`/api/ai/chronology/proposals/${proposal.id}/reject`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result : item)) } } catch { setError('No se pudo registrar la revisión de esa propuesta.') } }
+  return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">AGENTE LOCAL · REVISIÓN OBLIGATORIA</span><h1>Cronología asistida</h1><p>Detecta posibles acontecimientos en evidencias sin modificar el calendario automáticamente.</p></div><button className="primary-button" onClick={generate} disabled={loading}><Sparkles size={16} /> {loading ? 'Analizando…' : 'Buscar acontecimientos'}</button></section>{error && <div className="login-error">{error}</div>}<article className="panel chronology-agent"><div className="chronology-proposals">{proposals.map(proposal => <section className={`chronology-proposal ${proposal.status}`} key={proposal.id}><div className="proposal-date"><strong>{format(new Date(`${proposal.date}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${proposal.date}T12:00:00`), 'MMM yyyy', { locale: es })}</span>{proposal.time && <small>{proposal.time}</small>}</div><div><div className="proposal-badges"><span>{proposal.dateBasis === 'explicit' ? 'Fecha explícita' : proposal.dateBasis === 'file_date' ? 'Fecha del archivo' : 'Fecha inferida'}</span><span>Confianza {(proposal.certainty * 100).toFixed(0)}%</span></div><p>{proposal.description}</p>{proposal.people.length > 0 && <small>Personas: {proposal.people.join(', ')}</small>}<div className="proposal-sources">{proposal.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}>{source.sourceId} · {source.evidenceName}</a>)}</div></div><div className="proposal-actions">{proposal.status === 'pending_review' ? <><button onClick={() => review(proposal, 'reject')}>Descartar</button><button className="approve" onClick={() => review(proposal, 'approve')}><Check size={15} /> Aprobar</button></> : <span>{proposal.status === 'approved' ? 'Incorporado al calendario' : 'Descartado'}</span>}</div></section>)}{proposals.length === 0 && <div className="vault-empty"><Clock3 /><strong>Sin propuestas pendientes</strong><p>GORE sólo mostrará acontecimientos que pueda vincular con fuentes.</p></div>}</div></article></>
+}
+
+function EventsView({ events, openModal, openEvent, caseConfig }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void; caseConfig: CaseConfig }) {
+  const [query, setQuery] = useState('')
   const filtered = events.filter(e => `${e.title} ${e.description} ${e.category}`.toLowerCase().includes(query.toLowerCase()))
   return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">REGISTRO OBJETIVO</span><h1>Acontecimientos</h1><p>Una cronología clara de hechos, comunicaciones y cambios relevantes.</p></div><button className="primary-button" onClick={openModal}><Plus size={18} /> Nuevo acontecimiento</button></section>
     <article className="milestone-banner"><div className="milestone-date"><strong>{format(new Date(`${caseConfig.mainMilestone}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${caseConfig.mainMilestone}T12:00:00`), 'MMM yyyy', { locale: es }).toUpperCase()}</span></div><div><span className="eyebrow">HITO PRINCIPAL DEL EXPEDIENTE</span><h2>{caseConfig.title}</h2><p>Fecha principal configurada para organizar la lectura del expediente. Los hechos anteriores y posteriores permanecen visibles en la misma cronología.</p></div><Gavel size={22} /></article>
-    <article className="panel chronology-agent"><div className="panel-head"><div><span className="eyebrow accent">AGENTE LOCAL · REVISIÓN OBLIGATORIA</span><h2>Propuestas para la cronología</h2><p>Detecta fechas en evidencias, pero nunca modifica el calendario sin tu aprobación.</p></div><button className="primary-button" onClick={generateChronology} disabled={chronologyLoading}><Sparkles size={16} /> {chronologyLoading ? 'Analizando…' : 'Buscar acontecimientos'}</button></div>{chronologyError && <div className="login-error">{chronologyError}</div>}<div className="chronology-proposals">{proposals.map(proposal => <section className={`chronology-proposal ${proposal.status}`} key={proposal.id}><div className="proposal-date"><strong>{format(new Date(`${proposal.date}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${proposal.date}T12:00:00`), 'MMM yyyy', { locale: es })}</span>{proposal.time && <small>{proposal.time}</small>}</div><div><div className="proposal-badges"><span>{proposal.dateBasis === 'explicit' ? 'Fecha explícita' : proposal.dateBasis === 'file_date' ? 'Fecha del archivo' : 'Fecha inferida'}</span><span>Confianza {(proposal.certainty * 100).toFixed(0)}%</span></div><p>{proposal.description}</p>{proposal.people.length > 0 && <small>Personas: {proposal.people.join(', ')}</small>}<div className="proposal-sources">{proposal.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}>{source.sourceId} · {source.evidenceName}</a>)}</div></div><div className="proposal-actions">{proposal.status === 'pending_review' ? <><button onClick={() => reviewProposal(proposal, 'reject')}>Descartar</button><button className="approve" onClick={() => reviewProposal(proposal, 'approve')}><Check size={15} /> Aprobar</button></> : <span>{proposal.status === 'approved' ? 'Incorporado al calendario' : 'Descartado'}</span>}</div></section>)}{proposals.length === 0 && <div className="vault-empty"><Clock3 /><strong>Sin propuestas pendientes</strong><p>GORE sólo mostrará acontecimientos que pueda vincular con fuentes.</p></div>}</div></article>
     <article className="panel list-panel"><div className="list-tools"><label><Search size={18} /><input placeholder="Buscar por palabra, categoría o fecha…" value={query} onChange={e => setQuery(e.target.value)} /></label><button>Todos los estados <ChevronRight size={16} /></button></div><div className="events-list">{filtered.map((event, i) => <EventRow key={event.id} event={event} last={i === filtered.length - 1} onOpen={openEvent} />)}{filtered.length === 0 && <div className="empty-inline">No encontramos acontecimientos con ese criterio.</div>}</div></article></>
 }
 
@@ -484,6 +492,42 @@ function DraftsView() {
     catch { setError('El navegador no permitió copiar el borrador.') }
   }
   return <><section className="page-heading compact"><div><span className="eyebrow accent">REDACCIÓN LOCAL CON REVISIÓN</span><h1>Borradores asistidos</h1><p>Prepara textos basados en fuentes sin enviar, firmar ni presentar nada automáticamente.</p></div></section><form className="panel draft-form" onSubmit={generate}><div className="panel-head"><div><h2>Nuevo borrador</h2><p>Elegí el formato y explicá qué necesitás preparar.</p></div><Sparkles /></div><div className="draft-form-fields"><label>Tipo de borrador<select value={draftType} onChange={event => setDraftType(event.target.value)}><option value="client_summary">Resumen para cliente</option><option value="internal_report">Informe interno</option><option value="questions">Lista de preguntas</option><option value="minutes">Minuta</option><option value="email">Correo</option><option value="document_request">Solicitud de documentación</option><option value="generic_legal">Borrador jurídico genérico</option></select></label><label>Indicaciones opcionales<textarea value={instructions} onChange={event => setInstructions(event.target.value)} maxLength={2000} placeholder="Ejemplo: preparar una lista breve de preguntas sobre las fechas y la modalidad de cuidado." /></label></div><div className="draft-form-actions"><span>{instructions.length}/2000 · Sólo se usarán evidencias relacionadas.</span><button className="primary-button" disabled={loading}><FileText size={16} /> {loading ? 'Redactando…' : 'Generar borrador'}</button></div>{error && <div className="login-error">{error}</div>}</form><div className="draft-list">{drafts.map(draft => <article className="panel draft-card" key={draft.id}><div className="draft-card-head"><div><span>{draft.draftTypeLabel}</span><h2>{draft.title}</h2><small>{format(new Date(draft.generatedAt), "dd/MM/yyyy 'a las' HH:mm")} · {draft.model}</small></div><button onClick={() => copyDraft(draft)}><FileCheck2 size={15} /> {copied === draft.id ? 'Copiado' : 'Copiar borrador'}</button></div><div className="draft-disclaimer"><Info /><span>{draft.disclaimer}</span></div><div className="draft-body">{draft.body}</div>{(draft.reviewFields.length > 0 || draft.unconfirmedInformation.length > 0) && <div className="draft-review"><section><strong>Campos para revisar</strong>{draft.reviewFields.length ? <ul>{draft.reviewFields.map(item => <li key={item}>{item}</li>)}</ul> : <p>Sin campos señalados.</p>}</section><section><strong>Información no confirmada</strong>{draft.unconfirmedInformation.length ? <ul>{draft.unconfirmedInformation.map(item => <li key={item}>{item}</li>)}</ul> : <p>Sin afirmaciones adicionales pendientes.</p>}</section></div>}<div className="assistant-citations"><strong>Documentos utilizados</strong>{draft.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}><span>{source.sourceId}</span><div><strong>{source.evidenceName}</strong><p>{source.text}</p><small>SHA {source.textHash}</small></div><Download /></a>)}</div></article>)}{drafts.length === 0 && <article className="panel vault-empty"><FileText /><strong>No hay borradores guardados</strong><p>Los textos generados aparecerán aquí y seguirán disponibles después de reiniciar GORE.</p></article>}</div></>
+}
+
+function AIChatView() {
+  const [conversations, setConversations] = useState<AIConversationSummary[]>([])
+  const [active, setActive] = useState<AIConversation | null>(null)
+  const [message, setMessage] = useState('')
+  const [sending, setSending] = useState(false)
+  const [error, setError] = useState('')
+  const refreshList = () => apiGet<AIConversationSummary[]>('/api/ai/chat/conversations').then(setConversations).catch(() => undefined)
+  const loadConversation = (id: string) => apiGet<AIConversation>(`/api/ai/chat/conversations/${id}`).then(setActive)
+  useEffect(() => { refreshList() }, [])
+  useEffect(() => {
+    if (!active) return
+    const pending = active.messages.some(item => item.job && ['pending', 'processing'].includes(item.job.status))
+    if (!pending) return
+    const timer = window.setInterval(() => { loadConversation(active.id).then(refreshList).catch(() => undefined) }, 2500)
+    return () => window.clearInterval(timer)
+  }, [active])
+  async function send(event: React.FormEvent) {
+    event.preventDefault(); const value = message.trim(); if (!value) return
+    setSending(true); setError('')
+    try { const result = await apiPost<AIConversation>('/api/ai/chat/messages', { conversationId: active?.id ?? null, message: value }); setActive(result); setMessage(''); refreshList() }
+    catch { setError('No se pudo poner el mensaje en la cola local. Verificá Ollama e intentá nuevamente.') }
+    finally { setSending(false) }
+  }
+  async function retryFailed(index: number) {
+    if (!active) return
+    const previous = [...active.messages.slice(0, index)].reverse().find(item => item.role === 'user')
+    if (!previous) return
+    setSending(true); setError('')
+    try { setActive(await apiPost<AIConversation>('/api/ai/chat/messages', { conversationId: active.id, message: previous.content })); refreshList() }
+    catch { setError('No se pudo reintentar. Comprobá que Ollama esté activo.') }
+    finally { setSending(false) }
+  }
+  const waiting = active?.messages.findLast(item => item.job && ['pending', 'processing'].includes(item.job.status))
+  return <><section className="page-heading compact"><div><span className="eyebrow accent">CONVERSACIÓN PRIVADA EN SEGUNDO PLANO</span><h1>Chat con Ollama</h1><p>Conversá en lenguaje neutral usando evidencias, análisis guardados y aclaraciones aportadas por vos.</p></div></section><div className="ai-chat-layout"><aside className="panel ai-chat-history"><button className="primary-button" onClick={() => setActive(null)}><Plus size={15} /> Nueva conversación</button>{conversations.map(item => <button className={active?.id === item.id ? 'active' : ''} key={item.id} onClick={() => loadConversation(item.id)}><MessageCircle /><span><strong>{item.title}</strong><small>{format(new Date(item.updatedAt), 'dd/MM HH:mm')}</small></span></button>)}</aside><section className="panel ai-chat-main"><div className="ai-chat-notice"><ShieldCheck /><div><strong>Modelo avanzado · carga moderada</strong><span>Una sola tarea a la vez, contexto reducido y liberación automática del modelo. Las aclaraciones tuyas se identifican como datos aportados por el usuario.</span></div></div><div className="ai-chat-messages">{active?.messages.map((item, index) => <div className={`ai-chat-message ${item.role} ${item.status === 'failed' ? 'failed' : ''}`} key={item.id}><div><span>{item.role === 'user' ? 'Vos · dato aportado por el usuario' : 'GORE · Ollama local'}</span>{item.status === 'queued' || item.status === 'processing' ? <div className="ai-job-progress"><div><strong>{item.job?.stage ?? 'En cola'}</strong><small>{item.job?.model} · {item.job?.progress ?? 0}%</small></div><div className="ai-job-track"><i style={{ width: `${item.job?.progress ?? 0}%` }} /></div><p>Podés cambiar de pestaña o cerrar GORE. La tarea continuará y se recuperará al reiniciar.</p></div> : item.status === 'failed' ? <div className="chat-failed"><p>Ollama se detuvo o no terminó dentro del tiempo permitido.</p><button onClick={() => retryFailed(index)} disabled={sending}><Clock3 size={14} /> Reintentar este mensaje</button></div> : <p>{item.content}</p>}{item.sources.length > 0 && <div className="chat-sources">{item.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}>{source.sourceId} · {source.evidenceName}</a>)}</div>}</div></div>)}{!active && <div className="vault-empty"><MessageCircle /><strong>Iniciá una conversación</strong><p>Podés saludar, consultar pendientes o responder preguntas. GORE distinguirá tus aclaraciones de las evidencias originales.</p></div>}</div>{waiting && <div className="chat-background-indicator"><Clock3 /> Ollama está trabajando en segundo plano. Podés seguir usando el resto de GORE.</div>}<form className="ai-chat-form" onSubmit={send}><textarea value={message} onChange={event => setMessage(event.target.value)} maxLength={5000} placeholder="Ejemplo: ¿Podrías preparar una lista de incógnitas y preguntas pendientes para que yo las responda?" /><div><small>{message.length}/5000</small><button className="primary-button" disabled={sending || !message.trim()}><ArrowRight size={16} /> {sending ? 'Encolando…' : 'Enviar'}</button></div></form>{error && <div className="login-error">{error}</div>}</section></div></>
 }
 
 function CommunicationsView({ events, openModal, openEvent }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void }) {

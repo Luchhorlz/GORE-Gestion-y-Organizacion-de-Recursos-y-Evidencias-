@@ -57,6 +57,8 @@ SEMANTIC_MIN_SCORE = max(0.0, min(float(os.environ.get("GORE_SEMANTIC_MIN_SCORE"
 ALLOWED_EVIDENCE_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".opus", ".ogg", ".oga", ".mp3", ".m4a", ".aac", ".wav", ".amr", ".webm", ".mp4", ".mov", ".avi"}
 PROCESSING_WORKER_STARTED = False
 PROCESSING_WORKER_LOCK = threading.Lock()
+AI_CHAT_WORKER_STARTED = False
+AI_CHAT_WORKER_LOCK = threading.Lock()
 
 app = FastAPI(
     title="GORE API",
@@ -491,15 +493,92 @@ def start_processing_worker() -> None:
         threading.Thread(target=processing_worker, name="gore-processing-worker", daemon=True).start()
 
 
+def ai_chat_progress_ticker(job_id: str, stop: threading.Event) -> None:
+    progress = 52
+    while not stop.wait(12):
+        progress = min(90, progress + 4)
+        with database() as db:
+            db.execute("UPDATE ai_chat_jobs SET progress=?,stage='Analizando con el modelo local',updated_at=? WHERE id=? AND status='processing'", (progress, utc_now(), job_id))
+
+
+def process_next_ai_chat_job() -> bool:
+    with database() as db:
+        job = db.execute("SELECT * FROM ai_chat_jobs WHERE status='pending' ORDER BY created_at LIMIT 1").fetchone()
+        if not job: return False
+        now = utc_now()
+        if not db.execute("UPDATE ai_chat_jobs SET status='processing',progress=40,stage='Preparando el modelo avanzado',started_at=?,updated_at=? WHERE id=? AND status='pending'", (now, now, job["id"])).rowcount: return True
+        db.execute("UPDATE ai_chat_messages SET status='processing',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
+        history = db.execute("SELECT role,content,user_provided FROM ai_chat_messages WHERE conversation_id=? AND id<>? ORDER BY created_at DESC LIMIT 12", (job["conversation_id"], job["assistant_message_id"])).fetchall()
+    context_items = json.loads(job["context_json"])
+    evidence_context = "\n\n".join(f"[{item['sourceId']}] {item['evidenceName']} | SHA {item['textHash']}\n{item['text'][:700]}" for item in context_items.get("sources", []))
+    analysis_context = "\n".join(context_items.get("analyses", []))
+    conversation = "\n".join(("[DATO APORTADO POR EL USUARIO] " if row["role"] == "user" else "[RESPUESTA PREVIA DE GORE] ") + row["content"] for row in reversed(history))
+    prompt = f"""Sos el chat privado de GORE. Conversá en español neutral y claro.
+REGLAS:
+- Podés saludar y conversar normalmente.
+- Para hechos del expediente usá sólo EVIDENCIAS y ANÁLISIS GUARDADOS.
+- Todo mensaje del usuario es [DATO APORTADO POR EL USUARIO]: puede completar contexto, pero no es evidencia independiente ni hecho verificado.
+- Si el usuario responde incógnitas, enumerá qué quedó aclarado por él y qué sigue pendiente, indicando expresamente su origen.
+- No inventes hechos, normas, delitos, diagnósticos ni intenciones. No des asesoramiento jurídico definitivo.
+- Citá S1/S2 cuando afirmes algo proveniente de una evidencia. Diferenciá transcripciones auxiliares del original.
+- No reveles razonamiento interno. Ofrecé una respuesta final y, cuando corresponda, listas concretas.
+
+EVIDENCIAS:
+{evidence_context or 'Sin evidencias suficientemente relacionadas.'}
+
+ANÁLISIS GUARDADOS:
+{analysis_context or 'Sin análisis previos disponibles.'}
+
+CONVERSACIÓN:
+{conversation}
+"""
+    stop = threading.Event(); ticker = threading.Thread(target=ai_chat_progress_ticker, args=(job["id"], stop), daemon=True); ticker.start()
+    try:
+        with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=50,stage='Analizando con el modelo local',updated_at=? WHERE id=?", (utc_now(), job["id"]))
+        answer = ai_provider().generate(prompt, job["model"], think=False)
+        if not answer: raise AIProviderError("Respuesta vacía")
+        now = utc_now()
+        with database() as db:
+            db.execute("UPDATE ai_chat_messages SET content=?,sources_json=?,status='completed',updated_at=? WHERE id=?", (answer[:20_000], json.dumps(context_items.get("sources", []), ensure_ascii=False), now, job["assistant_message_id"]))
+            db.execute("UPDATE ai_chat_jobs SET status='completed',progress=100,stage='Respuesta guardada',completed_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
+            db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, job["conversation_id"]))
+            scope = {"tenant_id": job["tenant_id"], "case_id": job["case_id"], "user_id": DEFAULT_USER_ID}
+            audit(db, "AI_CHAT_RESPONSE_COMPLETED", "ai_chat_job", job["id"], {"model": job["model"], "sources": [item["sourceId"] for item in context_items.get("sources", [])]}, scope)
+    except Exception:
+        now = utc_now()
+        with database() as db:
+            db.execute("UPDATE ai_chat_messages SET content='No se pudo completar esta respuesta local.',status='failed',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
+            db.execute("UPDATE ai_chat_jobs SET status='failed',stage='No se pudo completar',error_code='local_generation_failed',updated_at=? WHERE id=?", (now, job["id"]))
+    finally:
+        stop.set()
+    return True
+
+
+def ai_chat_worker() -> None:
+    while True:
+        if not process_next_ai_chat_job(): time.sleep(1.5)
+
+
+def start_ai_chat_worker() -> None:
+    global AI_CHAT_WORKER_STARTED
+    with AI_CHAT_WORKER_LOCK:
+        if AI_CHAT_WORKER_STARTED: return
+        AI_CHAT_WORKER_STARTED = True
+        threading.Thread(target=ai_chat_worker, name="gore-ai-chat-worker", daemon=True).start()
+
+
 def recover_interrupted_processing() -> None:
     with database() as db:
         now = utc_now()
         interrupted = db.execute("SELECT COUNT(*) FROM processing_jobs WHERE status='processing'").fetchone()[0]
-        if not interrupted:
-            return
-        db.execute("UPDATE processing_jobs SET status='pending',available_at=?,updated_at=?,error_code='interrupted_recovered' WHERE status='processing'", (now, now))
-        db.execute("UPDATE audio_transcriptions SET status='queued',updated_at=? WHERE status='processing'", (now,))
-        audit(db, "PROCESSING_JOBS_RECOVERED", "system", "worker", {"jobs": interrupted})
+        if interrupted:
+            db.execute("UPDATE processing_jobs SET status='pending',available_at=?,updated_at=?,error_code='interrupted_recovered' WHERE status='processing'", (now, now))
+            db.execute("UPDATE audio_transcriptions SET status='queued',updated_at=? WHERE status='processing'", (now,))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_chat_jobs'").fetchone():
+            db.execute("UPDATE ai_chat_jobs SET status='pending',progress=20,stage='Retomando tarea interrumpida',updated_at=? WHERE status='processing'", (now,))
+            db.execute("UPDATE ai_chat_messages SET status='queued',updated_at=? WHERE status='processing'", (now,))
+        if interrupted:
+            audit(db, "PROCESSING_JOBS_RECOVERED", "system", "worker", {"jobs": interrupted})
 
 
 class EventCreate(BaseModel):
@@ -563,6 +642,11 @@ class AIDraftPayload(BaseModel):
     instructions: str = Field(default="", max_length=2000)
 
 
+class AIChatMessagePayload(BaseModel):
+    conversationId: str | None = Field(default=None, max_length=80)
+    message: str = Field(min_length=1, max_length=5000)
+
+
 def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
     return {
         "id": row["id"], "date": row["date"], "time": row["time"],
@@ -611,6 +695,7 @@ def startup() -> None:
     init_database()
     recover_interrupted_processing()
     start_processing_worker()
+    start_ai_chat_worker()
 
 
 @app.get("/api/health")
@@ -1315,6 +1400,67 @@ def generate_ai_draft(payload: AIDraftPayload, request: Request) -> dict:
         db.execute("INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (analysis_id, scope["tenant_id"], scope["case_id"], "draft", "completed", profile, model, json.dumps(result, ensure_ascii=False), json.dumps(cited_sources, ensure_ascii=False), 1, scope["user_id"], now, now))
         audit(db, "AI_DRAFT_GENERATED", "ai_analysis", analysis_id, {"model": model, "draft_type": payload.draftType, "citations": source_ids}, scope)
         return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone())
+
+
+def ai_conversation_dict(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    messages = db.execute("""SELECT m.*,j.id job_id,j.progress,j.stage,j.status job_status,j.model
+        FROM ai_chat_messages m LEFT JOIN ai_chat_jobs j ON j.assistant_message_id=m.id
+        WHERE m.conversation_id=? ORDER BY m.created_at""", (row["id"],)).fetchall()
+    return {"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"], "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "status": item["status"], "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
+
+
+@app.get("/api/ai/chat/conversations")
+def list_ai_conversations(request: Request) -> list[dict]:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM ai_conversations WHERE tenant_id=? AND case_id=? ORDER BY updated_at DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
+        return [{"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"]} for row in rows]
+
+
+@app.get("/api/ai/chat/conversations/{conversation_id}")
+def get_ai_conversation(conversation_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT * FROM ai_conversations WHERE id=? AND tenant_id=? AND case_id=?", (conversation_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not row: raise HTTPException(404, "Conversación no encontrada")
+        return ai_conversation_dict(db, row)
+
+
+@app.post("/api/ai/chat/messages", status_code=202)
+def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> dict:
+    message = payload.message.strip()
+    try:
+        retrieval = semantic_search(SemanticSearchPayload(query=message, limit=4), request)
+    except HTTPException as error:
+        if error.status_code != 503: raise
+        retrieval = {"results": []}
+    sources: list[dict] = []; seen: set[str] = set()
+    for source in retrieval["results"]:
+        if source["evidenceId"] not in seen:
+            sources.append({"sourceId": f"S{len(sources)+1}", **source}); seen.add(source["evidenceId"])
+        if len(sources) == 3: break
+    now = utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        conversation = None
+        if payload.conversationId:
+            conversation = db.execute("SELECT * FROM ai_conversations WHERE id=? AND tenant_id=? AND case_id=?", (payload.conversationId, scope["tenant_id"], scope["case_id"])).fetchone()
+            if not conversation: raise HTTPException(404, "Conversación no encontrada")
+        conversation_id = conversation["id"] if conversation else f"CNV-{uuid.uuid4().hex[:12].upper()}"
+        if not conversation:
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (conversation_id, scope["tenant_id"], scope["case_id"], message[:70], scope["user_id"], now, now))
+        analyses = db.execute("SELECT analysis_type,result_json FROM ai_analyses WHERE tenant_id=? AND case_id=? AND status='completed' ORDER BY created_at DESC LIMIT 8", (scope["tenant_id"], scope["case_id"])).fetchall()
+        analysis_context = [f"{row['analysis_type']}: {row['result_json'][:900]}" for row in analyses]
+        user_id, assistant_id, job_id = f"MSG-{uuid.uuid4().hex[:12].upper()}", f"MSG-{uuid.uuid4().hex[:12].upper()}", f"AIJ-{uuid.uuid4().hex[:12].upper()}"
+        db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (user_id, conversation_id, scope["tenant_id"], scope["case_id"], "user", message, 1, "[]", "completed", now, now))
+        db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (assistant_id, conversation_id, scope["tenant_id"], scope["case_id"], "assistant", "", 0, "[]", "queued", now, now))
+        context_json = json.dumps({"sources": sources, "analyses": analysis_context}, ensure_ascii=False)
+        model = AI_CONFIG.model_for("quality")
+        db.execute("INSERT INTO ai_chat_jobs (id,conversation_id,user_message_id,assistant_message_id,tenant_id,case_id,status,progress,stage,model,context_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, conversation_id, user_id, assistant_id, scope["tenant_id"], scope["case_id"], "pending", 20, "En cola para análisis local", model, context_json, now, now))
+        db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, conversation_id))
+        audit(db, "AI_CHAT_MESSAGE_QUEUED", "ai_chat_job", job_id, {"model": model, "source_count": len(sources)}, scope)
+        row = db.execute("SELECT * FROM ai_conversations WHERE id=?", (conversation_id,)).fetchone()
+        return ai_conversation_dict(db, row)
 
 
 @app.post("/api/ai/index/retry")

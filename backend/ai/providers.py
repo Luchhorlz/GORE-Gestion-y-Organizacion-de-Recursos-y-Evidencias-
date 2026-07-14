@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -61,7 +62,8 @@ class LocalAIProvider(AIProvider):
     def generate(self, prompt: str, model: str, *, think: bool = False) -> str:
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": think,
-            "options": {"temperature": 0},
+            "keep_alive": "30s",
+            "options": {"temperature": 0, "num_predict": 240, "num_ctx": 3072, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
         })
         return str(result.get("response", "")).strip()
 
@@ -69,7 +71,8 @@ class LocalAIProvider(AIProvider):
         token_limit = 700 if "body" in schema.get("properties", {}) else 520 if "items" in schema.get("properties", {}) or "dates" in schema.get("properties", {}) else 500 if "contradictions" in schema.get("properties", {}) else 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": False,
-            "format": schema, "options": {"temperature": 0, "num_predict": token_limit},
+            "keep_alive": "30s", "format": schema,
+            "options": {"temperature": 0, "num_predict": token_limit, "num_ctx": 3072, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
         })
         try:
             parsed = json.loads(str(result.get("response", "")))

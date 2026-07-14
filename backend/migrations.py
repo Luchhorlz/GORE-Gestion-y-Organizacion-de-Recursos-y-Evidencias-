@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 9
 
 
 def _utc_now() -> str:
@@ -351,6 +351,36 @@ def _migration_008_date_proposals(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_009_ai_chat(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ai_conversations (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id), title TEXT NOT NULL,
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_chat_messages (
+            id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            role TEXT NOT NULL, content TEXT NOT NULL, user_provided INTEGER NOT NULL DEFAULT 0,
+            sources_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_chat_jobs (
+            id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+            user_message_id TEXT NOT NULL REFERENCES ai_chat_messages(id), assistant_message_id TEXT NOT NULL REFERENCES ai_chat_messages(id),
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL,
+            model TEXT NOT NULL, context_json TEXT NOT NULL DEFAULT '[]', error_code TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_conversations_scope ON ai_conversations (tenant_id,case_id,updated_at);
+        CREATE INDEX IF NOT EXISTS idx_ai_chat_messages_conversation ON ai_chat_messages (conversation_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_ai_chat_jobs_queue ON ai_chat_jobs (status,created_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -360,6 +390,7 @@ MIGRATIONS = {
     6: _migration_006_ai_analyses,
     7: _migration_007_chronology_proposals,
     8: _migration_008_date_proposals,
+    9: _migration_009_ai_chat,
 }
 
 

@@ -177,6 +177,17 @@ class IsolationTests(unittest.TestCase):
         drafts = self.client.get("/api/ai/drafts")
         self.assertEqual(drafts.status_code, 200, drafts.text)
         self.assertEqual(drafts.json()[0]["id"], draft.json()["id"])
+        queued_chat = self.client.post("/api/ai/chat/messages", json={"message": "Hola, listar preguntas pendientes"})
+        self.assertEqual(queued_chat.status_code, 202, queued_chat.text)
+        conversation_id = queued_chat.json()["id"]
+        conversation = queued_chat.json()
+        for _ in range(80):
+            conversation = self.client.get(f"/api/ai/chat/conversations/{conversation_id}").json()
+            if conversation["messages"][-1]["status"] in {"completed", "failed"}: break
+            time.sleep(0.05)
+        self.assertEqual(conversation["messages"][0]["userProvided"], True)
+        self.assertEqual(conversation["messages"][-1]["status"], "completed")
+        self.assertEqual(conversation["messages"][-1]["job"]["progress"], 100)
 
 
 if __name__ == "__main__":
