@@ -31,6 +31,7 @@ type StoredChatSummary = { id: string; displayName: string; selfName: string; so
 type StoredChat = Omit<StoredChatSummary, 'messageCount' | 'audioCount'> & { rawText: string; messages: ChatMessage[]; audioMatches: { messageId: number; evidenceId?: string; confidence: AudioMatch['confidence']; reason: string }[] }
 type AudioTranscription = { evidence_id: string; text: string; status: string; language: string; engine: string; updated_at: string }
 type AIStatus = { enabled: boolean; provider: string; available: boolean; version: string; activeProfile: string; activeModel: string; profiles: { id: string; model: string; installed: boolean }[]; embeddingModel: string; embeddingInstalled: boolean }
+type Workspace = { tenant: { id: string; name: string }; user: { id: string; displayName: string; role: string }; case: { id: string; code: string; title: string; status: string; role: string } }
 
 const seedEvents: EventItem[] = [
   { id: 'EVT-20260618-001', date: '2026-06-18', time: '19:20', category: 'Comunicación', title: 'Propuesta de organización semanal', description: 'Se registró una conversación sobre la organización de los próximos días.', expected: 'Organización habitual', actual: 'Propuesta de cambio', evidenceCount: 2, status: 'Revisado' },
@@ -70,6 +71,7 @@ function App() {
   const [backendOnline, setBackendOnline] = useState(false)
   const [authenticated, setAuthenticated] = useState<boolean | null>(null)
   const [caseConfig, setCaseConfig] = useState<CaseConfig>({ caseCode: 'GORE-2026-001', title: 'Organización familiar', status: 'En documentación', mainMilestone: '2026-07-01', previousModality: 'Organización semanal alternada' })
+  const [workspace, setWorkspace] = useState<Workspace | null>(null)
 
   useEffect(() => localStorage.setItem('gore-events', JSON.stringify(events)), [events])
   useEffect(() => localStorage.setItem('gore-evidence', JSON.stringify(evidence)), [evidence])
@@ -80,8 +82,8 @@ function App() {
   }, [])
   useEffect(() => {
     if (!authenticated) return
-    Promise.all([apiGet<EventItem[]>('/api/events'), apiGet<Evidence[]>('/api/evidence'), apiGet<CaseConfig>('/api/case')])
-      .then(([serverEvents, serverEvidence, serverCase]) => { setBackendOnline(true); setEvents(serverEvents); setEvidence(serverEvidence); setCaseConfig(serverCase) })
+    Promise.all([apiGet<EventItem[]>('/api/events'), apiGet<Evidence[]>('/api/evidence'), apiGet<CaseConfig>('/api/case'), apiGet<Workspace>('/api/workspace')])
+      .then(([serverEvents, serverEvidence, serverCase, serverWorkspace]) => { setBackendOnline(true); setEvents(serverEvents); setEvidence(serverEvidence); setCaseConfig(serverCase); setWorkspace(serverWorkspace) })
       .catch(() => setBackendOnline(false))
   }, [authenticated])
 
@@ -135,7 +137,7 @@ function App() {
           <button><Users size={19} /> Personas autorizadas</button>
           <button onClick={() => go('configuracion')}><Settings size={19} /> Configuración</button>
           <button onClick={logout}><LogOut size={19} /> Cerrar sesión</button>
-          <div className="user-card"><div className="avatar">LC</div><div><strong>Luciano Chaer</strong><span>Propietario</span></div><ShieldCheck size={17} /></div>
+          <div className="user-card"><div className="avatar">{workspace?.user.displayName.split(/\s+/).map(part => part[0]).join('').slice(0, 2).toUpperCase() || 'LC'}</div><div><strong>{workspace?.user.displayName || 'Luciano Chaer'}</strong><span>{workspace?.tenant.name || 'Estudio personal'}</span></div><ShieldCheck size={17} /></div>
         </div>
       </aside>
       {mobileOpen && <div className="scrim" onClick={() => setMobileOpen(false)} />}

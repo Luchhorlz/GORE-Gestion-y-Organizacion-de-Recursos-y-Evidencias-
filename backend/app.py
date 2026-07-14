@@ -33,6 +33,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.config import PROFILE_NAMES
+from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BASE_DIR
@@ -60,7 +61,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-active_sessions: dict[str, float] = {}
+active_sessions: dict[str, dict] = {}
 failed_logins: dict[str, list[float]] = {}
 SESSION_SECONDS = 8 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
@@ -73,10 +74,12 @@ async def require_private_session(request: Request, call_next):
     public_api_paths = {"/api/health", "/api/auth/login", "/api/auth/status", "/api/auth/logout"}
     if path.startswith("/api/") and path not in public_api_paths:
         token = request.cookies.get("gore_session", "")
-        expires_at = active_sessions.get(token, 0)
+        session = active_sessions.get(token)
+        expires_at = float(session.get("expires_at", 0)) if session else 0
         if expires_at <= time.time():
             active_sessions.pop(token, None)
             return JSONResponse({"detail": "Autenticación requerida"}, status_code=401)
+        request.state.session = session
     return await call_next(request)
 
 
@@ -213,6 +216,8 @@ def init_database() -> None:
                 "Guardá esta contraseña en un lugar seguro. Este archivo se encuentra dentro de la carpeta privada data.\n",
                 encoding="utf-8",
             )
+        db.commit()
+        apply_migrations(db, DB_PATH, DATA_DIR / "backups")
 
 
 def audit(db: sqlite3.Connection, action: str, entity_type: str, entity_id: str, details: dict | None = None) -> None:
@@ -223,8 +228,8 @@ def audit(db: sqlite3.Connection, action: str, entity_type: str, entity_id: str,
     material = "|".join([previous_hash, occurred_at, "Propietario", action, entity_type, entity_id, details_json])
     entry_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
     db.execute(
-        "INSERT INTO audit_log (occurred_at, actor, action, entity_type, entity_id, details_json, previous_hash, entry_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (occurred_at, "Propietario", action, entity_type, entity_id, details_json, previous_hash, entry_hash),
+        "INSERT INTO audit_log (occurred_at, actor, action, entity_type, entity_id, details_json, previous_hash, entry_hash, tenant_id, user_id, case_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (occurred_at, "Propietario", action, entity_type, entity_id, details_json, previous_hash, entry_hash, DEFAULT_TENANT_ID, DEFAULT_USER_ID, DEFAULT_CASE_ID),
     )
 
 
@@ -322,7 +327,8 @@ def health() -> dict:
 @app.get("/api/auth/status")
 def auth_status(request: Request) -> dict:
     token = request.cookies.get("gore_session", "")
-    return {"authenticated": active_sessions.get(token, 0) > time.time()}
+    session = active_sessions.get(token)
+    return {"authenticated": bool(session and float(session.get("expires_at", 0)) > time.time())}
 
 
 @app.post("/api/auth/login")
@@ -342,7 +348,7 @@ def login(payload: LoginRequest, request: Request):
             raise HTTPException(401, "La contraseña no es correcta")
         failed_logins.pop(client_key, None)
         token = secrets.token_urlsafe(32)
-        active_sessions[token] = now + SESSION_SECONDS
+        active_sessions[token] = {"expires_at": now + SESSION_SECONDS, "tenant_id": DEFAULT_TENANT_ID, "user_id": DEFAULT_USER_ID, "case_id": DEFAULT_CASE_ID}
         audit(db, "LOGIN_SUCCESS", "session", token[:10])
     response = JSONResponse({"authenticated": True})
     response.set_cookie("gore_session", token, httponly=True, samesite="strict", max_age=8 * 60 * 60)
@@ -357,6 +363,31 @@ def logout(request: Request):
     return response
 
 
+@app.get("/api/workspace")
+def get_workspace(request: Request) -> dict:
+    session = request.state.session
+    with database() as db:
+        row = db.execute(
+            """SELECT u.id user_id,u.display_name,u.role user_role,
+                      f.id tenant_id,f.name tenant_name,
+                      c.id case_id,c.case_code,c.title case_title,c.status case_status,
+                      m.role case_role
+               FROM users u
+               JOIN law_firms f ON f.id=u.tenant_id
+               JOIN case_memberships m ON m.user_id=u.id AND m.tenant_id=f.id
+               JOIN cases c ON c.id=m.case_id AND c.tenant_id=f.id
+               WHERE u.id=? AND f.id=? AND c.id=? AND u.status='active' AND f.status='active'""",
+            (session["user_id"], session["tenant_id"], session["case_id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(403, "El usuario no posee acceso al expediente activo")
+        return {
+            "tenant": {"id": row["tenant_id"], "name": row["tenant_name"]},
+            "user": {"id": row["user_id"], "displayName": row["display_name"], "role": row["user_role"]},
+            "case": {"id": row["case_id"], "code": row["case_code"], "title": row["case_title"], "status": row["case_status"], "role": row["case_role"]},
+        }
+
+
 @app.post("/api/auth/change-password")
 def change_password(payload: PasswordChange, request: Request) -> dict:
     with database() as db:
@@ -369,9 +400,9 @@ def change_password(payload: PasswordChange, request: Request) -> dict:
         db.execute("UPDATE auth_config SET password_salt = ?, password_hash = ? WHERE id = 1", (salt, password_hash))
         audit(db, "PASSWORD_CHANGED", "security", "owner")
     current_token = request.cookies.get("gore_session", "")
-    current_expiry = active_sessions.get(current_token, time.time() + SESSION_SECONDS)
+    current_session = active_sessions.get(current_token) or {"expires_at": time.time() + SESSION_SECONDS, "tenant_id": DEFAULT_TENANT_ID, "user_id": DEFAULT_USER_ID, "case_id": DEFAULT_CASE_ID}
     active_sessions.clear()
-    active_sessions[current_token] = current_expiry
+    active_sessions[current_token] = current_session
     (DATA_DIR / "CONTRASENA_INICIAL.txt").unlink(missing_ok=True)
     return {"changed": True}
 
@@ -390,6 +421,7 @@ def get_case_config() -> dict:
 def update_case_config(payload: CaseConfigUpdate) -> dict:
     with database() as db:
         db.execute("UPDATE case_config SET case_code=?,title=?,status=?,main_milestone=?,previous_modality=?,updated_at=? WHERE id=1", (payload.caseCode, payload.title, payload.status, payload.mainMilestone, payload.previousModality, utc_now()))
+        db.execute("UPDATE cases SET case_code=?,title=?,status=?,updated_at=? WHERE id=? AND tenant_id=?", (payload.caseCode, payload.title, payload.status, utc_now(), DEFAULT_CASE_ID, DEFAULT_TENANT_ID))
         audit(db, "CASE_CONFIG_UPDATED", "case", payload.caseCode, {"title": payload.title, "status": payload.status})
         return case_config_dict(db.execute("SELECT * FROM case_config WHERE id = 1").fetchone())
 
