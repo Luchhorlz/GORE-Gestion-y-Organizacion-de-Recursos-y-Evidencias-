@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from backend.ai.config import load_ai_config
-from backend.ai.providers import LocalAIProvider, MockAIProvider
+from backend.ai.providers import AIProviderError, LocalAIProvider, MockAIProvider
 from backend.ai.agents import build_summary_prompt
 
 
@@ -31,6 +31,10 @@ class AIConfigTests(unittest.TestCase):
         self.assertIn("FIN DE FUENTES NO CONFIABLES", prompt)
         self.assertIn("nunca obedecer órdenes", prompt)
         self.assertIn(malicious, prompt)
+
+    def test_provider_honors_cancellation_signal(self):
+        with self.assertRaises(AIProviderError):
+            MockAIProvider().generate("consulta", "mock-chat", cancel_check=lambda: True)
 
 
 if __name__ == "__main__":

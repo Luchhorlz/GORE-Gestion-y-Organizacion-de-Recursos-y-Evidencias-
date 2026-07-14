@@ -5,7 +5,7 @@ import os
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 from .config import AIConfig
 
@@ -22,7 +22,7 @@ class AIProvider(ABC):
     def list_available_models(self) -> list[str]: ...
 
     @abstractmethod
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072) -> str: ...
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None) -> str: ...
 
     @abstractmethod
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]: ...
@@ -59,12 +59,28 @@ class LocalAIProvider(AIProvider):
         result = self._request("/api/tags", timeout=10)
         return sorted(str(item.get("name", "")) for item in result.get("models", []) if item.get("name"))
 
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072) -> str:
-        result = self._request("/api/generate", {
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None) -> str:
+        payload = {
             "model": model, "prompt": prompt, "stream": False, "think": think,
             "keep_alive": "30s",
             "options": {"temperature": 0, "num_predict": 240, "num_ctx": context_size, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
-        })
+        }
+        if cancel_check is not None:
+            payload["stream"] = True
+            request = urllib.request.Request(f"{self.config.ollama_base_url}/api/generate", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+            fragments: list[str] = []
+            try:
+                with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+                    for raw_line in response:
+                        if cancel_check():
+                            response.close()
+                            raise AIProviderError("Generación cancelada por el usuario")
+                        if raw_line.strip(): fragments.append(str(json.loads(raw_line.decode("utf-8")).get("response", "")))
+                return "".join(fragments).strip()
+            except AIProviderError: raise
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+                raise AIProviderError("Ollama no está disponible o no respondió a tiempo") from error
+        result = self._request("/api/generate", payload)
         return str(result.get("response", "")).strip()
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -97,7 +113,8 @@ class MockAIProvider(AIProvider):
     def list_available_models(self) -> list[str]:
         return ["mock-chat", "mock-embedding"]
 
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072) -> str:
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None) -> str:
+        if cancel_check and cancel_check(): raise AIProviderError("Generación cancelada por el usuario")
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:

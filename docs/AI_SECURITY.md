@@ -14,6 +14,7 @@
 - Los endpoints de generación admiten hasta 30 solicitudes por usuario cada 10 minutos. Al alcanzar el límite responden con un mensaje seguro y el tiempo de espera, sin iniciar trabajo adicional.
 - La auditoría técnica guarda modelo, fuentes, duración y estado, pero no copia el contenido completo de mensajes o evidencias.
 - Las respuestas siguen siendo resultados derivados sujetos a revisión humana; ningún agente crea eventos ni realiza presentaciones automáticamente.
+- Una tarea de chat puede cancelarse durante la espera o generación. El servidor conserva el estado `cancelled`, corta la respuesta en curso y registra la acción sin borrar fuentes ni originales.
 - El acceso futuro se filtra por tenant, usuario, permiso y expediente antes de consultar documentos o vectores.
 - Las fechas detectadas son propuestas `pending_review`.
 - Las respuestas que requieren evidencia deben incluir fuentes o declarar información insuficiente.

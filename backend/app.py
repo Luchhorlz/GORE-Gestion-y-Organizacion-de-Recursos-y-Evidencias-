@@ -59,6 +59,8 @@ PROCESSING_WORKER_STARTED = False
 PROCESSING_WORKER_LOCK = threading.Lock()
 AI_CHAT_WORKER_STARTED = False
 AI_CHAT_WORKER_LOCK = threading.Lock()
+AI_CHAT_CANCEL_LOCK = threading.Lock()
+AI_CHAT_CANCEL_EVENTS: dict[str, threading.Event] = {}
 AI_RATE_WINDOW_SECONDS = 10 * 60
 AI_RATE_MAX_REQUESTS = 30
 AI_RATE_LOCK = threading.Lock()
@@ -523,12 +525,18 @@ def process_next_ai_chat_job() -> bool:
         if not db.execute("UPDATE ai_chat_jobs SET status='processing',progress=30,stage='Preparando fuentes y adjuntos',started_at=?,updated_at=? WHERE id=? AND status='pending'", (now, now, job["id"])).rowcount: return True
         db.execute("UPDATE ai_chat_messages SET status='processing',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
         history = db.execute("SELECT role,content,user_provided FROM ai_chat_messages WHERE conversation_id=? AND id<>? ORDER BY created_at DESC LIMIT 12", (job["conversation_id"], job["assistant_message_id"])).fetchall()
+    cancel_event = threading.Event()
+    with AI_CHAT_CANCEL_LOCK: AI_CHAT_CANCEL_EVENTS[job["id"]] = cancel_event
+    with database() as db:
+        current_status = db.execute("SELECT status FROM ai_chat_jobs WHERE id=?", (job["id"],)).fetchone()
+    if current_status and current_status["status"] == "cancelled": cancel_event.set()
     context_items = json.loads(job["context_json"])
     attachments = context_items.get("attachments", [])
     if attachments:
         with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=35,stage='Extrayendo texto de los adjuntos',updated_at=? WHERE id=?", (utc_now(), job["id"]))
         deadline = time.time() + 240
         while time.time() < deadline:
+            if cancel_event.is_set(): break
             with database() as db:
                 states = [db.execute("SELECT extraction_status FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (item["evidenceId"], job["tenant_id"], job["case_id"])).fetchone() for item in attachments]
             if all(state and state["extraction_status"] in {"ready", "empty", "failed", "not_applicable"} for state in states): break
@@ -570,7 +578,9 @@ CONVERSACIÓN:
     try:
         with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=50,stage='Analizando con el modelo local',updated_at=? WHERE id=?", (utc_now(), job["id"]))
         generation_started = time.perf_counter()
-        answer = ai_provider().generate(prompt, job["model"], think=False, context_size=16_384)
+        if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
+        answer = ai_provider().generate(prompt, job["model"], think=False, context_size=16_384, cancel_check=cancel_event.is_set)
+        if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
         duration_ms = round((time.perf_counter() - generation_started) * 1000)
         if not answer: raise AIProviderError("Respuesta vacía")
         now = utc_now()
@@ -583,10 +593,13 @@ CONVERSACIÓN:
     except Exception:
         now = utc_now()
         with database() as db:
-            db.execute("UPDATE ai_chat_messages SET content='No se pudo completar esta respuesta local.',status='failed',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
-            db.execute("UPDATE ai_chat_jobs SET status='failed',stage='No se pudo completar',error_code='local_generation_failed',updated_at=? WHERE id=?", (now, job["id"]))
+            current = db.execute("SELECT status FROM ai_chat_jobs WHERE id=?", (job["id"],)).fetchone()
+            if not current or current["status"] != "cancelled":
+                db.execute("UPDATE ai_chat_messages SET content='No se pudo completar esta respuesta local.',status='failed',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
+                db.execute("UPDATE ai_chat_jobs SET status='failed',stage='No se pudo completar',error_code='local_generation_failed',updated_at=? WHERE id=?", (now, job["id"]))
     finally:
         stop.set()
+        with AI_CHAT_CANCEL_LOCK: AI_CHAT_CANCEL_EVENTS.pop(job["id"], None)
     return True
 
 
@@ -888,6 +901,52 @@ def get_ai_status(request: Request) -> dict:
     with database() as db:
         authorized_scope(request, db)
     return ai_status_payload()
+
+
+@app.get("/api/ai/operations/status")
+def get_ai_operations_status(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        params = (scope["tenant_id"], scope["case_id"])
+        processing = db.execute(
+            """SELECT
+               SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+               SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) processing,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed,
+               SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed
+               FROM processing_jobs WHERE tenant_id=? AND case_id=?""", params,
+        ).fetchone()
+        chats = db.execute(
+            """SELECT
+               SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+               SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) processing,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed,
+               SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
+               AVG(CASE WHEN status='completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                   THEN (julianday(completed_at)-julianday(started_at))*86400 END) average_seconds
+               FROM ai_chat_jobs WHERE tenant_id=? AND case_id=?""", params,
+        ).fetchone()
+        evidence = db.execute(
+            """SELECT COUNT(*) total,
+               SUM(CASE WHEN extraction_status IN ('queued','processing') THEN 1 ELSE 0 END) extracting,
+               SUM(CASE WHEN extraction_status='failed' OR embedding_status='failed' THEN 1 ELSE 0 END) failed
+               FROM evidence WHERE tenant_id=? AND case_id=?""", params,
+        ).fetchone()
+        analyses = db.execute("SELECT COUNT(*) FROM ai_analyses WHERE tenant_id=? AND case_id=? AND status='completed'", params).fetchone()[0]
+        latest = db.execute(
+            "SELECT id,status,progress,stage,model,created_at,updated_at FROM ai_chat_jobs WHERE tenant_id=? AND case_id=? ORDER BY created_at DESC LIMIT 6", params,
+        ).fetchall()
+    status = ai_status_payload()
+    counts = lambda row: {key: int(row[key] or 0) for key in ("pending", "processing", "completed", "failed")}
+    return {
+        "ollamaAvailable": status["available"], "activeModel": status["activeModel"],
+        "processingJobs": counts(processing), "chatJobs": counts(chats),
+        "averageChatSeconds": round(float(chats["average_seconds"] or 0), 1),
+        "evidence": {"total": int(evidence["total"] or 0), "extracting": int(evidence["extracting"] or 0), "failed": int(evidence["failed"] or 0)},
+        "completedAnalyses": int(analyses),
+        "latestChatJobs": [{"id": row["id"], "status": row["status"], "progress": row["progress"], "stage": row["stage"], "model": row["model"], "createdAt": row["created_at"], "updatedAt": row["updated_at"]} for row in latest],
+        "generatedAt": utc_now(),
+    }
 
 
 @app.put("/api/ai/settings")
@@ -1506,6 +1565,24 @@ def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> di
         audit(db, "AI_CHAT_MESSAGE_QUEUED", "ai_chat_job", job_id, {"model": model, "source_count": len(sources)}, scope)
         row = db.execute("SELECT * FROM ai_conversations WHERE id=?", (conversation_id,)).fetchone()
         return ai_conversation_dict(db, row)
+
+
+@app.post("/api/ai/chat/jobs/{job_id}/cancel")
+def cancel_ai_chat_job(job_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        job = db.execute("SELECT * FROM ai_chat_jobs WHERE id=? AND tenant_id=? AND case_id=?", (job_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not job: raise HTTPException(404, "Tarea de IA no encontrada")
+        if job["status"] not in {"pending", "processing"}:
+            return {"id": job_id, "status": job["status"], "cancelled": False}
+        now = utc_now()
+        db.execute("UPDATE ai_chat_jobs SET status='cancelled',stage='Cancelado por el usuario',error_code='user_cancelled',completed_at=?,updated_at=? WHERE id=?", (now, now, job_id))
+        db.execute("UPDATE ai_chat_messages SET content='Análisis cancelado por el usuario.',status='cancelled',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
+        audit(db, "AI_CHAT_RESPONSE_CANCELLED", "ai_chat_job", job_id, {"model": job["model"]}, scope)
+    with AI_CHAT_CANCEL_LOCK:
+        event = AI_CHAT_CANCEL_EVENTS.get(job_id)
+        if event: event.set()
+    return {"id": job_id, "status": "cancelled", "cancelled": True}
 
 
 @app.post("/api/ai/index/retry")

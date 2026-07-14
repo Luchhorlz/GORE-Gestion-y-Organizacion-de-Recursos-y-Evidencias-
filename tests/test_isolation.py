@@ -75,6 +75,33 @@ class IsolationTests(unittest.TestCase):
         response = self.client.post("/api/ai/chat/messages", json={"message": "Analizar adjunto", "evidenceIds": ["EVD-FOREIGN"]})
         self.assertEqual(response.status_code, 404)
 
+    def test_ai_operations_status_is_scoped_and_content_free(self):
+        response = self.client.get("/api/ai/operations/status")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertIn("processingJobs", payload)
+        self.assertIn("chatJobs", payload)
+        self.assertIn("averageChatSeconds", payload)
+        self.assertNotIn("content", response.text.lower())
+        self.assertNotIn("EVD-FOREIGN", response.text)
+
+    def test_ai_chat_job_can_be_cancelled_and_stays_cancelled(self):
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            db.execute("INSERT INTO ai_conversations VALUES (?,?,?,?,?,?,?)", ("CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Cancelar", self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-CANCEL-USER", "CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "user", "Consulta a cancelar", 1, "[]", "completed", now, now))
+            db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-CANCEL-AI", "CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "assistant", "", 0, "[]", "processing", now, now))
+            db.execute("INSERT INTO ai_chat_jobs (id,conversation_id,user_message_id,assistant_message_id,tenant_id,case_id,status,progress,stage,model,context_json,created_at,started_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("AIJ-CANCEL-TEST", "CNV-CANCEL-TEST", "MSG-CANCEL-USER", "MSG-CANCEL-AI", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "processing", 60, "Analizando", "mock-chat", "{}", now, now, now))
+        response = self.client.post("/api/ai/chat/jobs/AIJ-CANCEL-TEST/cancel")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["cancelled"])
+        with self.module.database() as db:
+            job = db.execute("SELECT status,error_code FROM ai_chat_jobs WHERE id='AIJ-CANCEL-TEST'").fetchone()
+            message = db.execute("SELECT status,content FROM ai_chat_messages WHERE id='MSG-CANCEL-AI'").fetchone()
+        self.assertEqual((job["status"], job["error_code"]), ("cancelled", "user_cancelled"))
+        self.assertEqual(message["status"], "cancelled")
+        self.assertIn("cancelado", message["content"].lower())
+
     def test_secure_upload_is_verified_and_duplicate_is_reused(self):
         content = b"Texto de prueba juridica para verificar el original."
         first = self.client.post("/api/evidence", files={"file": ("prueba.txt", content, "application/octet-stream")})
