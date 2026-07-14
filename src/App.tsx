@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'borradores' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -36,6 +36,7 @@ type ContradictionsAnalysis = { id: string; contradictions: ContradictionItem[];
 type EvidenceAnalysisItem = { sourceId: string; classification: 'favorable' | 'desfavorable' | 'neutral'; relevance: string; limitations: string; authenticityConcerns: string[]; confidence: number }
 type EvidenceAnalysis = { id: string; items: EvidenceAnalysisItem[]; missingEvidence: string[]; sources: AssistantCitation[]; insufficientEvidence: boolean; model: string; profile: string; generatedAt: string }
 type DateProposal = { id: string; date: string; time: string; type: string; reason: string; dateBasis: 'explicit' | 'inferred' | 'file_date'; certainty: number; sources: AssistantCitation[]; warning: string; status: 'pending_review' | 'approved' | 'rejected'; approvedEventId?: string }
+type AIDraft = { id: string; draftType: string; draftTypeLabel: string; title: string; body: string; unconfirmedInformation: string[]; reviewFields: string[]; sources: AssistantCitation[]; disclaimer: string; model: string; profile: string; generatedAt: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -61,6 +62,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'analisis-evidencia', label: 'Análisis de evidencias', icon: FileCheck2 },
   { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
   { id: 'contradicciones', label: 'Posibles contradicciones', icon: Scale },
+  { id: 'borradores', label: 'Borradores asistidos', icon: FileText },
   { id: 'comunicaciones', label: 'Comunicaciones', icon: MessageCircle },
   { id: 'whatsapp', label: 'Simulador WhatsApp', icon: Phone },
   { id: 'informes', label: 'Informes', icon: FileText },
@@ -204,6 +206,7 @@ function App() {
           {view === 'analisis-evidencia' && <EvidenceAnalysisView />}
           {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
           {view === 'contradicciones' && <ContradictionsView />}
+          {view === 'borradores' && <DraftsView />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
           {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} audioProgress={audioProgress} prepareAllAudios={prepareAllAudios} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
@@ -460,6 +463,27 @@ function ContradictionsView() {
   }
   const source = (id: string) => analysis?.sources.find(item => item.sourceId === id)
   return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">COMPARACIÓN LOCAL TRAZABLE</span><h1>Posibles contradicciones</h1><p>Compara versiones provenientes de evidencias diferentes sin atribuir intenciones ni conclusiones jurídicas.</p></div><button className="primary-button" onClick={analyze} disabled={loading}><Scale size={17} /> {loading ? 'Comparando…' : analysis ? 'Volver a analizar' : 'Analizar evidencias'}</button></section><div className="contradiction-warning"><Info /><div><strong>Indicadores para revisión, no conclusiones</strong><span>Una posible incompatibilidad puede deberse a fechas, contextos o errores de transcripción. Siempre revisá los originales.</span></div></div>{error && <div className="login-error">{error}</div>}{analysis ? <div className="contradictions-list">{analysis.contradictions.map((item, index) => <article className="panel contradiction-card" key={`${item.sourceA}-${item.sourceB}-${index}`}><div className="contradiction-head"><span>POSIBLE CONTRADICCIÓN {index + 1}</span><div><b className={`severity ${item.severity}`}>{item.severity === 'high' ? 'Alta' : item.severity === 'medium' ? 'Media' : 'Baja'}</b><small>Confianza {(item.confidence * 100).toFixed(0)}%</small></div></div><div className="claims-compare"><section><span>{item.sourceA}</span><p>{item.claimA}</p>{source(item.sourceA) && <a href={evidenceDownloadUrl(source(item.sourceA)!.evidenceId)}>{source(item.sourceA)!.evidenceName} <Download /></a>}</section><Scale /><section><span>{item.sourceB}</span><p>{item.claimB}</p>{source(item.sourceB) && <a href={evidenceDownloadUrl(source(item.sourceB)!.evidenceId)}>{source(item.sourceB)!.evidenceName} <Download /></a>}</section></div><div className="contradiction-reason"><strong>Motivo de la posible incompatibilidad</strong><p>{item.reason}</p><strong>Explicación alternativa</strong><p>{item.alternativeExplanation || 'No fue identificada; requiere revisión humana.'}</p></div></article>)}{analysis.noContradictionsFound && <article className="panel vault-empty"><ShieldCheck /><strong>No se detectaron contradicciones suficientemente respaldadas</strong><p>Esto no demuestra que no existan; indica que las fuentes comparadas no alcanzaron el criterio mínimo.</p></article>}<small className="analysis-footer">Análisis local con {analysis.model} · {format(new Date(analysis.generatedAt), "dd/MM/yyyy 'a las' HH:mm")} · Revisión humana obligatoria.</small></div> : <article className="panel vault-empty"><Scale /><strong>Todavía no se compararon las evidencias</strong><p>GORE exigirá dos archivos distintos y conservará el resultado para futuras revisiones.</p></article>}</>
+}
+
+function DraftsView() {
+  const [drafts, setDrafts] = useState<AIDraft[]>([])
+  const [draftType, setDraftType] = useState('internal_report')
+  const [instructions, setInstructions] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [copied, setCopied] = useState('')
+  useEffect(() => { apiGet<AIDraft[]>('/api/ai/drafts').then(setDrafts).catch(() => undefined) }, [])
+  async function generate(event: React.FormEvent) {
+    event.preventDefault(); setLoading(true); setError('')
+    try { const draft = await apiPost<AIDraft>('/api/ai/drafts', { draftType, instructions: instructions.trim() }); setDrafts(previous => [draft, ...previous]); setInstructions('') }
+    catch { setError('No se pudo generar el borrador. Revisá las indicaciones, las evidencias indexadas y Ollama.') }
+    finally { setLoading(false) }
+  }
+  async function copyDraft(draft: AIDraft) {
+    try { await navigator.clipboard.writeText(`${draft.title}\n\n${draft.body}\n\n${draft.disclaimer}`); setCopied(draft.id); window.setTimeout(() => setCopied(''), 2000) }
+    catch { setError('El navegador no permitió copiar el borrador.') }
+  }
+  return <><section className="page-heading compact"><div><span className="eyebrow accent">REDACCIÓN LOCAL CON REVISIÓN</span><h1>Borradores asistidos</h1><p>Prepara textos basados en fuentes sin enviar, firmar ni presentar nada automáticamente.</p></div></section><form className="panel draft-form" onSubmit={generate}><div className="panel-head"><div><h2>Nuevo borrador</h2><p>Elegí el formato y explicá qué necesitás preparar.</p></div><Sparkles /></div><div className="draft-form-fields"><label>Tipo de borrador<select value={draftType} onChange={event => setDraftType(event.target.value)}><option value="client_summary">Resumen para cliente</option><option value="internal_report">Informe interno</option><option value="questions">Lista de preguntas</option><option value="minutes">Minuta</option><option value="email">Correo</option><option value="document_request">Solicitud de documentación</option><option value="generic_legal">Borrador jurídico genérico</option></select></label><label>Indicaciones opcionales<textarea value={instructions} onChange={event => setInstructions(event.target.value)} maxLength={2000} placeholder="Ejemplo: preparar una lista breve de preguntas sobre las fechas y la modalidad de cuidado." /></label></div><div className="draft-form-actions"><span>{instructions.length}/2000 · Sólo se usarán evidencias relacionadas.</span><button className="primary-button" disabled={loading}><FileText size={16} /> {loading ? 'Redactando…' : 'Generar borrador'}</button></div>{error && <div className="login-error">{error}</div>}</form><div className="draft-list">{drafts.map(draft => <article className="panel draft-card" key={draft.id}><div className="draft-card-head"><div><span>{draft.draftTypeLabel}</span><h2>{draft.title}</h2><small>{format(new Date(draft.generatedAt), "dd/MM/yyyy 'a las' HH:mm")} · {draft.model}</small></div><button onClick={() => copyDraft(draft)}><FileCheck2 size={15} /> {copied === draft.id ? 'Copiado' : 'Copiar borrador'}</button></div><div className="draft-disclaimer"><Info /><span>{draft.disclaimer}</span></div><div className="draft-body">{draft.body}</div>{(draft.reviewFields.length > 0 || draft.unconfirmedInformation.length > 0) && <div className="draft-review"><section><strong>Campos para revisar</strong>{draft.reviewFields.length ? <ul>{draft.reviewFields.map(item => <li key={item}>{item}</li>)}</ul> : <p>Sin campos señalados.</p>}</section><section><strong>Información no confirmada</strong>{draft.unconfirmedInformation.length ? <ul>{draft.unconfirmedInformation.map(item => <li key={item}>{item}</li>)}</ul> : <p>Sin afirmaciones adicionales pendientes.</p>}</section></div>}<div className="assistant-citations"><strong>Documentos utilizados</strong>{draft.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}><span>{source.sourceId}</span><div><strong>{source.evidenceName}</strong><p>{source.text}</p><small>SHA {source.textHash}</small></div><Download /></a>)}</div></article>)}{drafts.length === 0 && <article className="panel vault-empty"><FileText /><strong>No hay borradores guardados</strong><p>Los textos generados aparecerán aquí y seguirán disponibles después de reiniciar GORE.</p></article>}</div></>
 }
 
 function CommunicationsView({ events, openModal, openEvent }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void }) {

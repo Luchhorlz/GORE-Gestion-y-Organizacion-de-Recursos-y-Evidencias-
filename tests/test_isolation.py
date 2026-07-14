@@ -170,6 +170,13 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(organized.json()["items"][0]["sourceId"], "S1")
         persisted = self.client.get("/api/ai/analyses/evidence")
         self.assertEqual(persisted.json()["analysis"]["id"], organized.json()["id"])
+        draft = self.client.post("/api/ai/drafts", json={"draftType": "internal_report", "instructions": "Resumir la modalidad de cuidado"})
+        self.assertEqual(draft.status_code, 200, draft.text)
+        self.assertEqual(draft.json()["draftType"], "internal_report")
+        self.assertEqual(draft.json()["sources"][0]["sourceId"], "S1")
+        drafts = self.client.get("/api/ai/drafts")
+        self.assertEqual(drafts.status_code, 200, drafts.text)
+        self.assertEqual(drafts.json()[0]["id"], draft.json()["id"])
 
 
 if __name__ == "__main__":

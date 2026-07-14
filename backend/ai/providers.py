@@ -66,7 +66,7 @@ class LocalAIProvider(AIProvider):
         return str(result.get("response", "")).strip()
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
-        token_limit = 520 if "items" in schema.get("properties", {}) or "dates" in schema.get("properties", {}) else 500 if "contradictions" in schema.get("properties", {}) else 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
+        token_limit = 700 if "body" in schema.get("properties", {}) else 520 if "items" in schema.get("properties", {}) or "dates" in schema.get("properties", {}) else 500 if "contradictions" in schema.get("properties", {}) else 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": False,
             "format": schema, "options": {"temperature": 0, "num_predict": token_limit},
@@ -98,6 +98,8 @@ class MockAIProvider(AIProvider):
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if "body" in schema.get("properties", {}):
+            return {"title": "Borrador simulado", "body": "Contenido de borrador respaldado por la fuente S1.", "unconfirmed_information": [], "review_fields": ["Revisar destinatario"], "source_ids": ["S1"]}
         if "dates" in schema.get("properties", {}):
             return {"dates": [{"date": "2026-07-09", "time": "10:00", "type": "compromiso", "reason": "Entrega acordada entre las partes.", "date_basis": "explicit", "certainty": 0.85, "source_ids": ["S1"]}]}
         if "items" in schema.get("properties", {}):

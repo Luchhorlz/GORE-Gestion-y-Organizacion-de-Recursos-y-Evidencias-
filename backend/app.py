@@ -35,7 +35,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.providers import AIProviderError
 from backend.ai.config import PROFILE_NAMES
-from backend.ai.agents import CHRONOLOGY_SCHEMA, CONTRADICTIONS_SCHEMA, DATES_SCHEMA, EVIDENCE_ANALYSIS_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_contradictions_prompt, build_dates_prompt, build_evidence_analysis_prompt, build_summary_prompt, normalize_summary
+from backend.ai.agents import CHRONOLOGY_SCHEMA, CONTRADICTIONS_SCHEMA, DATES_SCHEMA, DRAFT_SCHEMA, EVIDENCE_ANALYSIS_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_contradictions_prompt, build_dates_prompt, build_draft_prompt, build_evidence_analysis_prompt, build_summary_prompt, normalize_summary
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
@@ -556,6 +556,11 @@ class SemanticSearchPayload(BaseModel):
 
 class AIQuestionPayload(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
+
+
+class AIDraftPayload(BaseModel):
+    draftType: str = Field(min_length=3, max_length=80)
+    instructions: str = Field(default="", max_length=2000)
 
 
 def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
@@ -1256,6 +1261,60 @@ def reject_date_proposal(proposal_id: str, request: Request) -> dict:
         if not updated: raise HTTPException(404, "Propuesta pendiente no encontrada")
         audit(db, "AI_DATE_PROPOSAL_REJECTED", "date_proposal", proposal_id, {}, scope)
         return date_proposal_dict(db.execute("SELECT * FROM date_proposals WHERE id=?", (proposal_id,)).fetchone())
+
+
+@app.get("/api/ai/drafts")
+def list_ai_drafts(request: Request) -> list[dict]:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM ai_analyses WHERE tenant_id=? AND case_id=? AND analysis_type='draft' AND status='completed' ORDER BY created_at DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
+        return [ai_analysis_dict(row) for row in rows]
+
+
+@app.post("/api/ai/drafts")
+def generate_ai_draft(payload: AIDraftPayload, request: Request) -> dict:
+    draft_types = {
+        "client_summary": "Resumen para cliente", "internal_report": "Informe interno",
+        "questions": "Lista de preguntas", "minutes": "Minuta", "email": "Correo",
+        "document_request": "Solicitud de documentación", "generic_legal": "Borrador jurídico genérico",
+    }
+    if payload.draftType not in draft_types:
+        raise HTTPException(422, "Tipo de borrador no permitido")
+    query = payload.instructions.strip() or "hechos principales comunicaciones acuerdos evidencia información faltante"
+    retrieval = semantic_search(SemanticSearchPayload(query=query, limit=8), request)
+    sources: list[dict] = []; seen: set[str] = set()
+    for source in retrieval["results"]:
+        if source["evidenceId"] not in seen:
+            sources.append(source); seen.add(source["evidenceId"])
+        if len(sources) == 3: break
+    if not sources:
+        raise HTTPException(422, "No hay evidencias suficientemente relacionadas para redactar este borrador")
+    with database() as db:
+        scope = authorized_scope(request, db)
+        setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone()
+        profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+    source_map = {f"S{index}": source for index, source in enumerate(sources, start=1)}
+    context = "\n\n".join(f"[{sid}] Archivo: {source['evidenceName']} | Fecha: {source['factDate'] or 'sin fecha'} | SHA: {source['textHash']}\n{source['text'][:650]}" for sid, source in source_map.items())
+    model = AI_CONFIG.model_for(profile)
+    try:
+        raw = ai_provider().generate_structured(build_draft_prompt(draft_types[payload.draftType], payload.instructions.strip(), context), model, DRAFT_SCHEMA)
+    except AIProviderError as error:
+        raise HTTPException(503, "Ollama no pudo generar el borrador local") from error
+    source_ids = list(dict.fromkeys(str(value) for value in raw.get("source_ids", []) if str(value) in source_map)) if isinstance(raw.get("source_ids"), list) else []
+    if not source_ids:
+        raise HTTPException(422, "El modelo no pudo respaldar el borrador con fuentes válidas")
+    def clean_list(value: object, limit: int = 8) -> list[str]:
+        return [str(item).strip()[:400] for item in value[:limit] if str(item).strip()] if isinstance(value, list) else []
+    result = {"draftType": payload.draftType, "draftTypeLabel": draft_types[payload.draftType], "title": str(raw.get("title", "")).strip()[:200] or draft_types[payload.draftType], "body": str(raw.get("body", "")).strip()[:12_000], "unconfirmedInformation": clean_list(raw.get("unconfirmed_information")), "reviewFields": clean_list(raw.get("review_fields")), "sourceIds": source_ids, "humanReviewRequired": True, "disclaimer": "Borrador generado localmente. Debe ser revisado antes de copiar, exportar, enviar o presentar."}
+    if not result["body"]:
+        raise HTTPException(422, "El modelo no produjo un borrador utilizable")
+    cited_sources = [{"sourceId": source_id, **source_map[source_id]} for source_id in source_ids]
+    analysis_id, now = f"DRF-{uuid.uuid4().hex[:12].upper()}", utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        db.execute("INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (analysis_id, scope["tenant_id"], scope["case_id"], "draft", "completed", profile, model, json.dumps(result, ensure_ascii=False), json.dumps(cited_sources, ensure_ascii=False), 1, scope["user_id"], now, now))
+        audit(db, "AI_DRAFT_GENERATED", "ai_analysis", analysis_id, {"model": model, "draft_type": payload.draftType, "citations": source_ids}, scope)
+        return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone())
 
 
 @app.post("/api/ai/index/retry")
