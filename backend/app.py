@@ -33,6 +33,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.config import PROFILE_NAMES
+from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -319,19 +320,54 @@ def process_next_job() -> bool:
                 while chunk := source.read(1024 * 1024): digest.update(chunk)
             if digest.hexdigest() != evidence["sha256"]: raise ValueError("integrity_mismatch")
             now = utc_now()
-            db.execute("UPDATE evidence SET processing_status='ready',processing_error='',detected_media_type=CASE WHEN detected_media_type='' THEN media_type ELSE detected_media_type END WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+            if job["job_type"] == "document_extract":
+                sections = extract_document(path, evidence["media_type"])
+                db.execute("DELETE FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+                character_count = 0
+                chunk_count = 0
+                methods: set[str] = set()
+                for section in sections:
+                    methods.add(section.method)
+                    character_count += len(section.text)
+                    for chunk_index, text_chunk in enumerate(chunk_text(section.text), start=1):
+                        chunk_id = f"TXT-{uuid.uuid4().hex[:16].upper()}"
+                        db.execute(
+                            "INSERT INTO evidence_text_chunks (id,evidence_id,tenant_id,case_id,section_type,section_label,section_index,chunk_index,text,text_sha256,extraction_method,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (chunk_id, job["evidence_id"], job["tenant_id"], job["case_id"], section.section_type, section.section_label, section.section_index, chunk_index, text_chunk, hashlib.sha256(text_chunk.encode("utf-8")).hexdigest(), section.method, now),
+                        )
+                        chunk_count += 1
+                extraction_status = "ready" if character_count else "empty"
+                engine = "+".join(sorted(methods))
+                db.execute(
+                    "INSERT INTO evidence_extractions (evidence_id,tenant_id,case_id,status,character_count,section_count,engine,source_sha256,error_code,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET status=excluded.status,character_count=excluded.character_count,section_count=excluded.section_count,engine=excluded.engine,source_sha256=excluded.source_sha256,error_code='',updated_at=excluded.updated_at",
+                    (job["evidence_id"], job["tenant_id"], job["case_id"], extraction_status, character_count, len(sections), engine, evidence["sha256"], "", now, now),
+                )
+                db.execute("UPDATE evidence SET extraction_status=?,extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (extraction_status, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "EVIDENCE_TEXT_EXTRACTED", "evidence", job["evidence_id"], {"job_id": job["id"], "characters": character_count, "chunks": chunk_count, "sections": len(sections), "engine": engine}, scope)
+            else:
+                db.execute("UPDATE evidence SET processing_status='ready',processing_error='',detected_media_type=CASE WHEN detected_media_type='' THEN media_type ELSE detected_media_type END WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+                if evidence["media_type"] in SUPPORTED_MEDIA_TYPES:
+                    active_extract = db.execute("SELECT 1 FROM processing_jobs WHERE evidence_id=? AND job_type='document_extract' AND status IN ('pending','processing')", (job["evidence_id"],)).fetchone()
+                    if not active_extract:
+                        enqueue_processing_job(db, job["evidence_id"], scope, "document_extract")
+                    db.execute("UPDATE evidence SET extraction_status='queued',extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "EVIDENCE_INTAKE_VERIFIED", "evidence", job["evidence_id"], {"job_id": job["id"], "sha256_verified": True}, scope)
             db.execute("UPDATE processing_jobs SET status='completed',completed_at=?,updated_at=?,error_code='' WHERE id=?", (now, now, job["id"]))
-            audit(db, "EVIDENCE_INTAKE_VERIFIED", "evidence", job["evidence_id"], {"job_id": job["id"], "sha256_verified": True}, scope)
     except Exception as error:
         code = str(error) if str(error) in {"evidence_missing", "original_missing", "integrity_mismatch"} else type(error).__name__
         with database() as db:
             current = db.execute("SELECT attempts,max_attempts FROM processing_jobs WHERE id=?", (job["id"],)).fetchone()
             terminal = current["attempts"] >= current["max_attempts"] or code == "integrity_mismatch"
             status = "failed" if terminal else "pending"
-            evidence_status = "quarantined" if code == "integrity_mismatch" else ("failed" if terminal else "pending")
             db.execute("UPDATE processing_jobs SET status=?,error_code=?,available_at=?,updated_at=? WHERE id=?", (status, code, utc_now(), utc_now(), job["id"]))
-            db.execute("UPDATE evidence SET processing_status=?,processing_error=? WHERE id=? AND tenant_id=? AND case_id=?", (evidence_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
-            audit(db, "EVIDENCE_INTAKE_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
+            if job["job_type"] == "document_extract":
+                extraction_status = "failed" if terminal else "queued"
+                db.execute("UPDATE evidence SET extraction_status=?,extraction_error=? WHERE id=? AND tenant_id=? AND case_id=?", (extraction_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "EVIDENCE_TEXT_EXTRACTION_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
+            else:
+                evidence_status = "quarantined" if code == "integrity_mismatch" else ("failed" if terminal else "pending")
+                db.execute("UPDATE evidence SET processing_status=?,processing_error=? WHERE id=? AND tenant_id=? AND case_id=?", (evidence_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "EVIDENCE_INTAKE_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
     return True
 
 
@@ -423,6 +459,8 @@ def evidence_dict(row: sqlite3.Row) -> dict:
     if "processing_status" in keys: result["processingStatus"] = row["processing_status"]
     if "detected_media_type" in keys: result["detectedType"] = row["detected_media_type"]
     if "processing_error" in keys: result["processingError"] = row["processing_error"]
+    if "extraction_status" in keys: result["extractionStatus"] = row["extraction_status"]
+    if "extraction_error" in keys: result["extractionError"] = row["extraction_error"]
     return result
 
 
@@ -781,6 +819,45 @@ def retry_evidence_processing(evidence_id: str, request: Request) -> dict:
         job_id = enqueue_processing_job(db, evidence_id, scope)
         db.execute("UPDATE evidence SET processing_status='pending',processing_error='' WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"]))
         audit(db, "EVIDENCE_PROCESSING_RETRIED", "evidence", evidence_id, {"job_id": job_id}, scope)
+        return {"jobId": job_id, "status": "pending"}
+
+
+@app.get("/api/evidence/{evidence_id}/text")
+def get_evidence_text(evidence_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        evidence = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not evidence:
+            raise HTTPException(404, "Evidencia no encontrada")
+        extraction = db.execute("SELECT * FROM evidence_extractions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        chunks = db.execute(
+            "SELECT section_type,section_label,section_index,chunk_index,text,text_sha256,extraction_method FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=? ORDER BY section_index,chunk_index",
+            (evidence_id, scope["tenant_id"], scope["case_id"]),
+        ).fetchall()
+        return {
+            "evidenceId": evidence_id,
+            "status": evidence["extraction_status"],
+            "error": evidence["extraction_error"],
+            "summary": dict(extraction) if extraction else None,
+            "chunks": [dict(chunk) for chunk in chunks],
+        }
+
+
+@app.post("/api/evidence/{evidence_id}/text/retry")
+def retry_evidence_text(evidence_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        evidence = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not evidence:
+            raise HTTPException(404, "Evidencia no encontrada")
+        if evidence["media_type"] not in SUPPORTED_MEDIA_TYPES:
+            raise HTTPException(415, "Esta clase de evidencia no contiene texto extraíble")
+        active = db.execute("SELECT id FROM processing_jobs WHERE evidence_id=? AND job_type='document_extract' AND status IN ('pending','processing')", (evidence_id,)).fetchone()
+        if active:
+            return {"jobId": active["id"], "status": "already_pending"}
+        job_id = enqueue_processing_job(db, evidence_id, scope, "document_extract")
+        db.execute("UPDATE evidence SET extraction_status='queued',extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"]))
+        audit(db, "EVIDENCE_TEXT_EXTRACTION_RETRIED", "evidence", evidence_id, {"job_id": job_id}, scope)
         return {"jobId": job_id, "status": "pending"}
 
 

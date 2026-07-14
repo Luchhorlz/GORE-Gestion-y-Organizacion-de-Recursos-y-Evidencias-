@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 def _utc_now() -> str:
@@ -154,7 +154,75 @@ def _migration_002_evidence_processing_queue(db: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = {1: _migration_001_workspace_isolation, 2: _migration_002_evidence_processing_queue}
+def _migration_003_document_extraction(db: sqlite3.Connection) -> None:
+    now = _utc_now()
+    _add_column(db, "evidence", "extraction_status TEXT NOT NULL DEFAULT 'not_applicable'")
+    _add_column(db, "evidence", "extraction_error TEXT NOT NULL DEFAULT ''")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_extractions (
+            evidence_id TEXT PRIMARY KEY REFERENCES evidence(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id),
+            status TEXT NOT NULL,
+            character_count INTEGER NOT NULL DEFAULT 0,
+            section_count INTEGER NOT NULL DEFAULT 0,
+            engine TEXT NOT NULL DEFAULT '',
+            source_sha256 TEXT NOT NULL,
+            error_code TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS evidence_text_chunks (
+            id TEXT PRIMARY KEY,
+            evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id),
+            section_type TEXT NOT NULL,
+            section_label TEXT NOT NULL,
+            section_index INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            text_sha256 TEXT NOT NULL,
+            extraction_method TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(evidence_id,section_index,chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_text_chunks_scope
+            ON evidence_text_chunks (tenant_id,case_id,evidence_id,section_index,chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_evidence_extractions_scope
+            ON evidence_extractions (tenant_id,case_id,status);
+        """
+    )
+    columns = _columns(db, "evidence")
+    required = {"id", "tenant_id", "case_id", "created_by", "media_type", "processing_status"}
+    if required.issubset(columns):
+        supported = (
+            "text/plain",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+        )
+        placeholders = ",".join("?" for _ in supported)
+        db.execute(f"UPDATE evidence SET extraction_status='queued' WHERE processing_status='ready' AND media_type IN ({placeholders})", supported)
+        db.execute(
+            f"""INSERT OR IGNORE INTO processing_jobs
+                (id,tenant_id,case_id,evidence_id,job_type,status,available_at,created_by,created_at,updated_at)
+                SELECT 'JOB-EXTRACT-' || id,tenant_id,case_id,id,'document_extract','pending',?,created_by,?,?
+                FROM evidence WHERE processing_status='ready' AND media_type IN ({placeholders})""",
+            (now, now, now, *supported),
+        )
+
+
+MIGRATIONS = {
+    1: _migration_001_workspace_isolation,
+    2: _migration_002_evidence_processing_queue,
+    3: _migration_003_document_extraction,
+}
 
 
 def apply_migrations(db: sqlite3.Connection, db_path: Path, backup_dir: Path) -> list[int]:

@@ -68,7 +68,19 @@ class IsolationTests(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertEqual(status, "ready")
-        self.assertEqual(processing.json()["jobs"][0]["status"], "completed")
+        intake_job = next(job for job in processing.json()["jobs"] if job["job_type"] == "secure_intake")
+        self.assertEqual(intake_job["status"], "completed")
+        extraction_status = "queued"
+        for _ in range(80):
+            extracted = self.client.get(f"/api/evidence/{evidence_id}/text")
+            self.assertEqual(extracted.status_code, 200, extracted.text)
+            extraction_status = extracted.json()["status"]
+            if extraction_status == "ready":
+                break
+            time.sleep(0.05)
+        self.assertEqual(extraction_status, "ready")
+        self.assertIn("Texto de prueba juridica", extracted.json()["chunks"][0]["text"])
+        self.assertEqual(extracted.json()["summary"]["source_sha256"], first.json()["hash"])
 
         duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
         self.assertEqual(duplicate.status_code, 201, duplicate.text)

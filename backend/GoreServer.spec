@@ -6,7 +6,7 @@ root = Path(SPECPATH).parent
 extra_datas = []
 extra_binaries = []
 extra_hiddenimports = []
-for package in ('faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'onnxruntime'):
+for package in ('faster_whisper', 'ctranslate2', 'av', 'tokenizers', 'onnxruntime', 'rapidocr_onnxruntime', 'pypdfium2', 'pypdf', 'docx', 'openpyxl'):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     extra_datas += package_datas
     extra_binaries += package_binaries
