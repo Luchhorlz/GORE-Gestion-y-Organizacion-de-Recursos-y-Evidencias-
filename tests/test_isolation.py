@@ -150,6 +150,12 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(item["embeddingStatus"], "ready")
         result = self.client.post("/api/ai/search", json={"query": "modalidad de cuidado", "limit": 5}).json()["results"]
         self.assertTrue(any(row["evidenceId"] == evidence_id and row["sectionLabel"] == "Transcripción del audio" for row in result))
+        compared = self.client.post("/api/ai/analyses/contradictions", json={})
+        self.assertEqual(compared.status_code, 200, compared.text)
+        self.assertEqual(len(compared.json()["contradictions"]), 1)
+        self.assertNotEqual(compared.json()["contradictions"][0]["sourceA"], compared.json()["contradictions"][0]["sourceB"])
+        latest = self.client.get("/api/ai/analyses/contradictions")
+        self.assertEqual(latest.json()["analysis"]["id"], compared.json()["id"])
 
 
 if __name__ == "__main__":

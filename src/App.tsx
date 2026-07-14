@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'asistente' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'asistente' | 'contradicciones' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -31,6 +31,8 @@ type AssistantCitation = SemanticSearchResult & { sourceId: string }
 type AssistantAnswer = { question: string; answer: string; insufficientEvidence: boolean; caveats: string[]; citations: AssistantCitation[]; model: string; profile: string }
 type CaseSummary = { id: string; executiveSummary: string; mainFacts: string[]; peopleInvolved: string[]; availableEvidence: string[]; missingInformation: string[]; questionsPending: string[]; confidence: number; insufficientEvidence: boolean; humanReviewRequired: boolean; sources: AssistantCitation[]; model: string; profile: string; generatedAt: string }
 type ChronologyProposal = { id: string; date: string; time: string; description: string; people: string[]; certainty: number; dateBasis: 'explicit' | 'inferred' | 'file_date'; sources: AssistantCitation[]; status: 'pending_review' | 'approved' | 'rejected'; approvedEventId?: string }
+type ContradictionItem = { claimA: string; sourceA: string; claimB: string; sourceB: string; reason: string; alternativeExplanation: string; severity: 'low' | 'medium' | 'high'; confidence: number }
+type ContradictionsAnalysis = { id: string; contradictions: ContradictionItem[]; sources: AssistantCitation[]; noContradictionsFound: boolean; humanReviewRequired: boolean; model: string; profile: string; generatedAt: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -53,6 +55,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'acontecimientos', label: 'Acontecimientos', icon: Clock3 },
   { id: 'evidencias', label: 'Bóveda de evidencias', icon: FolderLock },
   { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
+  { id: 'contradicciones', label: 'Posibles contradicciones', icon: Scale },
   { id: 'comunicaciones', label: 'Comunicaciones', icon: MessageCircle },
   { id: 'whatsapp', label: 'Simulador WhatsApp', icon: Phone },
   { id: 'informes', label: 'Informes', icon: FileText },
@@ -193,6 +196,7 @@ function App() {
           {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
           {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
+          {view === 'contradicciones' && <ContradictionsView />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
           {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} audioProgress={audioProgress} prepareAllAudios={prepareAllAudios} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
@@ -399,6 +403,21 @@ function AIAssistantView({ audioProgress }: { audioProgress: AudioIndexStatus | 
     finally { setLoading(false) }
   }
   return <><section className="page-heading compact"><div><span className="eyebrow accent">ANÁLISIS LOCAL CON FUENTES</span><h1>Asistente documental</h1><p>Consultá el expediente usando solamente información recuperada de las evidencias.</p></div></section><article className="panel assistant-panel"><div className="assistant-safety"><ShieldCheck /><div><strong>Respuestas limitadas por evidencia</strong><span>GORE debe indicar cuando no encuentra respaldo suficiente. Las transcripciones son auxiliares y el audio original siempre prevalece.</span></div></div>{audioProgress && !audioProgress.finished && <div className="assistant-progress"><Clock3 /><span>La cobertura continúa aumentando: {audioProgress.completed} de {audioProgress.total} audios transcritos ({audioProgress.percent}%).</span></div>}<form onSubmit={ask}><textarea value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ejemplo: ¿Qué comunicaciones mencionan cambios en la modalidad de cuidado?" maxLength={2000} /><div><small>{question.length}/2000</small><button className="primary-button" disabled={loading || question.trim().length < 3}><Sparkles size={16} /> {loading ? 'Analizando evidencias…' : 'Preguntar a GORE'}</button></div></form>{error && <div className="login-error">{error}</div>}</article><div className="assistant-answers">{answers.map((item, answerIndex) => <article className="panel assistant-answer" key={`${item.question}-${answerIndex}`}><span className="assistant-question">{item.question}</span><div className={`assistant-answer-status ${item.insufficientEvidence ? 'insufficient' : ''}`}><Sparkles /><strong>{item.insufficientEvidence ? 'Evidencia insuficiente' : 'Respuesta respaldada'}</strong><small>{item.model === 'none' ? 'Sin ejecutar modelo generativo' : `${item.model} · perfil ${item.profile}`}</small></div><p>{item.answer}</p>{item.caveats.length > 0 && <ul>{item.caveats.map(caveat => <li key={caveat}>{caveat}</li>)}</ul>}{item.citations.length > 0 && <div className="assistant-citations"><strong>Fuentes utilizadas</strong>{item.citations.map(citation => <a href={evidenceDownloadUrl(citation.evidenceId)} key={citation.sourceId}><span>{citation.sourceId}</span><div><strong>{citation.evidenceName} · {citation.sectionLabel}</strong><p>{citation.text}</p><small>Coincidencia {(citation.score * 100).toFixed(1)}% · SHA {citation.textHash}</small></div><Download /></a>)}</div>}</article>)}</div></>
+}
+
+function ContradictionsView() {
+  const [analysis, setAnalysis] = useState<ContradictionsAnalysis | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { apiGet<{ analysis: ContradictionsAnalysis | null }>('/api/ai/analyses/contradictions').then(result => setAnalysis(result.analysis)).catch(() => undefined) }, [])
+  async function analyze() {
+    setLoading(true); setError('')
+    try { setAnalysis(await apiPost<ContradictionsAnalysis>('/api/ai/analyses/contradictions', {})) }
+    catch { setError('No se pudo completar la comparación. Se necesitan al menos dos evidencias distintas indexadas y Ollama activo.') }
+    finally { setLoading(false) }
+  }
+  const source = (id: string) => analysis?.sources.find(item => item.sourceId === id)
+  return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">COMPARACIÓN LOCAL TRAZABLE</span><h1>Posibles contradicciones</h1><p>Compara versiones provenientes de evidencias diferentes sin atribuir intenciones ni conclusiones jurídicas.</p></div><button className="primary-button" onClick={analyze} disabled={loading}><Scale size={17} /> {loading ? 'Comparando…' : analysis ? 'Volver a analizar' : 'Analizar evidencias'}</button></section><div className="contradiction-warning"><Info /><div><strong>Indicadores para revisión, no conclusiones</strong><span>Una posible incompatibilidad puede deberse a fechas, contextos o errores de transcripción. Siempre revisá los originales.</span></div></div>{error && <div className="login-error">{error}</div>}{analysis ? <div className="contradictions-list">{analysis.contradictions.map((item, index) => <article className="panel contradiction-card" key={`${item.sourceA}-${item.sourceB}-${index}`}><div className="contradiction-head"><span>POSIBLE CONTRADICCIÓN {index + 1}</span><div><b className={`severity ${item.severity}`}>{item.severity === 'high' ? 'Alta' : item.severity === 'medium' ? 'Media' : 'Baja'}</b><small>Confianza {(item.confidence * 100).toFixed(0)}%</small></div></div><div className="claims-compare"><section><span>{item.sourceA}</span><p>{item.claimA}</p>{source(item.sourceA) && <a href={evidenceDownloadUrl(source(item.sourceA)!.evidenceId)}>{source(item.sourceA)!.evidenceName} <Download /></a>}</section><Scale /><section><span>{item.sourceB}</span><p>{item.claimB}</p>{source(item.sourceB) && <a href={evidenceDownloadUrl(source(item.sourceB)!.evidenceId)}>{source(item.sourceB)!.evidenceName} <Download /></a>}</section></div><div className="contradiction-reason"><strong>Motivo de la posible incompatibilidad</strong><p>{item.reason}</p><strong>Explicación alternativa</strong><p>{item.alternativeExplanation || 'No fue identificada; requiere revisión humana.'}</p></div></article>)}{analysis.noContradictionsFound && <article className="panel vault-empty"><ShieldCheck /><strong>No se detectaron contradicciones suficientemente respaldadas</strong><p>Esto no demuestra que no existan; indica que las fuentes comparadas no alcanzaron el criterio mínimo.</p></article>}<small className="analysis-footer">Análisis local con {analysis.model} · {format(new Date(analysis.generatedAt), "dd/MM/yyyy 'a las' HH:mm")} · Revisión humana obligatoria.</small></div> : <article className="panel vault-empty"><Scale /><strong>Todavía no se compararon las evidencias</strong><p>GORE exigirá dos archivos distintos y conservará el resultado para futuras revisiones.</p></article>}</>
 }
 
 function CommunicationsView({ events, openModal, openEvent }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void }) {

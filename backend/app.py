@@ -35,7 +35,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.providers import AIProviderError
 from backend.ai.config import PROFILE_NAMES
-from backend.ai.agents import CHRONOLOGY_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_summary_prompt, normalize_summary
+from backend.ai.agents import CHRONOLOGY_SCHEMA, CONTRADICTIONS_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_contradictions_prompt, build_summary_prompt, normalize_summary
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
@@ -1050,6 +1050,67 @@ def reject_chronology_proposal(proposal_id: str, request: Request) -> dict:
             raise HTTPException(404, "Propuesta pendiente no encontrada")
         audit(db, "AI_CHRONOLOGY_REJECTED", "chronology_proposal", proposal_id, {}, scope)
         return chronology_proposal_dict(db.execute("SELECT * FROM chronology_proposals WHERE id=?", (proposal_id,)).fetchone())
+
+
+@app.get("/api/ai/analyses/contradictions")
+def latest_contradictions_analysis(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT * FROM ai_analyses WHERE tenant_id=? AND case_id=? AND analysis_type='contradictions' AND status='completed' ORDER BY created_at DESC LIMIT 1", (scope["tenant_id"], scope["case_id"])).fetchone()
+        return {"analysis": ai_analysis_dict(row) if row else None}
+
+
+@app.post("/api/ai/analyses/contradictions")
+def generate_contradictions_analysis(request: Request) -> dict:
+    retrieval = semantic_search(SemanticSearchPayload(query="acuerdos versiones cambios modalidades fechas afirmaciones", limit=8), request)
+    distinct_sources: list[dict] = []
+    evidence_seen: set[str] = set()
+    for source in retrieval["results"]:
+        if source["evidenceId"] not in evidence_seen:
+            distinct_sources.append(source)
+            evidence_seen.add(source["evidenceId"])
+        if len(distinct_sources) == 4:
+            break
+    if len(distinct_sources) < 2:
+        raise HTTPException(422, "Se necesitan al menos dos evidencias distintas indexadas para comparar versiones")
+    with database() as db:
+        scope = authorized_scope(request, db)
+        setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone()
+        profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+    source_map = {f"S{index}": source for index, source in enumerate(distinct_sources, start=1)}
+    context = "\n\n".join(f"[{sid}] Archivo: {source['evidenceName']} | Fecha: {source['factDate'] or 'sin fecha'} | SHA: {source['textHash']}\n{source['text'][:700]}" for sid, source in source_map.items())
+    model = AI_CONFIG.model_for(profile)
+    try:
+        raw = ai_provider().generate_structured(build_contradictions_prompt(context), model, CONTRADICTIONS_SCHEMA)
+    except AIProviderError as error:
+        raise HTTPException(503, "Ollama no pudo comparar las evidencias localmente") from error
+    contradictions: list[dict] = []
+    cited_ids: list[str] = []
+    for item in raw.get("contradictions", [])[:3] if isinstance(raw.get("contradictions"), list) else []:
+        source_a, source_b = str(item.get("source_a", "")), str(item.get("source_b", ""))
+        if source_a not in source_map or source_b not in source_map or source_a == source_b or source_map[source_a]["evidenceId"] == source_map[source_b]["evidenceId"]:
+            continue
+        claim_a, claim_b, reason = str(item.get("claim_a", "")).strip(), str(item.get("claim_b", "")).strip(), str(item.get("reason", "")).strip()
+        if not claim_a or not claim_b or not reason:
+            continue
+        try:
+            confidence = max(0.0, min(float(item.get("confidence", 0)), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        severity = str(item.get("severity", "")).lower()
+        severity = severity if severity in {"low", "medium", "high"} else "low"
+        contradictions.append({"claimA": claim_a[:500], "sourceA": source_a, "claimB": claim_b[:500], "sourceB": source_b, "reason": reason[:500], "alternativeExplanation": str(item.get("alternative_explanation", "")).strip()[:500], "severity": severity, "confidence": confidence})
+        for source_id in (source_a, source_b):
+            if source_id not in cited_ids:
+                cited_ids.append(source_id)
+    cited_sources = [{"sourceId": source_id, **source_map[source_id]} for source_id in cited_ids]
+    result = {"contradictions": contradictions, "sourceIds": cited_ids, "humanReviewRequired": True, "noContradictionsFound": not contradictions}
+    analysis_id, now = f"ANL-{uuid.uuid4().hex[:12].upper()}", utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        db.execute("INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (analysis_id, scope["tenant_id"], scope["case_id"], "contradictions", "completed", profile, model, json.dumps(result, ensure_ascii=False), json.dumps(cited_sources, ensure_ascii=False), 1, scope["user_id"], now, now))
+        audit(db, "AI_CONTRADICTIONS_ANALYZED", "ai_analysis", analysis_id, {"model": model, "count": len(contradictions), "citations": cited_ids}, scope)
+        return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone())
 
 
 @app.post("/api/ai/index/retry")
