@@ -116,6 +116,14 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(approved.status_code, 200, approved.text)
         self.assertEqual(approved.json()["proposal"]["status"], "approved")
         self.assertEqual(approved.json()["event"]["date"], "2026-07-08")
+        dates = self.client.post("/api/ai/dates/generate", json={})
+        self.assertEqual(dates.status_code, 200, dates.text)
+        date_proposal = dates.json()["proposals"][0]
+        self.assertEqual(date_proposal["status"], "pending_review")
+        scheduled = self.client.post(f"/api/ai/dates/proposals/{date_proposal['id']}/approve", json={})
+        self.assertEqual(scheduled.status_code, 200, scheduled.text)
+        self.assertEqual(scheduled.json()["event"]["date"], "2026-07-09")
+        self.assertEqual(scheduled.json()["event"]["category"], "Compromiso")
 
         duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
         self.assertEqual(duplicate.status_code, 201, duplicate.text)

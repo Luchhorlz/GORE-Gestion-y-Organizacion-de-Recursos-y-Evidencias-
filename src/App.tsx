@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -35,6 +35,7 @@ type ContradictionItem = { claimA: string; sourceA: string; claimB: string; sour
 type ContradictionsAnalysis = { id: string; contradictions: ContradictionItem[]; sources: AssistantCitation[]; noContradictionsFound: boolean; humanReviewRequired: boolean; model: string; profile: string; generatedAt: string }
 type EvidenceAnalysisItem = { sourceId: string; classification: 'favorable' | 'desfavorable' | 'neutral'; relevance: string; limitations: string; authenticityConcerns: string[]; confidence: number }
 type EvidenceAnalysis = { id: string; items: EvidenceAnalysisItem[]; missingEvidence: string[]; sources: AssistantCitation[]; insufficientEvidence: boolean; model: string; profile: string; generatedAt: string }
+type DateProposal = { id: string; date: string; time: string; type: string; reason: string; dateBasis: 'explicit' | 'inferred' | 'file_date'; certainty: number; sources: AssistantCitation[]; warning: string; status: 'pending_review' | 'approved' | 'rejected'; approvedEventId?: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -55,6 +56,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'inicio', label: 'Inicio', icon: Home },
   { id: 'calendario', label: 'Calendario', icon: CalendarDays },
   { id: 'acontecimientos', label: 'Acontecimientos', icon: Clock3 },
+  { id: 'fechas', label: 'Fechas y compromisos', icon: CalendarDays },
   { id: 'evidencias', label: 'Bóveda de evidencias', icon: FolderLock },
   { id: 'analisis-evidencia', label: 'Análisis de evidencias', icon: FileCheck2 },
   { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
@@ -197,6 +199,7 @@ function App() {
           {view === 'inicio' && <Dashboard events={events} evidence={evidence} go={go} openModal={openNewEvent} backendOnline={backendOnline} openEvent={openEvent} />}
           {view === 'calendario' && <CalendarView month={month} setMonth={setMonth} events={events} openDay={setSelectedDay} milestoneDate={caseConfig.mainMilestone} />}
           {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
+          {view === 'fechas' && <DatesView onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
           {view === 'analisis-evidencia' && <EvidenceAnalysisView />}
           {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
@@ -273,6 +276,26 @@ function CalendarView({ month, setMonth, events, openDay, milestoneDate }: { mon
       <div className="calendar-grid days">{days.map(day => { const dayEvents = events.filter(e => isSameDay(new Date(`${e.date}T12:00:00`), day)); const dayKey = format(day, 'yyyy-MM-dd'); const milestone = dayKey === milestoneDate; return <button key={day.toISOString()} className={`day ${!isSameMonth(day, month) ? 'muted' : ''} ${milestone ? 'milestone' : ''}`} onClick={() => openDay(dayKey)}><span className={isSameDay(day, new Date()) ? 'current' : ''}>{format(day, 'd')}</span>{milestone && <b>Hito del expediente</b>}{dayEvents.slice(0, 2).map(e => <small key={e.id}>{e.title}</small>)}{dayEvents.length > 2 && <em>+{dayEvents.length - 2} más</em>}</button> })}</div>
     </article>
   </>
+}
+
+function DatesView({ onEventApproved }: { onEventApproved: (event: EventItem) => void }) {
+  const [proposals, setProposals] = useState<DateProposal[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { apiGet<DateProposal[]>('/api/ai/dates/proposals').then(setProposals).catch(() => undefined) }, [])
+  async function generate() {
+    setLoading(true); setError('')
+    try { const result = await apiPost<{ proposals: DateProposal[] }>('/api/ai/dates/generate', {}); setProposals(previous => [...result.proposals, ...previous]) }
+    catch { setError('No se pudieron detectar fechas. Verificá las evidencias indexadas y que Ollama esté activo.') }
+    finally { setLoading(false) }
+  }
+  async function review(proposal: DateProposal, action: 'approve' | 'reject') {
+    try {
+      if (action === 'approve') { const result = await apiPost<{ proposal: DateProposal; event: EventItem }>(`/api/ai/dates/proposals/${proposal.id}/approve`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result.proposal : item)); onEventApproved(result.event) }
+      else { const result = await apiPost<DateProposal>(`/api/ai/dates/proposals/${proposal.id}/reject`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result : item)) }
+    } catch { setError('No se pudo guardar la revisión de la propuesta.') }
+  }
+  return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">AGENDA ASISTIDA · APROBACIÓN OBLIGATORIA</span><h1>Fechas y compromisos</h1><p>Detecta fechas asociadas con acciones concretas sin calcular vencimientos legales definitivos.</p></div><button className="primary-button" onClick={generate} disabled={loading}><CalendarDays size={17} /> {loading ? 'Revisando fuentes…' : 'Detectar fechas'}</button></section><div className="contradiction-warning"><Gavel /><div><strong>Nunca es un cálculo jurídico definitivo</strong><span>Confirmá fecha, alcance, días hábiles y reglas aplicables con un profesional antes de aprobar.</span></div></div>{error && <div className="login-error">{error}</div>}<div className="date-proposals">{proposals.map(proposal => <article className={`panel date-proposal ${proposal.status}`} key={proposal.id}><div className="date-proposal-calendar"><strong>{format(new Date(`${proposal.date}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${proposal.date}T12:00:00`), 'MMM yyyy', { locale: es })}</span><small>{proposal.time || 'Sin hora'}</small></div><div className="date-proposal-body"><div><b>{proposal.type}</b><span>{proposal.dateBasis === 'explicit' ? 'Fecha explícita' : proposal.dateBasis === 'file_date' ? 'Fecha del archivo' : 'Fecha inferida'}</span><span>Confianza {(proposal.certainty * 100).toFixed(0)}%</span></div><h2>{proposal.reason}</h2><p>{proposal.warning}</p><div className="proposal-sources">{proposal.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}>{source.sourceId} · {source.evidenceName}</a>)}</div></div><div className="proposal-actions">{proposal.status === 'pending_review' ? <><button onClick={() => review(proposal, 'reject')}>Descartar</button><button className="approve" onClick={() => review(proposal, 'approve')}><Check size={15} /> Aprobar y agendar</button></> : <span>{proposal.status === 'approved' ? 'Incorporado al calendario' : 'Descartado'}</span>}</div></article>)}{proposals.length === 0 && <article className="panel vault-empty"><CalendarDays /><strong>No hay fechas propuestas</strong><p>GORE sólo propondrá fechas vinculadas con una acción concreta y una fuente identificable.</p></article>}</div></>
 }
 
 function EventsView({ events, openModal, openEvent, caseConfig, onEventApproved }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void; caseConfig: CaseConfig; onEventApproved: (event: EventItem) => void }) {
