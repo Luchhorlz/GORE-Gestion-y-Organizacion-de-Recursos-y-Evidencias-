@@ -57,6 +57,24 @@ class IsolationTests(unittest.TestCase):
         finally:
             session["case_id"] = original_case
 
+    def test_ai_rate_limit_returns_safe_retry_response(self):
+        original_limit = self.module.AI_RATE_MAX_REQUESTS
+        self.module.AI_RATE_MAX_REQUESTS = 1
+        self.module.ai_request_times.clear()
+        try:
+            self.assertEqual(self.client.post("/api/ai/index/retry").status_code, 200)
+            limited = self.client.post("/api/ai/index/retry")
+            self.assertEqual(limited.status_code, 429)
+            self.assertIn("Esperá unos minutos", limited.json()["detail"])
+            self.assertIn("Retry-After", limited.headers)
+        finally:
+            self.module.AI_RATE_MAX_REQUESTS = original_limit
+            self.module.ai_request_times.clear()
+
+    def test_ai_chat_rejects_foreign_attachment(self):
+        response = self.client.post("/api/ai/chat/messages", json={"message": "Analizar adjunto", "evidenceIds": ["EVD-FOREIGN"]})
+        self.assertEqual(response.status_code, 404)
+
     def test_secure_upload_is_verified_and_duplicate_is_reused(self):
         content = b"Texto de prueba juridica para verificar el original."
         first = self.client.post("/api/evidence", files={"file": ("prueba.txt", content, "application/octet-stream")})
