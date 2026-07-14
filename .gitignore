@@ -1,0 +1,37 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+backend/.venv
+backend/data
+dist
+dist-server
+build-server
+gore-data
+dist-ssr
+*.local
+cloudflared-gore.yml
+*.db
+*.sqlite
+*.sqlite3
+CONTRASENA_INICIAL.txt
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

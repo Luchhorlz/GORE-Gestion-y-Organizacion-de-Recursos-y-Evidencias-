@@ -1,0 +1,7 @@
+tunnel: REEMPLAZAR_CON_ID_DEL_TUNEL
+credentials-file: C:\RUTA\PRIVADA\CREDENCIALES_DEL_TUNEL.json
+
+ingress:
+  - hostname: gore.ejemplo.com
+    service: http://127.0.0.1:3010
+  - service: http_status:404
