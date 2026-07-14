@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 
 def _utc_now() -> str:
@@ -274,12 +274,37 @@ def _migration_005_audio_transcript_indexing(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_006_ai_analyses(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ai_analyses (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id),
+            analysis_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            model TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            human_review_required INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_analyses_scope
+            ON ai_analyses (tenant_id,case_id,analysis_type,created_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
     3: _migration_003_document_extraction,
     4: _migration_004_semantic_embeddings,
     5: _migration_005_audio_transcript_indexing,
+    6: _migration_006_ai_analyses,
 }
 
 

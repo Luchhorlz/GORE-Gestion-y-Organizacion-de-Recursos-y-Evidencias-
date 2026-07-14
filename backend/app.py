@@ -35,6 +35,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.providers import AIProviderError
 from backend.ai.config import PROFILE_NAMES
+from backend.ai.agents import SUMMARY_SCHEMA, build_summary_prompt, normalize_summary
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
@@ -899,6 +900,62 @@ FUENTES:
         "caveats": [str(item) for item in generated.get("caveats", []) if str(item).strip()],
         "citations": citations, "model": model, "profile": profile, "retrievalQuery": retrieval_query,
     }
+
+
+def ai_analysis_dict(row: sqlite3.Row) -> dict:
+    result = json.loads(row["result_json"])
+    result.update({
+        "id": row["id"], "type": row["analysis_type"], "status": row["status"],
+        "profile": row["profile"], "model": row["model"],
+        "sources": json.loads(row["sources_json"]), "generatedAt": row["created_at"],
+        "humanReviewRequired": bool(row["human_review_required"]),
+    })
+    return result
+
+
+@app.get("/api/ai/analyses/summary")
+def latest_case_summary(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute(
+            "SELECT * FROM ai_analyses WHERE tenant_id=? AND case_id=? AND analysis_type='case_summary' AND status='completed' ORDER BY created_at DESC LIMIT 1",
+            (scope["tenant_id"], scope["case_id"]),
+        ).fetchone()
+        return {"analysis": ai_analysis_dict(row) if row else None}
+
+
+@app.post("/api/ai/analyses/summary")
+def generate_case_summary(request: Request) -> dict:
+    retrieval = semantic_search(SemanticSearchPayload(query="hechos principales personas comunicaciones acuerdos conflictos evidencia", limit=2), request)
+    sources = retrieval["results"]
+    if not sources:
+        raise HTTPException(422, "Todavía no hay evidencias indexadas suficientes para generar el resumen")
+    with database() as db:
+        scope = authorized_scope(request, db)
+        setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone()
+        profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+    source_map = {f"S{index}": source for index, source in enumerate(sources, start=1)}
+    context = "\n\n".join(
+        f"[{source_id}] Archivo: {source['evidenceName']} | Sección: {source['sectionLabel']} | Fecha: {source['factDate'] or 'sin fecha'} | SHA: {source['textHash']}\n{source['text'][:1000]}"
+        for source_id, source in source_map.items()
+    )
+    model = AI_CONFIG.model_for(profile)
+    try:
+        raw = ai_provider().generate_structured(build_summary_prompt(context), model, SUMMARY_SCHEMA)
+    except AIProviderError as error:
+        raise HTTPException(503, "Ollama no pudo generar el resumen local") from error
+    result = normalize_summary(raw, set(source_map))
+    cited_sources = [{"sourceId": source_id, **source_map[source_id]} for source_id in result["sourceIds"]]
+    analysis_id, now = f"ANL-{uuid.uuid4().hex[:12].upper()}", utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        db.execute(
+            "INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (analysis_id, scope["tenant_id"], scope["case_id"], "case_summary", "completed", profile, model, json.dumps(result, ensure_ascii=False), json.dumps(cited_sources, ensure_ascii=False), 1, scope["user_id"], now, now),
+        )
+        audit(db, "AI_CASE_SUMMARY_GENERATED", "ai_analysis", analysis_id, {"model": model, "citations": result["sourceIds"], "confidence": result["confidence"]}, scope)
+        row = db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone()
+        return ai_analysis_dict(row)
 
 
 @app.post("/api/ai/index/retry")

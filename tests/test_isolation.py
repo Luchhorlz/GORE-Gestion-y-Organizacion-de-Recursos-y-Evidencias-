@@ -101,6 +101,13 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(answer.status_code, 200, answer.text)
         self.assertFalse(answer.json()["insufficientEvidence"])
         self.assertEqual(answer.json()["citations"][0]["sourceId"], "S1")
+        summary = self.client.post("/api/ai/analyses/summary", json={})
+        self.assertEqual(summary.status_code, 200, summary.text)
+        self.assertEqual(summary.json()["executiveSummary"], "Resumen simulado respaldado.")
+        self.assertEqual(summary.json()["sources"][0]["sourceId"], "S1")
+        persisted = self.client.get("/api/ai/analyses/summary")
+        self.assertEqual(persisted.status_code, 200, persisted.text)
+        self.assertEqual(persisted.json()["analysis"]["id"], summary.json()["id"])
 
         duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
         self.assertEqual(duplicate.status_code, 201, duplicate.text)
