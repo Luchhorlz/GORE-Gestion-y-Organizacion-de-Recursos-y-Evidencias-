@@ -68,7 +68,7 @@ class LocalAIProvider(AIProvider):
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": False,
-            "format": schema, "options": {"temperature": 0},
+            "format": schema, "options": {"temperature": 0, "num_predict": 180},
         })
         try:
             parsed = json.loads(str(result.get("response", "")))
@@ -97,6 +97,8 @@ class MockAIProvider(AIProvider):
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if "answer" in schema.get("properties", {}):
+            return {"answer": "Respuesta simulada respaldada.", "source_ids": ["S1"], "caveats": ["Revisión humana requerida."], "insufficient_evidence": False}
         return {"summary": "Resultado simulado", "sources": [], "human_review_required": True}
 
     def create_embeddings(self, texts: list[str], model: str) -> list[list[float]]:

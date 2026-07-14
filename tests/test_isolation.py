@@ -97,6 +97,10 @@ class IsolationTests(unittest.TestCase):
         self.assertTrue(all(result["score"] >= search.json()["minimumScore"] for result in search.json()["results"]))
         self.assertEqual(search.json()["results"][0]["evidenceId"], evidence_id)
         self.assertEqual(search.json()["results"][0]["textHash"], extracted.json()["chunks"][0]["text_sha256"])
+        answer = self.client.post("/api/ai/ask", json={"question": "¿Qué contiene la prueba jurídica?"})
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertFalse(answer.json()["insufficientEvidence"])
+        self.assertEqual(answer.json()["citations"][0]["sourceId"], "S1")
 
         duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
         self.assertEqual(duplicate.status_code, 201, duplicate.text)

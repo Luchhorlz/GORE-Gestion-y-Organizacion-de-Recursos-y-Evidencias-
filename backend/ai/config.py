@@ -46,6 +46,6 @@ def load_ai_config() -> AIConfig:
         },
         embedding_model=os.environ.get("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b").strip(),
         default_profile=profile,
-        request_timeout=max(10, min(int(os.environ.get("AI_REQUEST_TIMEOUT", "180")), 600)),
+        request_timeout=max(10, min(int(os.environ.get("AI_REQUEST_TIMEOUT", "300")), 600)),
         max_context_chunks=max(1, min(int(os.environ.get("AI_MAX_CONTEXT_CHUNKS", "12")), 50)),
     )

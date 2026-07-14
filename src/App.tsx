@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'asistente' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -27,6 +27,8 @@ type ExtractedText = { evidenceId: string; status: string; error: string; summar
 type SemanticSearchResult = { score: number; evidenceId: string; evidenceName: string; evidenceHash: string; factDate: string; eventId?: string; sectionLabel: string; sectionIndex: number; chunkIndex: number; text: string; textHash: string; method: string }
 type SemanticSearchResponse = { query: string; model: string; indexedEvidence: number; results: SemanticSearchResult[] }
 type AudioIndexStatus = { total: number; transcribed: number; empty: number; completed: number; indexed: number; queued: number; failed: number; percent: number; finished: boolean }
+type AssistantCitation = SemanticSearchResult & { sourceId: string }
+type AssistantAnswer = { question: string; answer: string; insufficientEvidence: boolean; caveats: string[]; citations: AssistantCitation[]; model: string; profile: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -48,6 +50,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'calendario', label: 'Calendario', icon: CalendarDays },
   { id: 'acontecimientos', label: 'Acontecimientos', icon: Clock3 },
   { id: 'evidencias', label: 'Bóveda de evidencias', icon: FolderLock },
+  { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
   { id: 'comunicaciones', label: 'Comunicaciones', icon: MessageCircle },
   { id: 'whatsapp', label: 'Simulador WhatsApp', icon: Phone },
   { id: 'informes', label: 'Informes', icon: FileText },
@@ -187,6 +190,7 @@ function App() {
           {view === 'calendario' && <CalendarView month={month} setMonth={setMonth} events={events} openDay={setSelectedDay} milestoneDate={caseConfig.mainMilestone} />}
           {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
+          {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
           {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} audioProgress={audioProgress} prepareAllAudios={prepareAllAudios} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
@@ -359,6 +363,23 @@ function EvidenceView({ evidence, setEvidence, setBackendOnline, events }: { evi
     <article className="panel evidence-panel"><div className="panel-head"><div><h2>Archivos incorporados</h2><p>{evidence.length} original{evidence.length === 1 ? '' : 'es'} registrado{evidence.length === 1 ? '' : 's'}</p></div><span className="safe-badge"><ShieldCheck size={16} /> SHA-256 activo</span></div>
       {evidence.length === 0 ? <div className="vault-empty"><FolderLock /><strong>La bóveda está preparada</strong><p>El primer archivo que incorpores aparecerá aquí con su identificación y hash.</p></div> : <div className="file-list">{evidence.map(file => <div className="file-row" key={file.id}><div className="file-icon"><FileText /></div><div className="file-info"><strong>{file.name}</strong><span>{(file.size / 1024).toFixed(1)} KB · Incorporado {format(new Date(file.addedAt), "dd/MM/yyyy 'a las' HH:mm")}</span><code title={file.hash}>{file.hash}</code>{file.extractionStatus && file.extractionStatus !== 'not_applicable' && <small className={`extraction-state extraction-${file.extractionStatus}`}>{file.extractionStatus === 'ready' ? 'Texto disponible para IA' : file.extractionStatus === 'empty' ? 'Sin texto legible' : file.extractionStatus === 'failed' ? 'Extracción pendiente de revisión' : 'Extrayendo texto localmente…'}</small>}</div><span className={`verified processing-${file.processingStatus || 'ready'}`}>{file.processingStatus === 'pending' || file.processingStatus === 'processing' ? <Clock3 size={14} /> : file.processingStatus === 'quarantined' || file.processingStatus === 'failed' ? <X size={14} /> : <Check size={14} />} {file.id.startsWith('LOCAL-') ? 'Huella local' : file.processingStatus === 'pending' ? 'Pendiente' : file.processingStatus === 'processing' ? 'Verificando' : file.processingStatus === 'quarantined' ? 'En cuarentena' : file.processingStatus === 'failed' ? 'Revisión necesaria' : 'Original verificado'}</span><div className="file-actions">{file.extractionStatus && file.extractionStatus !== 'not_applicable' && <button type="button" onClick={() => openExtractedText(file)} title="Ver texto extraído"><Eye /></button>}{file.id.startsWith('LOCAL-') ? <button title="Archivo local"><MoreHorizontal /></button> : <a className="download-file" href={evidenceDownloadUrl(file.id)} title="Descargar original"><Download /></a>}</div></div>)}</div>}
     </article>{textEvidence && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setTextEvidence(null)}><div className="modal extracted-text-modal"><div className="modal-head"><div><span className="eyebrow accent">LECTURA LOCAL TRAZABLE</span><h2>{textEvidence.name}</h2><p>Texto auxiliar vinculado al original SHA-256</p></div><button type="button" onClick={() => setTextEvidence(null)}><X /></button></div><div className="extracted-text-content">{textLoading ? <div className="vault-empty"><Clock3 /><strong>Recuperando el texto…</strong></div> : extractedText?.status === 'ready' ? <>{extractedText.summary && <div className="extraction-summary"><span>{extractedText.summary.character_count.toLocaleString('es-AR')} caracteres</span><span>{extractedText.summary.section_count} secciones</span><span>Motor: {extractedText.summary.engine}</span></div>}{extractedText.chunks.map((chunk, index) => <section key={`${chunk.section_index}-${chunk.chunk_index}`}><strong>{index === 0 || extractedText.chunks[index - 1].section_index !== chunk.section_index ? chunk.section_label : `${chunk.section_label} · continuación`}</strong><p>{chunk.text}</p><small>Huella del fragmento: {chunk.text_sha256}</small></section>)}</> : <div className="vault-empty"><FileText /><strong>{extractedText?.status === 'empty' ? 'No se detectó texto legible' : extractedText?.status === 'failed' ? 'No se pudo extraer el texto' : 'La extracción está en proceso'}</strong><p>El archivo original permanece preservado y siempre prevalece sobre esta lectura auxiliar.</p></div>}</div></div></div>}</>
+}
+
+function AIAssistantView({ audioProgress }: { audioProgress: AudioIndexStatus | null }) {
+  const [question, setQuestion] = useState('')
+  const [answers, setAnswers] = useState<AssistantAnswer[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  async function ask(event: React.FormEvent) {
+    event.preventDefault()
+    const value = question.trim()
+    if (value.length < 3) return
+    setLoading(true); setError('')
+    try { const answer = await apiPost<AssistantAnswer>('/api/ai/ask', { question: value }); setAnswers(previous => [answer, ...previous]); setQuestion('') }
+    catch { setError('No se pudo generar la respuesta. Comprobá que Ollama esté activo e intentá nuevamente.') }
+    finally { setLoading(false) }
+  }
+  return <><section className="page-heading compact"><div><span className="eyebrow accent">ANÁLISIS LOCAL CON FUENTES</span><h1>Asistente documental</h1><p>Consultá el expediente usando solamente información recuperada de las evidencias.</p></div></section><article className="panel assistant-panel"><div className="assistant-safety"><ShieldCheck /><div><strong>Respuestas limitadas por evidencia</strong><span>GORE debe indicar cuando no encuentra respaldo suficiente. Las transcripciones son auxiliares y el audio original siempre prevalece.</span></div></div>{audioProgress && !audioProgress.finished && <div className="assistant-progress"><Clock3 /><span>La cobertura continúa aumentando: {audioProgress.completed} de {audioProgress.total} audios transcritos ({audioProgress.percent}%).</span></div>}<form onSubmit={ask}><textarea value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ejemplo: ¿Qué comunicaciones mencionan cambios en la modalidad de cuidado?" maxLength={2000} /><div><small>{question.length}/2000</small><button className="primary-button" disabled={loading || question.trim().length < 3}><Sparkles size={16} /> {loading ? 'Analizando evidencias…' : 'Preguntar a GORE'}</button></div></form>{error && <div className="login-error">{error}</div>}</article><div className="assistant-answers">{answers.map((item, answerIndex) => <article className="panel assistant-answer" key={`${item.question}-${answerIndex}`}><span className="assistant-question">{item.question}</span><div className={`assistant-answer-status ${item.insufficientEvidence ? 'insufficient' : ''}`}><Sparkles /><strong>{item.insufficientEvidence ? 'Evidencia insuficiente' : 'Respuesta respaldada'}</strong><small>{item.model === 'none' ? 'Sin ejecutar modelo generativo' : `${item.model} · perfil ${item.profile}`}</small></div><p>{item.answer}</p>{item.caveats.length > 0 && <ul>{item.caveats.map(caveat => <li key={caveat}>{caveat}</li>)}</ul>}{item.citations.length > 0 && <div className="assistant-citations"><strong>Fuentes utilizadas</strong>{item.citations.map(citation => <a href={evidenceDownloadUrl(citation.evidenceId)} key={citation.sourceId}><span>{citation.sourceId}</span><div><strong>{citation.evidenceName} · {citation.sectionLabel}</strong><p>{citation.text}</p><small>Coincidencia {(citation.score * 100).toFixed(1)}% · SHA {citation.textHash}</small></div><Download /></a>)}</div>}</article>)}</div></>
 }
 
 function CommunicationsView({ events, openModal, openEvent }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void }) {
