@@ -66,7 +66,7 @@ class LocalAIProvider(AIProvider):
         return str(result.get("response", "")).strip()
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
-        token_limit = 500 if "contradictions" in schema.get("properties", {}) else 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
+        token_limit = 520 if "items" in schema.get("properties", {}) else 500 if "contradictions" in schema.get("properties", {}) else 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": False,
             "format": schema, "options": {"temperature": 0, "num_predict": token_limit},
@@ -98,6 +98,8 @@ class MockAIProvider(AIProvider):
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if "items" in schema.get("properties", {}):
+            return {"items": [{"source_id": "S1", "classification": "neutral", "relevance": "Documenta un hecho mencionado.", "limitations": "No permite confirmar el contexto completo.", "authenticity_concerns": ["Revisar el original."], "confidence": 0.75}], "missing_evidence": ["Contexto adicional."]}
         if "contradictions" in schema.get("properties", {}):
             return {"contradictions": [{"claim_a": "La modalidad sería una.", "source_a": "S1", "claim_b": "La modalidad sería otra.", "source_b": "S2", "reason": "Las modalidades son incompatibles.", "alternative_explanation": "Pueden referirse a momentos diferentes.", "severity": "medium", "confidence": 0.7}]}
         if "events" in schema.get("properties", {}):

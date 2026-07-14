@@ -156,6 +156,12 @@ class IsolationTests(unittest.TestCase):
         self.assertNotEqual(compared.json()["contradictions"][0]["sourceA"], compared.json()["contradictions"][0]["sourceB"])
         latest = self.client.get("/api/ai/analyses/contradictions")
         self.assertEqual(latest.json()["analysis"]["id"], compared.json()["id"])
+        organized = self.client.post("/api/ai/analyses/evidence", json={})
+        self.assertEqual(organized.status_code, 200, organized.text)
+        self.assertEqual(organized.json()["items"][0]["classification"], "neutral")
+        self.assertEqual(organized.json()["items"][0]["sourceId"], "S1")
+        persisted = self.client.get("/api/ai/analyses/evidence")
+        self.assertEqual(persisted.json()["analysis"]["id"], organized.json()["id"])
 
 
 if __name__ == "__main__":

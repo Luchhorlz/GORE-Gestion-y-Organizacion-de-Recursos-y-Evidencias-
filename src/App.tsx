@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'asistente' | 'contradicciones' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -33,6 +33,8 @@ type CaseSummary = { id: string; executiveSummary: string; mainFacts: string[]; 
 type ChronologyProposal = { id: string; date: string; time: string; description: string; people: string[]; certainty: number; dateBasis: 'explicit' | 'inferred' | 'file_date'; sources: AssistantCitation[]; status: 'pending_review' | 'approved' | 'rejected'; approvedEventId?: string }
 type ContradictionItem = { claimA: string; sourceA: string; claimB: string; sourceB: string; reason: string; alternativeExplanation: string; severity: 'low' | 'medium' | 'high'; confidence: number }
 type ContradictionsAnalysis = { id: string; contradictions: ContradictionItem[]; sources: AssistantCitation[]; noContradictionsFound: boolean; humanReviewRequired: boolean; model: string; profile: string; generatedAt: string }
+type EvidenceAnalysisItem = { sourceId: string; classification: 'favorable' | 'desfavorable' | 'neutral'; relevance: string; limitations: string; authenticityConcerns: string[]; confidence: number }
+type EvidenceAnalysis = { id: string; items: EvidenceAnalysisItem[]; missingEvidence: string[]; sources: AssistantCitation[]; insufficientEvidence: boolean; model: string; profile: string; generatedAt: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -54,6 +56,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'calendario', label: 'Calendario', icon: CalendarDays },
   { id: 'acontecimientos', label: 'Acontecimientos', icon: Clock3 },
   { id: 'evidencias', label: 'Bóveda de evidencias', icon: FolderLock },
+  { id: 'analisis-evidencia', label: 'Análisis de evidencias', icon: FileCheck2 },
   { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
   { id: 'contradicciones', label: 'Posibles contradicciones', icon: Scale },
   { id: 'comunicaciones', label: 'Comunicaciones', icon: MessageCircle },
@@ -195,6 +198,7 @@ function App() {
           {view === 'calendario' && <CalendarView month={month} setMonth={setMonth} events={events} openDay={setSelectedDay} milestoneDate={caseConfig.mainMilestone} />}
           {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
+          {view === 'analisis-evidencia' && <EvidenceAnalysisView />}
           {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
           {view === 'contradicciones' && <ContradictionsView />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
@@ -403,6 +407,21 @@ function AIAssistantView({ audioProgress }: { audioProgress: AudioIndexStatus | 
     finally { setLoading(false) }
   }
   return <><section className="page-heading compact"><div><span className="eyebrow accent">ANÁLISIS LOCAL CON FUENTES</span><h1>Asistente documental</h1><p>Consultá el expediente usando solamente información recuperada de las evidencias.</p></div></section><article className="panel assistant-panel"><div className="assistant-safety"><ShieldCheck /><div><strong>Respuestas limitadas por evidencia</strong><span>GORE debe indicar cuando no encuentra respaldo suficiente. Las transcripciones son auxiliares y el audio original siempre prevalece.</span></div></div>{audioProgress && !audioProgress.finished && <div className="assistant-progress"><Clock3 /><span>La cobertura continúa aumentando: {audioProgress.completed} de {audioProgress.total} audios transcritos ({audioProgress.percent}%).</span></div>}<form onSubmit={ask}><textarea value={question} onChange={event => setQuestion(event.target.value)} placeholder="Ejemplo: ¿Qué comunicaciones mencionan cambios en la modalidad de cuidado?" maxLength={2000} /><div><small>{question.length}/2000</small><button className="primary-button" disabled={loading || question.trim().length < 3}><Sparkles size={16} /> {loading ? 'Analizando evidencias…' : 'Preguntar a GORE'}</button></div></form>{error && <div className="login-error">{error}</div>}</article><div className="assistant-answers">{answers.map((item, answerIndex) => <article className="panel assistant-answer" key={`${item.question}-${answerIndex}`}><span className="assistant-question">{item.question}</span><div className={`assistant-answer-status ${item.insufficientEvidence ? 'insufficient' : ''}`}><Sparkles /><strong>{item.insufficientEvidence ? 'Evidencia insuficiente' : 'Respuesta respaldada'}</strong><small>{item.model === 'none' ? 'Sin ejecutar modelo generativo' : `${item.model} · perfil ${item.profile}`}</small></div><p>{item.answer}</p>{item.caveats.length > 0 && <ul>{item.caveats.map(caveat => <li key={caveat}>{caveat}</li>)}</ul>}{item.citations.length > 0 && <div className="assistant-citations"><strong>Fuentes utilizadas</strong>{item.citations.map(citation => <a href={evidenceDownloadUrl(citation.evidenceId)} key={citation.sourceId}><span>{citation.sourceId}</span><div><strong>{citation.evidenceName} · {citation.sectionLabel}</strong><p>{citation.text}</p><small>Coincidencia {(citation.score * 100).toFixed(1)}% · SHA {citation.textHash}</small></div><Download /></a>)}</div>}</article>)}</div></>
+}
+
+function EvidenceAnalysisView() {
+  const [analysis, setAnalysis] = useState<EvidenceAnalysis | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { apiGet<{ analysis: EvidenceAnalysis | null }>('/api/ai/analyses/evidence').then(result => setAnalysis(result.analysis)).catch(() => undefined) }, [])
+  async function analyze() {
+    setLoading(true); setError('')
+    try { setAnalysis(await apiPost<EvidenceAnalysis>('/api/ai/analyses/evidence', {})) }
+    catch { setError('No se pudo organizar la evidencia. Verificá que existan archivos indexados y que Ollama esté activo.') }
+    finally { setLoading(false) }
+  }
+  const source = (id: string) => analysis?.sources.find(item => item.sourceId === id)
+  return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">ORGANIZACIÓN LOCAL CON FUENTES</span><h1>Análisis de evidencias</h1><p>Ordena utilidad, límites y alertas observables sin decidir admisibilidad ni responsabilidad.</p></div><button className="primary-button" onClick={analyze} disabled={loading}><FileCheck2 size={17} /> {loading ? 'Organizando…' : analysis ? 'Actualizar análisis' : 'Analizar evidencias'}</button></section><div className="contradiction-warning"><ShieldCheck /><div><strong>Clasificación documental, no valoración judicial</strong><span>“Favorable” significa que ayuda a documentar un hecho; no significa que garantice un resultado legal.</span></div></div>{error && <div className="login-error">{error}</div>}{analysis ? <><div className="evidence-analysis-grid">{analysis.items.map(item => { const file = source(item.sourceId); return <article className="panel evidence-analysis-card" key={item.sourceId}><div className="evidence-analysis-head"><span>{item.sourceId}</span><b className={item.classification}>{item.classification}</b><small>Confianza {(item.confidence * 100).toFixed(0)}%</small></div><h2>{file?.evidenceName ?? 'Evidencia vinculada'}</h2><section><strong>Qué ayuda a documentar</strong><p>{item.relevance || 'No se determinó una utilidad concreta.'}</p></section><section><strong>Límites</strong><p>{item.limitations || 'Requiere revisión del original y su contexto.'}</p></section><section><strong>Alertas de autenticidad o contexto</strong>{item.authenticityConcerns.length ? <ul>{item.authenticityConcerns.map(concern => <li key={concern}>{concern}</li>)}</ul> : <p>No se identificaron alertas observables en esta lectura auxiliar.</p>}</section>{file && <a href={evidenceDownloadUrl(file.evidenceId)}><Download size={14} /> Revisar archivo original</a>}</article>})}</div><article className="panel missing-evidence"><div><Search /><span><strong>Evidencia o información faltante</strong><small>Sugerencias para completar el contexto, sujetas a revisión.</small></span></div>{analysis.missingEvidence.length ? <ul>{analysis.missingEvidence.map(item => <li key={item}>{item}</li>)}</ul> : <p>No se identificaron faltantes concretos en las fuentes analizadas.</p>}</article><small className="analysis-footer">Análisis local con {analysis.model} · {format(new Date(analysis.generatedAt), "dd/MM/yyyy 'a las' HH:mm")} · Los originales siempre prevalecen.</small></> : <article className="panel vault-empty"><FileCheck2 /><strong>Todavía no se organizaron las evidencias</strong><p>El análisis quedará guardado y vinculado a los archivos originales mediante sus fuentes y hashes.</p></article>}</>
 }
 
 function ContradictionsView() {

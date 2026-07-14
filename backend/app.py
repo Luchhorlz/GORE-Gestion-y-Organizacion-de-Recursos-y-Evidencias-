@@ -35,7 +35,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.providers import AIProviderError
 from backend.ai.config import PROFILE_NAMES
-from backend.ai.agents import CHRONOLOGY_SCHEMA, CONTRADICTIONS_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_contradictions_prompt, build_summary_prompt, normalize_summary
+from backend.ai.agents import CHRONOLOGY_SCHEMA, CONTRADICTIONS_SCHEMA, EVIDENCE_ANALYSIS_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_contradictions_prompt, build_evidence_analysis_prompt, build_summary_prompt, normalize_summary
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
@@ -1110,6 +1110,65 @@ def generate_contradictions_analysis(request: Request) -> dict:
         scope = authorized_scope(request, db)
         db.execute("INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (analysis_id, scope["tenant_id"], scope["case_id"], "contradictions", "completed", profile, model, json.dumps(result, ensure_ascii=False), json.dumps(cited_sources, ensure_ascii=False), 1, scope["user_id"], now, now))
         audit(db, "AI_CONTRADICTIONS_ANALYZED", "ai_analysis", analysis_id, {"model": model, "count": len(contradictions), "citations": cited_ids}, scope)
+        return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone())
+
+
+@app.get("/api/ai/analyses/evidence")
+def latest_evidence_analysis(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT * FROM ai_analyses WHERE tenant_id=? AND case_id=? AND analysis_type='evidence_organization' AND status='completed' ORDER BY created_at DESC LIMIT 1", (scope["tenant_id"], scope["case_id"])).fetchone()
+        return {"analysis": ai_analysis_dict(row) if row else None}
+
+
+@app.post("/api/ai/analyses/evidence")
+def generate_evidence_analysis(request: Request) -> dict:
+    retrieval = semantic_search(SemanticSearchPayload(query="hechos documentos comunicaciones organización evidencia contexto", limit=8), request)
+    sources: list[dict] = []
+    seen: set[str] = set()
+    for source in retrieval["results"]:
+        if source["evidenceId"] not in seen:
+            sources.append(source); seen.add(source["evidenceId"])
+        if len(sources) == 3:
+            break
+    if not sources:
+        raise HTTPException(422, "Todavía no hay evidencias indexadas para organizar")
+    with database() as db:
+        scope = authorized_scope(request, db)
+        setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone()
+        profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+    source_map = {f"S{index}": source for index, source in enumerate(sources, start=1)}
+    context = "\n\n".join(f"[{sid}] Archivo: {source['evidenceName']} | Tipo de lectura: {source['method']} | Fecha: {source['factDate'] or 'sin fecha'} | SHA: {source['textHash']}\n{source['text'][:750]}" for sid, source in source_map.items())
+    model = AI_CONFIG.model_for(profile)
+    try:
+        raw = ai_provider().generate_structured(build_evidence_analysis_prompt(context), model, EVIDENCE_ANALYSIS_SCHEMA)
+    except AIProviderError as error:
+        raise HTTPException(503, "Ollama no pudo organizar las evidencias localmente") from error
+    items: list[dict] = []
+    cited_ids: list[str] = []
+    classification_map = {"favorable": "favorable", "favourable": "favorable", "unfavorable": "desfavorable", "unfavourable": "desfavorable", "desfavorable": "desfavorable", "neutral": "neutral"}
+    for item in raw.get("items", []) if isinstance(raw.get("items"), list) else []:
+        source_id = str(item.get("source_id", ""))
+        if source_id not in source_map or source_id in cited_ids:
+            continue
+        classification = classification_map.get(str(item.get("classification", "")).lower(), "neutral")
+        try:
+            confidence = max(0.0, min(float(item.get("confidence", 0)), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        concerns = item.get("authenticity_concerns", [])
+        concerns = [str(value).strip()[:300] for value in concerns[:3] if str(value).strip()] if isinstance(concerns, list) else []
+        items.append({"sourceId": source_id, "classification": classification, "relevance": str(item.get("relevance", "")).strip()[:500], "limitations": str(item.get("limitations", "")).strip()[:500], "authenticityConcerns": concerns, "confidence": confidence})
+        cited_ids.append(source_id)
+    missing = raw.get("missing_evidence", [])
+    missing = [str(value).strip()[:300] for value in missing[:4] if str(value).strip()] if isinstance(missing, list) else []
+    cited_sources = [{"sourceId": source_id, **source_map[source_id]} for source_id in cited_ids]
+    result = {"items": items, "missingEvidence": missing, "sourceIds": cited_ids, "humanReviewRequired": True, "insufficientEvidence": not items}
+    analysis_id, now = f"ANL-{uuid.uuid4().hex[:12].upper()}", utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        db.execute("INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (analysis_id, scope["tenant_id"], scope["case_id"], "evidence_organization", "completed", profile, model, json.dumps(result, ensure_ascii=False), json.dumps(cited_sources, ensure_ascii=False), 1, scope["user_id"], now, now))
+        audit(db, "AI_EVIDENCE_ORGANIZED", "ai_analysis", analysis_id, {"model": model, "items": len(items), "citations": cited_ids}, scope)
         return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone())
 
 
