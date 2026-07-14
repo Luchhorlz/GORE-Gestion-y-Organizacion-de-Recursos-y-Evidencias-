@@ -22,7 +22,7 @@ class AIProvider(ABC):
     def list_available_models(self) -> list[str]: ...
 
     @abstractmethod
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None) -> str: ...
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None, timeout: int | None = None) -> str: ...
 
     @abstractmethod
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]: ...
@@ -59,7 +59,7 @@ class LocalAIProvider(AIProvider):
         result = self._request("/api/tags", timeout=10)
         return sorted(str(item.get("name", "")) for item in result.get("models", []) if item.get("name"))
 
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None) -> str:
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None, timeout: int | None = None) -> str:
         payload = {
             "model": model, "prompt": prompt, "stream": False, "think": think,
             "keep_alive": "30s",
@@ -70,7 +70,7 @@ class LocalAIProvider(AIProvider):
             request = urllib.request.Request(f"{self.config.ollama_base_url}/api/generate", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
             fragments: list[str] = []
             try:
-                with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+                with urllib.request.urlopen(request, timeout=timeout or self.config.request_timeout) as response:
                     for raw_line in response:
                         if cancel_check():
                             response.close()
@@ -113,7 +113,7 @@ class MockAIProvider(AIProvider):
     def list_available_models(self) -> list[str]:
         return ["mock-chat", "mock-embedding"]
 
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None) -> str:
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None, timeout: int | None = None) -> str:
         if cancel_check and cancel_check(): raise AIProviderError("Generación cancelada por el usuario")
         return f"Respuesta simulada para {model}."
 

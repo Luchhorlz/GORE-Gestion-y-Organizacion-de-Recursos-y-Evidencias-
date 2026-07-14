@@ -511,10 +511,12 @@ def start_processing_worker() -> None:
 
 def ai_chat_progress_ticker(job_id: str, stop: threading.Event) -> None:
     progress = 52
-    while not stop.wait(12):
-        progress = min(90, progress + 4)
+    started = time.monotonic()
+    while not stop.wait(20):
+        progress = min(90, progress + 2)
+        elapsed_minutes = max(1, round((time.monotonic() - started) / 60))
         with database() as db:
-            db.execute("UPDATE ai_chat_jobs SET progress=?,stage='Analizando con el modelo local',updated_at=? WHERE id=? AND status='processing'", (progress, utc_now(), job_id))
+            db.execute("UPDATE ai_chat_jobs SET progress=?,stage=?,updated_at=? WHERE id=? AND status='processing'", (progress, f"Ollama sigue analizando · {elapsed_minutes} min", utc_now(), job_id))
 
 
 def process_next_ai_chat_job() -> bool:
@@ -551,7 +553,11 @@ def process_next_ai_chat_job() -> bool:
         with database() as db: db.execute("UPDATE ai_chat_jobs SET context_json=?,progress=42,stage='Adjuntos preparados',updated_at=? WHERE id=?", (json.dumps(context_items, ensure_ascii=False), utc_now(), job["id"]))
     evidence_context = "\n\n".join(f"[{item['sourceId']}] {item['evidenceName']} | SHA {item['textHash']}\n{item['text'][:700]}" for item in context_items.get("sources", []))
     analysis_context = "\n".join(context_items.get("analyses", []))
-    conversation = "\n".join(("[DATO APORTADO POR EL USUARIO] " if row["role"] == "user" else "[RESPUESTA PREVIA DE GORE] ") + row["content"] for row in reversed(history))
+    current = history[0] if history else None
+    previous_rows = list(reversed(history[1:]))
+    previous_context = "\n".join(("[DATO APORTADO POR EL USUARIO] " if row["role"] == "user" else "[RESPUESTA PREVIA DE GORE] ") + row["content"] for row in previous_rows)[-8_000:]
+    current_context = (("[DATO APORTADO POR EL USUARIO] " if current and current["role"] == "user" else "[RESPUESTA PREVIA DE GORE] ") + current["content"]) if current else ""
+    conversation = "\n".join(part for part in (previous_context, current_context) if part)
     prompt = f"""Sos el chat privado de GORE. Conversá en español neutral y claro.
 REGLAS:
 - Podés saludar y conversar normalmente.
@@ -579,7 +585,9 @@ CONVERSACIÓN:
         with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=50,stage='Analizando con el modelo local',updated_at=? WHERE id=?", (utc_now(), job["id"]))
         generation_started = time.perf_counter()
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
-        answer = ai_provider().generate(prompt, job["model"], think=False, context_size=16_384, cancel_check=cancel_event.is_set)
+        context_size = 4_096 if len(prompt) <= 11_000 else 8_192 if len(prompt) <= 25_000 else 16_384
+        generation_timeout = 600 if context_size == 4_096 else 720 if context_size == 8_192 else 900
+        answer = ai_provider().generate(prompt, job["model"], think=False, context_size=context_size, cancel_check=cancel_event.is_set, timeout=generation_timeout)
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
         duration_ms = round((time.perf_counter() - generation_started) * 1000)
         if not answer: raise AIProviderError("Respuesta vacía")
@@ -589,7 +597,7 @@ CONVERSACIÓN:
             db.execute("UPDATE ai_chat_jobs SET status='completed',progress=100,stage='Respuesta guardada',completed_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
             db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, job["conversation_id"]))
             scope = {"tenant_id": job["tenant_id"], "case_id": job["case_id"], "user_id": DEFAULT_USER_ID}
-            audit(db, "AI_CHAT_RESPONSE_COMPLETED", "ai_chat_job", job["id"], {"model": job["model"], "sources": [item["sourceId"] for item in context_items.get("sources", [])], "duration_ms": duration_ms}, scope)
+            audit(db, "AI_CHAT_RESPONSE_COMPLETED", "ai_chat_job", job["id"], {"model": job["model"], "sources": [item["sourceId"] for item in context_items.get("sources", [])], "duration_ms": duration_ms, "context_size": context_size}, scope)
     except Exception:
         now = utc_now()
         with database() as db:

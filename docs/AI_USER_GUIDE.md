@@ -19,3 +19,5 @@ Mientras una respuesta está en espera o siendo analizada aparece “Cancelar an
 Cada respuesta completada puede marcarse como “Útil”, “Incorrecta” o “Revisar”. En los dos últimos casos se puede guardar una observación. Esta revisión sirve como registro humano del expediente: no modifica las evidencias y GORE no la utiliza para entrenar automáticamente a Ollama.
 
 “Herramientas IA > Historial de análisis” reúne los resúmenes, borradores, análisis de evidencias y posibles contradicciones guardados. La vista permite filtrar por tipo y abrir sus fuentes originales sin generar nuevamente el resultado ni cargar Ollama.
+
+El chat ajusta automáticamente el contexto según el tamaño real de la consulta: usa una ventana liviana para preguntas normales y amplía la memoria sólo para textos o adjuntos extensos. El tiempo máximo también se adapta entre 10 y 15 minutos. Mientras Ollama trabaja, la etapa indica cuántos minutos lleva activa para distinguir una respuesta lenta de una tarea detenida.
