@@ -30,6 +30,7 @@ type AudioMatch = { messageId: number; file?: File; evidence?: Evidence; confide
 type StoredChatSummary = { id: string; displayName: string; selfName: string; sourceType: string; createdAt: string; updatedAt: string; messageCount: number; audioCount: number }
 type StoredChat = Omit<StoredChatSummary, 'messageCount' | 'audioCount'> & { rawText: string; messages: ChatMessage[]; audioMatches: { messageId: number; evidenceId?: string; confidence: AudioMatch['confidence']; reason: string }[] }
 type AudioTranscription = { evidence_id: string; text: string; status: string; language: string; engine: string; updated_at: string }
+type AIStatus = { enabled: boolean; provider: string; available: boolean; version: string; activeProfile: string; activeModel: string; profiles: { id: string; model: string; installed: boolean }[]; embeddingModel: string; embeddingInstalled: boolean }
 
 const seedEvents: EventItem[] = [
   { id: 'EVT-20260618-001', date: '2026-06-18', time: '19:20', category: 'Comunicación', title: 'Propuesta de organización semanal', description: 'Se registró una conversación sobre la organización de los próximos días.', expected: 'Organización habitual', actual: 'Propuesta de cambio', evidenceCount: 2, status: 'Revisado' },
@@ -159,7 +160,7 @@ function App() {
           {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
           {view === 'auditoria' && <AuditView />}
-          {view === 'configuracion' && <SettingsView config={caseConfig} onSaved={setCaseConfig} onLogout={logout} />}
+          {view === 'configuracion' && <><AISettingsCard /><SettingsView config={caseConfig} onSaved={setCaseConfig} onLogout={logout} /></>}
         </div>
       </main>
       {eventModal && <EventModal initial={selectedEvent} initialDate={newEventDate} close={() => setEventModal(false)} save={async (event) => { await saveEvent(event); setEventModal(false) }} />}
@@ -608,6 +609,33 @@ function AuditView() {
   const [loading, setLoading] = useState(true)
   useEffect(() => { apiGet<AuditItem[]>('/api/audit').then(setItems).finally(() => setLoading(false)) }, [])
   return <><section className="page-heading compact"><div><span className="eyebrow accent">TRAZABILIDAD PROTEGIDA</span><h1>Historial de auditoría</h1><p>Cada acción importante se encadena criptográficamente con la anterior para facilitar la detección de alteraciones.</p></div><div className="integrity-pill online"><ShieldCheck size={20} /><div><strong>Cadena activa</strong><span>{items.length} acciones visibles</span></div></div></section><article className="panel audit-panel"><div className="panel-head"><div><h2>Actividad del expediente</h2><p>Accesos, cambios e interacción con originales</p></div><span className="safe-badge"><ShieldCheck size={16} /> Registro inalterable</span></div>{loading ? <div className="empty-inline">Cargando auditoría…</div> : items.length === 0 ? <div className="vault-empty"><ShieldCheck /><strong>Sin actividad registrada</strong></div> : <div className="audit-list">{items.map(item => <div className="audit-row" key={item.id}><div className="audit-symbol"><Check /></div><div><strong>{auditLabels[item.action] ?? item.action}</strong><span>{format(new Date(item.occurred_at), "dd/MM/yyyy 'a las' HH:mm:ss")}</span><small>{item.entity_type} · {item.entity_id}</small></div><code title={item.entry_hash}>{item.entry_hash.slice(0, 14)}…</code></div>)}</div>}</article></>
+}
+
+function AISettingsCard() {
+  const [status, setStatus] = useState<AIStatus | null>(null)
+  const [message, setMessage] = useState('Comprobando Ollama…')
+  const labels: Record<string, { name: string; description: string }> = {
+    fast: { name: 'Rápido', description: 'Clasificación y tareas sencillas' },
+    balanced: { name: 'Equilibrado', description: 'Recomendado para el uso habitual' },
+    quality: { name: 'Mayor calidad', description: 'Análisis complejos con mayor espera' },
+  }
+  async function refresh() {
+    try {
+      const result = await apiGet<AIStatus>('/api/ai/status')
+      setStatus(result)
+      setMessage(result.available ? `Ollama ${result.version} disponible` : 'Ollama no está disponible en esta computadora.')
+    } catch { setMessage('No pudimos consultar el estado de la IA local.') }
+  }
+  useEffect(() => { refresh() }, [])
+  async function select(profile: string) {
+    setMessage('Cambiando el modelo activo…')
+    try {
+      const result = await apiPut<AIStatus>('/api/ai/settings', { activeProfile: profile })
+      setStatus(result)
+      setMessage(`Perfil ${labels[profile]?.name.toLowerCase()} activado.`)
+    } catch { setMessage('No se pudo activar ese modelo. Verificá que esté instalado.') }
+  }
+  return <section className="panel settings-card ai-settings-card"><div className="panel-head"><div><h2>Inteligencia artificial local</h2><p>Elegí el nivel de análisis. Los documentos permanecen en esta computadora.</p></div><Sparkles /></div><div className={`ai-health ${status?.available ? 'online' : 'offline'}`}><span /><div><strong>{status?.available ? 'Ollama conectado' : 'IA local no disponible'}</strong><small>{message}</small></div><button type="button" onClick={refresh}>Volver a comprobar</button></div><div className="ai-profile-grid">{status?.profiles.map(profile => { const label = labels[profile.id]; const active = profile.id === status.activeProfile; return <button type="button" key={profile.id} className={active ? 'active' : ''} disabled={!profile.installed || !status.available} onClick={() => select(profile.id)}><span>{active ? <Check size={17} /> : <Sparkles size={17} />}</span><strong>{label?.name ?? profile.id}</strong><small>{label?.description}</small><code>{profile.model}</code><b>{profile.installed ? active ? 'Activo' : 'Instalado' : 'No instalado'}</b></button> })}</div><div className="ai-embedding-status"><ShieldCheck size={16} /><span><strong>Búsqueda documental</strong><small>{status?.embeddingModel ?? 'Comprobando modelo…'} · {status?.embeddingInstalled ? 'instalado' : 'pendiente'}</small></span></div></section>
 }
 
 function SettingsView({ config, onSaved, onLogout }: { config: CaseConfig; onSaved: (config: CaseConfig) => void; onLogout: () => void }) {

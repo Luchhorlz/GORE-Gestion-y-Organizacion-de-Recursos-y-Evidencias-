@@ -969,3 +969,33 @@ Cuando una funcionalidad no pueda completarse, explicá exactamente:
 * Cómo continuar.
 
 Comenzá ahora inspeccionando el repositorio. No escribas código todavía hasta comprender la arquitectura existente y crear docs/AI_IMPLEMENTATION_PLAN.md. Después avanzá con la Fase 1.
+
+# DECISIÓN DE MODELOS LOCALES PARA GORE
+
+La integración con Ollama debe permitir instalar y alternar desde la interfaz entre tres perfiles del modelo Qwen3, sin modificar código ni reconstruir el servidor:
+
+* Qwen3 4B: perfil rápido, destinado a clasificación, extracciones simples y equipos con recursos limitados.
+* Qwen3 8B: perfil equilibrado y predeterminado para el uso cotidiano de GORE.
+* Qwen3 14B: perfil de mayor calidad para análisis complejos, aceptando una respuesta más lenta.
+
+Requisitos funcionales:
+
+* Los nombres exactos de los modelos deben configurarse mediante variables de entorno o configuración persistente; nunca quedar fijos dentro de la lógica de los agentes.
+* La pestaña Configuración debe mostrar qué modelos están instalados, cuál está activo y si Ollama se encuentra disponible.
+* El usuario debe poder cambiar el modelo activo sin reinstalar GORE.
+* Antes de seleccionar un modelo no instalado, GORE debe explicarlo y solicitar confirmación para descargarlo. Nunca debe iniciar una descarga grande silenciosamente.
+* Cada análisis debe registrar el proveedor y el modelo realmente utilizado.
+* Los trabajos ya guardados deben conservar el nombre del modelo con el que fueron generados aunque el perfil activo cambie posteriormente.
+* Debe existir una prueba comparativa interna con las mismas evidencias y preguntas para medir calidad, tiempo de respuesta, memoria utilizada y cumplimiento del esquema de fuentes.
+* El modelo de embeddings se configura de manera independiente y no cambia al alternar entre 4B, 8B y 14B.
+* La ausencia o el fallo de uno de los perfiles no debe impedir que GORE funcione con otro modelo instalado.
+
+Configuración conceptual sugerida:
+
+OLLAMA_CHAT_MODEL_FAST=qwen3:4b-instruct
+OLLAMA_CHAT_MODEL_BALANCED=qwen3:8b
+OLLAMA_CHAT_MODEL_QUALITY=qwen3:14b
+OLLAMA_CHAT_PROFILE=balanced
+OLLAMA_EMBEDDING_MODEL=qwen3-embedding:0.6b
+
+La implementación debe verificar los identificadores realmente disponibles en Ollama antes de establecer estos valores definitivos.

@@ -31,6 +31,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
+from backend.ai.config import PROFILE_NAMES
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BASE_DIR
@@ -44,6 +46,7 @@ FILES_DIR.mkdir(parents=True, exist_ok=True)
 WHISPER_MODEL = None
 WHISPER_MODEL_NAME = "small"
 WHISPER_LOCK = threading.Lock()
+AI_CONFIG = load_ai_config()
 
 app = FastAPI(
     title="GORE API",
@@ -177,6 +180,11 @@ def init_database() -> None:
                 engine TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ai_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                active_profile TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         evidence_columns = {row["name"] for row in db.execute("PRAGMA table_info(evidence)").fetchall()}
@@ -192,6 +200,7 @@ def init_database() -> None:
             "INSERT OR IGNORE INTO case_config (id,case_code,title,status,main_milestone,previous_modality,updated_at) VALUES (1,?,?,?,?,?,?)",
             ("GORE-2026-001", "Organización familiar", "En documentación", "2026-07-01", "Organización semanal alternada", utc_now()),
         )
+        db.execute("INSERT OR IGNORE INTO ai_settings (id,active_profile,updated_at) VALUES (1,?,?)", (AI_CONFIG.default_profile, utc_now()))
         if not db.execute("SELECT 1 FROM auth_config WHERE id = 1").fetchone():
             password = secrets.token_urlsafe(12)
             salt = secrets.token_hex(16)
@@ -260,6 +269,10 @@ class CaseConfigUpdate(BaseModel):
     status: str = Field(min_length=1, max_length=80)
     mainMilestone: str
     previousModality: str = Field(default="", max_length=2000)
+
+
+class AISettingsUpdate(BaseModel):
+    activeProfile: str
 
 
 def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
@@ -379,6 +392,65 @@ def update_case_config(payload: CaseConfigUpdate) -> dict:
         db.execute("UPDATE case_config SET case_code=?,title=?,status=?,main_milestone=?,previous_modality=?,updated_at=? WHERE id=1", (payload.caseCode, payload.title, payload.status, payload.mainMilestone, payload.previousModality, utc_now()))
         audit(db, "CASE_CONFIG_UPDATED", "case", payload.caseCode, {"title": payload.title, "status": payload.status})
         return case_config_dict(db.execute("SELECT * FROM case_config WHERE id = 1").fetchone())
+
+
+def ai_provider():
+    if AI_CONFIG.provider == "mock":
+        return MockAIProvider()
+    return LocalAIProvider(AI_CONFIG)
+
+
+def ai_status_payload() -> dict:
+    provider = ai_provider()
+    health = provider.health_check() if AI_CONFIG.enabled else {"available": False, "version": ""}
+    models: list[str] = []
+    if health["available"]:
+        try:
+            models = provider.list_available_models()
+        except Exception:
+            health = {"available": False, "version": ""}
+    with database() as db:
+        row = db.execute("SELECT active_profile FROM ai_settings WHERE id = 1").fetchone()
+        active_profile = row["active_profile"] if row and row["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+    profiles = [
+        {
+            "id": profile,
+            "model": AI_CONFIG.model_for(profile),
+            "installed": AI_CONFIG.model_for(profile) in models,
+        }
+        for profile in PROFILE_NAMES
+    ]
+    return {
+        "enabled": AI_CONFIG.enabled,
+        "provider": AI_CONFIG.provider,
+        "available": bool(health["available"]),
+        "version": health["version"],
+        "activeProfile": active_profile,
+        "activeModel": AI_CONFIG.model_for(active_profile),
+        "profiles": profiles,
+        "embeddingModel": AI_CONFIG.embedding_model,
+        "embeddingInstalled": AI_CONFIG.embedding_model in models,
+    }
+
+
+@app.get("/api/ai/status")
+def get_ai_status() -> dict:
+    return ai_status_payload()
+
+
+@app.put("/api/ai/settings")
+def update_ai_settings(payload: AISettingsUpdate) -> dict:
+    profile = payload.activeProfile.strip().lower()
+    if profile not in PROFILE_NAMES:
+        raise HTTPException(422, "El perfil de IA seleccionado no existe")
+    status = ai_status_payload()
+    selected = next(item for item in status["profiles"] if item["id"] == profile)
+    if not selected["installed"]:
+        raise HTTPException(409, "El modelo seleccionado todavía no está instalado en Ollama")
+    with database() as db:
+        db.execute("UPDATE ai_settings SET active_profile=?,updated_at=? WHERE id=1", (profile, utc_now()))
+        audit(db, "AI_PROFILE_CHANGED", "ai_settings", "local", {"profile": profile, "model": selected["model"]})
+    return ai_status_payload()
 
 
 @app.get("/api/events")
