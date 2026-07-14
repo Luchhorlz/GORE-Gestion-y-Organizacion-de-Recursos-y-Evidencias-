@@ -120,6 +120,18 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("Confirmar la fecha mencionada", " ".join(row["details_json"] for row in audit_details))
         self.assertEqual(self.client.post("/api/ai/chat/messages/MSG-CANCEL-AI/feedback", json={"rating": "useful"}).status_code, 409)
 
+    def test_ai_history_is_scoped_and_returns_safe_metadata(self):
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            db.execute("INSERT INTO ai_analyses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ANL-HISTORY-LOCAL", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "case_summary", "completed", "balanced", "mock-chat", '{"executiveSummary":"Resumen local comprobable"}', '[]', 1, self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_analyses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ANL-HISTORY-FOREIGN", "TENANT-OTHER", "CASE-OTHER", "case_summary", "completed", "balanced", "mock-chat", '{"executiveSummary":"Contenido ajeno secreto"}', '[]', 1, "USER-OTHER", now, now))
+        response = self.client.get("/api/ai/history")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("ANL-HISTORY-LOCAL", response.text)
+        self.assertIn("Resumen local comprobable", response.text)
+        self.assertNotIn("ANL-HISTORY-FOREIGN", response.text)
+        self.assertNotIn("Contenido ajeno secreto", response.text)
+
     def test_secure_upload_is_verified_and_duplicate_is_reused(self):
         content = b"Texto de prueba juridica para verificar el original."
         first = self.client.post("/api/evidence", files={"file": ("prueba.txt", content, "application/octet-stream")})

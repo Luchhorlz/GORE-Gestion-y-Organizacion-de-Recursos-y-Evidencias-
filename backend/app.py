@@ -1105,6 +1105,28 @@ def ai_analysis_dict(row: sqlite3.Row) -> dict:
     return result
 
 
+@app.get("/api/ai/history")
+def list_ai_analysis_history(request: Request, limit: int = 50) -> list[dict]:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM ai_analyses WHERE tenant_id=? AND case_id=? ORDER BY created_at DESC LIMIT ?", (scope["tenant_id"], scope["case_id"], min(max(limit, 1), 100))).fetchall()
+    history: list[dict] = []
+    for row in rows:
+        result = json.loads(row["result_json"]); sources = json.loads(row["sources_json"])
+        if row["analysis_type"] == "case_summary": preview = str(result.get("executiveSummary", ""))
+        elif row["analysis_type"] == "draft": preview = f"{result.get('title', '')}: {result.get('body', '')}"
+        elif row["analysis_type"] == "contradictions": preview = f"{len(result.get('contradictions', []))} posibles contradicciones identificadas para revisión."
+        elif row["analysis_type"] == "evidence_organization": preview = f"{len(result.get('items', []))} evidencias organizadas; {len(result.get('missingEvidence', []))} faltantes señalados."
+        else: preview = "Análisis local guardado."
+        history.append({
+            "id": row["id"], "type": row["analysis_type"], "status": row["status"], "profile": row["profile"], "model": row["model"],
+            "preview": re.sub(r"\s+", " ", preview).strip()[:320], "sourceCount": len(sources),
+            "sources": [{"sourceId": item.get("sourceId", ""), "evidenceId": item.get("evidenceId", ""), "evidenceName": item.get("evidenceName", "")} for item in sources],
+            "humanReviewRequired": bool(row["human_review_required"]), "generatedAt": row["created_at"],
+        })
+    return history
+
+
 @app.get("/api/ai/analyses/summary")
 def latest_case_summary(request: Request) -> dict:
     with database() as db:

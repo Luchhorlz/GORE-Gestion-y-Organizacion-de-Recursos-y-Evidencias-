@@ -16,7 +16,7 @@ import { apiDelete, apiFileUrl, apiGet, apiPost, apiPut, apiUpload, evidenceDown
 import JSZip from 'jszip'
 import { sha256Hex, validateGoreWhatsAppManifest, type GoreWhatsAppManifest } from './whatsappManifest'
 
-type View = 'inicio' | 'calendario' | 'acontecimientos' | 'cronologia-ia' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'borradores' | 'chat-ia' | 'ia-estado' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
+type View = 'inicio' | 'calendario' | 'acontecimientos' | 'cronologia-ia' | 'fechas' | 'evidencias' | 'analisis-evidencia' | 'asistente' | 'contradicciones' | 'borradores' | 'chat-ia' | 'ia-estado' | 'historial-ia' | 'comunicaciones' | 'whatsapp' | 'informes' | 'auditoria' | 'configuracion'
 type EventItem = {
   id: string; date: string; time: string; category: string; title: string;
   description: string; privateNotes?: string; expected?: string; actual?: string;
@@ -50,6 +50,7 @@ type StoredChat = Omit<StoredChatSummary, 'messageCount' | 'audioCount'> & { raw
 type AudioTranscription = { evidence_id: string; text: string; status: string; language: string; engine: string; updated_at: string }
 type AIStatus = { enabled: boolean; provider: string; available: boolean; version: string; activeProfile: string; activeModel: string; profiles: { id: string; model: string; installed: boolean }[]; embeddingModel: string; embeddingInstalled: boolean }
 type AIOperationsStatus = { ollamaAvailable: boolean; activeModel: string; processingJobs: Record<'pending' | 'processing' | 'completed' | 'failed', number>; chatJobs: Record<'pending' | 'processing' | 'completed' | 'failed', number>; averageChatSeconds: number; evidence: { total: number; extracting: number; failed: number }; completedAnalyses: number; reviewedResponses: number; latestChatJobs: { id: string; status: string; progress: number; stage: string; model: string; createdAt: string; updatedAt: string }[]; generatedAt: string }
+type AIHistoryItem = { id: string; type: string; status: string; profile: string; model: string; preview: string; sourceCount: number; sources: { sourceId: string; evidenceId: string; evidenceName: string }[]; humanReviewRequired: boolean; generatedAt: string }
 type Workspace = { tenant: { id: string; name: string }; user: { id: string; displayName: string; role: string }; case: { id: string; code: string; title: string; status: string; role: string } }
 
 const seedEvents: EventItem[] = [
@@ -71,6 +72,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
 ]
 const aiNavItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: 'ia-estado', label: 'Estado de la IA', icon: ShieldCheck },
+  { id: 'historial-ia', label: 'Historial de análisis', icon: Archive },
   { id: 'chat-ia', label: 'Chat con Ollama', icon: MessageCircle },
   { id: 'asistente', label: 'Asistente documental', icon: Sparkles },
   { id: 'evidencias', label: 'Búsqueda inteligente', icon: Search },
@@ -225,6 +227,7 @@ function App() {
           {view === 'borradores' && <DraftsView />}
           {view === 'chat-ia' && <AIChatView />}
           {view === 'ia-estado' && <AIOperationsView />}
+          {view === 'historial-ia' && <AIHistoryView />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
           {view === 'whatsapp' && <WhatsAppSimulator evidence={evidence} onEvidence={(item) => setEvidence(prev => prev.some(existing => existing.id === item.id) ? prev : [item, ...prev])} audioProgress={audioProgress} prepareAllAudios={prepareAllAudios} />}
           {view === 'informes' && <ReportsView events={events} evidence={evidence} />}
@@ -916,6 +919,23 @@ function AuditView() {
   const [loading, setLoading] = useState(true)
   useEffect(() => { apiGet<AuditItem[]>('/api/audit').then(setItems).finally(() => setLoading(false)) }, [])
   return <><section className="page-heading compact"><div><span className="eyebrow accent">TRAZABILIDAD PROTEGIDA</span><h1>Historial de auditoría</h1><p>Cada acción importante se encadena criptográficamente con la anterior para facilitar la detección de alteraciones.</p></div><div className="integrity-pill online"><ShieldCheck size={20} /><div><strong>Cadena activa</strong><span>{items.length} acciones visibles</span></div></div></section><article className="panel audit-panel"><div className="panel-head"><div><h2>Actividad del expediente</h2><p>Accesos, cambios e interacción con originales</p></div><span className="safe-badge"><ShieldCheck size={16} /> Registro inalterable</span></div>{loading ? <div className="empty-inline">Cargando auditoría…</div> : items.length === 0 ? <div className="vault-empty"><ShieldCheck /><strong>Sin actividad registrada</strong></div> : <div className="audit-list">{items.map(item => <div className="audit-row" key={item.id}><div className="audit-symbol"><Check /></div><div><strong>{auditLabels[item.action] ?? item.action}</strong><span>{format(new Date(item.occurred_at), "dd/MM/yyyy 'a las' HH:mm:ss")}</span><small>{item.entity_type} · {item.entity_id}</small></div><code title={item.entry_hash}>{item.entry_hash.slice(0, 14)}…</code></div>)}</div>}</article></>
+}
+
+function AIHistoryView() {
+  const [items, setItems] = useState<AIHistoryItem[]>([])
+  const [filter, setFilter] = useState('all')
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const labels: Record<string, string> = { case_summary: 'Resumen del expediente', contradictions: 'Posibles contradicciones', evidence_organization: 'Organización de evidencias', draft: 'Borrador asistido' }
+  async function refresh() {
+    setLoading(true)
+    try { setItems(await apiGet<AIHistoryItem[]>('/api/ai/history')); setError('') }
+    catch { setError('No se pudo recuperar el historial de análisis.') }
+    finally { setLoading(false) }
+  }
+  useEffect(() => { refresh() }, [])
+  const visible = filter === 'all' ? items : items.filter(item => item.type === filter)
+  return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">MEMORIA TRAZABLE DEL EXPEDIENTE</span><h1>Historial de análisis</h1><p>Consultá resultados ya guardados sin volver a ocupar Ollama ni modificar el expediente.</p></div><button className="primary-button" onClick={refresh}><Search size={16} /> Actualizar</button></section><div className="ai-history-filters"><button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>Todos <b>{items.length}</b></button>{Object.entries(labels).map(([type, label]) => <button className={filter === type ? 'active' : ''} onClick={() => setFilter(type)} key={type}>{label} <b>{items.filter(item => item.type === type).length}</b></button>)}</div>{error && <div className="login-error">{error}</div>}<div className="ai-history-list">{visible.map(item => <article className="panel ai-history-card" key={item.id}><div className="ai-history-icon"><Archive /></div><div className="ai-history-content"><div className="ai-history-head"><div><span>{labels[item.type] ?? item.type}</span><strong>{format(new Date(item.generatedAt), "dd/MM/yyyy 'a las' HH:mm")}</strong></div><b>Revisión humana requerida</b></div><p>{item.preview || 'Resultado guardado sin vista previa.'}</p><div className="ai-history-meta"><span><Sparkles /> {item.model}</span><span><FileCheck2 /> {item.sourceCount} fuente{item.sourceCount === 1 ? '' : 's'}</span><span><ShieldCheck /> Guardado localmente</span></div>{item.sources.length > 0 && <div className="chat-sources">{item.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={`${item.id}-${source.sourceId}`}>{source.sourceId} · {source.evidenceName}</a>)}</div>}</div></article>)}{!loading && visible.length === 0 && <article className="panel vault-empty"><Archive /><strong>No hay análisis en esta categoría</strong><p>Cuando generes un resultado con alguna herramienta IA aparecerá automáticamente aquí.</p></article>}{loading && <article className="panel empty-inline">Recuperando análisis guardados…</article>}</div></>
 }
 
 function AIOperationsView() {

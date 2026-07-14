@@ -17,3 +17,5 @@ Mientras una respuesta está en espera o siendo analizada aparece “Cancelar an
 “Herramientas IA > Estado de la IA” muestra la conexión de Ollama, tareas activas, errores acumulados, tiempos medios y las últimas respuestas. Esta pantalla usa solamente metadatos técnicos y se actualiza cada cinco segundos.
 
 Cada respuesta completada puede marcarse como “Útil”, “Incorrecta” o “Revisar”. En los dos últimos casos se puede guardar una observación. Esta revisión sirve como registro humano del expediente: no modifica las evidencias y GORE no la utiliza para entrenar automáticamente a Ollama.
+
+“Herramientas IA > Historial de análisis” reúne los resúmenes, borradores, análisis de evidencias y posibles contradicciones guardados. La vista permite filtrar por tipo y abrir sus fuentes originales sin generar nuevamente el resultado ni cargar Ollama.
