@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 def _utc_now() -> str:
@@ -255,11 +255,31 @@ def _migration_004_semantic_embeddings(db: sqlite3.Connection) -> None:
         )
 
 
+def _migration_005_audio_transcript_indexing(db: sqlite3.Connection) -> None:
+    now = _utc_now()
+    required_tables = all(_table_exists(db, table) for table in ("evidence", "audio_transcriptions", "processing_jobs"))
+    if not required_tables or not {"status", "text", "tenant_id", "case_id"}.issubset(_columns(db, "audio_transcriptions")):
+        return
+    db.execute(
+        """UPDATE evidence SET extraction_status='queued',extraction_error=''
+           WHERE id IN (SELECT evidence_id FROM audio_transcriptions WHERE status='completed' AND trim(text)<>'')"""
+    )
+    db.execute(
+        """INSERT OR IGNORE INTO processing_jobs
+            (id,tenant_id,case_id,evidence_id,job_type,status,available_at,created_by,created_at,updated_at)
+            SELECT 'JOB-TRANSCRIPT-' || e.id,e.tenant_id,e.case_id,e.id,'transcript_index','pending',?,e.created_by,?,?
+            FROM evidence e JOIN audio_transcriptions t ON t.evidence_id=e.id AND t.tenant_id=e.tenant_id AND t.case_id=e.case_id
+            WHERE t.status='completed' AND trim(t.text)<>''""",
+        (now, now, now),
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
     3: _migration_003_document_extraction,
     4: _migration_004_semantic_embeddings,
+    5: _migration_005_audio_transcript_indexing,
 }
 
 

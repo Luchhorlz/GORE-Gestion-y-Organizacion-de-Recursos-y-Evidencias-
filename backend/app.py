@@ -297,6 +297,46 @@ def enqueue_processing_job(db: sqlite3.Connection, evidence_id: str, scope: dict
     return job_id
 
 
+def transcribe_audio_file(path: Path) -> tuple[str, str, str]:
+    global WHISPER_MODEL
+    with WHISPER_LOCK:
+        if WHISPER_MODEL is None:
+            from faster_whisper import WhisperModel
+            model_dir = DATA_DIR / "models"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            WHISPER_MODEL = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8", download_root=str(model_dir))
+        segments, info = WHISPER_MODEL.transcribe(
+            str(path), language="es", beam_size=5, best_of=5, temperature=0,
+            vad_filter=True, condition_on_previous_text=True,
+            initial_prompt="Conversación de WhatsApp en español rioplatense. Conservar nombres propios, lugares y expresiones coloquiales.",
+        )
+        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+    return text, getattr(info, "language", "es") or "es", f"faster-whisper-{WHISPER_MODEL_NAME}"
+
+
+def store_transcript_for_index(db: sqlite3.Connection, evidence: sqlite3.Row, scope: dict, text: str, engine: str, now: str) -> tuple[int, str | None]:
+    db.execute("DELETE FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence["id"], scope["tenant_id"], scope["case_id"]))
+    chunks = chunk_text(text)
+    for index, text_chunk in enumerate(chunks, start=1):
+        db.execute(
+            "INSERT INTO evidence_text_chunks (id,evidence_id,tenant_id,case_id,section_type,section_label,section_index,chunk_index,text,text_sha256,extraction_method,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"TXT-{uuid.uuid4().hex[:16].upper()}", evidence["id"], scope["tenant_id"], scope["case_id"], "audio_transcript", "Transcripción del audio", 1, index, text_chunk, hashlib.sha256(text_chunk.encode("utf-8")).hexdigest(), engine, now),
+        )
+    status = "ready" if chunks else "empty"
+    db.execute(
+        "INSERT INTO evidence_extractions (evidence_id,tenant_id,case_id,status,character_count,section_count,engine,source_sha256,error_code,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET status=excluded.status,character_count=excluded.character_count,section_count=excluded.section_count,engine=excluded.engine,source_sha256=excluded.source_sha256,error_code='',updated_at=excluded.updated_at",
+        (evidence["id"], scope["tenant_id"], scope["case_id"], status, len(text), 1 if text else 0, engine, evidence["sha256"], "", now, now),
+    )
+    db.execute("UPDATE evidence SET extraction_status=?,extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (status, evidence["id"], scope["tenant_id"], scope["case_id"]))
+    embedding_job = None
+    if chunks:
+        active = db.execute("SELECT 1 FROM processing_jobs WHERE evidence_id=? AND job_type='semantic_embed' AND status IN ('pending','processing')", (evidence["id"],)).fetchone()
+        if not active:
+            embedding_job = enqueue_processing_job(db, evidence["id"], scope, "semantic_embed")
+        db.execute("UPDATE evidence SET embedding_status='queued',embedding_error='' WHERE id=? AND tenant_id=? AND case_id=?", (evidence["id"], scope["tenant_id"], scope["case_id"]))
+    return len(chunks), embedding_job
+
+
 def process_next_job() -> bool:
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -322,7 +362,22 @@ def process_next_job() -> bool:
                 while chunk := source.read(1024 * 1024): digest.update(chunk)
             if digest.hexdigest() != evidence["sha256"]: raise ValueError("integrity_mismatch")
             now = utc_now()
-            if job["job_type"] == "semantic_embed":
+            if job["job_type"] == "audio_transcribe":
+                text, language, engine = transcribe_audio_file(path)
+                transcription_status = "completed" if text else "empty"
+                db.execute(
+                    "INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at,tenant_id,case_id) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET text=excluded.text,status=excluded.status,language=excluded.language,engine=excluded.engine,updated_at=excluded.updated_at",
+                    (evidence["id"], text, transcription_status, language, engine, now, scope["tenant_id"], scope["case_id"]),
+                )
+                chunks, embedding_job = store_transcript_for_index(db, evidence, scope, text, engine, now)
+                audit(db, "AUDIO_TRANSCRIBED", "evidence", evidence["id"], {"characters": len(text), "engine": engine, "language": language, "chunks": chunks, "embedding_job": embedding_job}, scope)
+            elif job["job_type"] == "transcript_index":
+                transcription = db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=? AND status='completed' AND trim(text)<>''", (evidence["id"], scope["tenant_id"], scope["case_id"])).fetchone()
+                if not transcription:
+                    raise ValueError("transcript_missing")
+                chunks, embedding_job = store_transcript_for_index(db, evidence, scope, transcription["text"], transcription["engine"] or "transcription", now)
+                audit(db, "AUDIO_TRANSCRIPT_INDEXED", "evidence", evidence["id"], {"characters": len(transcription["text"]), "chunks": chunks, "embedding_job": embedding_job}, scope)
+            elif job["job_type"] == "semantic_embed":
                 chunks = db.execute("SELECT id,text,text_sha256 FROM evidence_text_chunks WHERE evidence_id=? AND tenant_id=? AND case_id=? ORDER BY section_index,chunk_index", (job["evidence_id"], job["tenant_id"], job["case_id"])).fetchall()
                 if not chunks:
                     raise ValueError("extracted_chunks_missing")
@@ -395,7 +450,14 @@ def process_next_job() -> bool:
             terminal = current["attempts"] >= current["max_attempts"] or code == "integrity_mismatch"
             status = "failed" if terminal else "pending"
             db.execute("UPDATE processing_jobs SET status=?,error_code=?,available_at=?,updated_at=? WHERE id=?", (status, code, utc_now(), utc_now(), job["id"]))
-            if job["job_type"] == "semantic_embed":
+            if job["job_type"] == "audio_transcribe":
+                db.execute("UPDATE audio_transcriptions SET status='failed',updated_at=? WHERE evidence_id=? AND tenant_id=? AND case_id=?", (utc_now(), job["evidence_id"], job["tenant_id"], job["case_id"]))
+                db.execute("UPDATE evidence SET extraction_status=?,extraction_error=? WHERE id=? AND tenant_id=? AND case_id=?", ("failed" if terminal else "queued", code, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "AUDIO_TRANSCRIPTION_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
+            elif job["job_type"] == "transcript_index":
+                db.execute("UPDATE evidence SET extraction_status=?,extraction_error=? WHERE id=? AND tenant_id=? AND case_id=?", ("failed" if terminal else "queued", code, job["evidence_id"], job["tenant_id"], job["case_id"]))
+                audit(db, "AUDIO_TRANSCRIPT_INDEX_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
+            elif job["job_type"] == "semantic_embed":
                 embedding_status = "failed" if terminal else "queued"
                 db.execute("UPDATE evidence SET embedding_status=?,embedding_error=? WHERE id=? AND tenant_id=? AND case_id=?", (embedding_status, code, job["evidence_id"], job["tenant_id"], job["case_id"]))
                 audit(db, "EVIDENCE_SEMANTIC_INDEX_FAILED", "evidence", job["evidence_id"], {"job_id": job["id"], "error_code": code}, scope)
@@ -761,6 +823,52 @@ def retry_semantic_index(request: Request) -> dict:
         return {"queued": len(candidates), "model": AI_CONFIG.embedding_model}
 
 
+@app.get("/api/ai/audio-index/status")
+def audio_index_status(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        params = (scope["tenant_id"], scope["case_id"])
+        total = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%'", params).fetchone()[0]
+        transcribed = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='completed' AND trim(text)<>''", params).fetchone()[0]
+        indexed = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%' AND embedding_status='ready'", params).fetchone()[0]
+        queued = db.execute("SELECT COUNT(*) FROM processing_jobs WHERE tenant_id=? AND case_id=? AND job_type='audio_transcribe' AND status IN ('pending','processing')", params).fetchone()[0]
+        failed = db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='failed'", params).fetchone()[0]
+        return {"total": total, "transcribed": transcribed, "indexed": indexed, "queued": queued, "failed": failed}
+
+
+@app.post("/api/ai/audio-index/prepare")
+def prepare_audio_index(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        candidates = db.execute(
+            """SELECT e.* FROM evidence e
+               LEFT JOIN audio_transcriptions t ON t.evidence_id=e.id AND t.tenant_id=e.tenant_id AND t.case_id=e.case_id
+               WHERE e.tenant_id=? AND e.case_id=? AND e.media_type LIKE 'audio/%'
+                 AND (t.evidence_id IS NULL OR t.status NOT IN ('completed','processing','queued') OR trim(t.text)='')
+                 AND NOT EXISTS (SELECT 1 FROM processing_jobs j WHERE j.evidence_id=e.id AND j.job_type='audio_transcribe' AND j.status IN ('pending','processing'))
+               ORDER BY e.added_at""",
+            (scope["tenant_id"], scope["case_id"]),
+        ).fetchall()
+        now = utc_now()
+        for evidence in candidates:
+            enqueue_processing_job(db, evidence["id"], scope, "audio_transcribe")
+            db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at,tenant_id,case_id) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET status='queued',updated_at=excluded.updated_at", (evidence["id"], "", "queued", "es", f"faster-whisper-{WHISPER_MODEL_NAME}", now, scope["tenant_id"], scope["case_id"]))
+            db.execute("UPDATE evidence SET extraction_status='queued',extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (evidence["id"], scope["tenant_id"], scope["case_id"]))
+        audit(db, "AUDIO_INDEX_PREPARATION_REQUESTED", "case", scope["case_id"], {"queued": len(candidates)}, scope)
+        return {"queued": len(candidates), "status": audio_index_status_from_db(db, scope)}
+
+
+def audio_index_status_from_db(db: sqlite3.Connection, scope: dict) -> dict:
+    params = (scope["tenant_id"], scope["case_id"])
+    return {
+        "total": db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%'", params).fetchone()[0],
+        "transcribed": db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='completed' AND trim(text)<>''", params).fetchone()[0],
+        "indexed": db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND media_type LIKE 'audio/%' AND embedding_status='ready'", params).fetchone()[0],
+        "queued": db.execute("SELECT COUNT(*) FROM processing_jobs WHERE tenant_id=? AND case_id=? AND job_type='audio_transcribe' AND status IN ('pending','processing')", params).fetchone()[0],
+        "failed": db.execute("SELECT COUNT(*) FROM audio_transcriptions WHERE tenant_id=? AND case_id=? AND status='failed'", params).fetchone()[0],
+    }
+
+
 @app.get("/api/events")
 def list_events(request: Request) -> list[dict]:
     with database() as db:
@@ -1081,7 +1189,8 @@ def delete_whatsapp_chat(chat_id: str, request: Request) -> dict:
 def get_transcription(evidence_id: str, request: Request) -> dict:
     with database() as db:
         scope = authorized_scope(request, db)
-        if not db.execute("SELECT 1 FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone(): raise HTTPException(404, "Evidencia no encontrada")
+        evidence_row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not evidence_row: raise HTTPException(404, "Evidencia no encontrada")
         row = db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
         return dict(row) if row else {"evidence_id": evidence_id, "text": "", "status": "none", "language": "", "engine": "", "updated_at": ""}
 
@@ -1090,9 +1199,12 @@ def get_transcription(evidence_id: str, request: Request) -> dict:
 def update_transcription(evidence_id: str, payload: TranscriptionUpdate, request: Request) -> dict:
     with database() as db:
         scope = authorized_scope(request, db)
-        if not db.execute("SELECT 1 FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone(): raise HTTPException(404, "Evidencia no encontrada")
+        evidence_row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not evidence_row: raise HTTPException(404, "Evidencia no encontrada")
         now = utc_now(); status = "completed" if payload.text.strip() else "none"
         db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at,tenant_id,case_id) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET text=excluded.text,status=excluded.status,engine=excluded.engine,updated_at=excluded.updated_at", (evidence_id, payload.text.strip(), status, "", "manual", now, scope["tenant_id"], scope["case_id"]))
+        if payload.text.strip():
+            store_transcript_for_index(db, evidence_row, scope, payload.text.strip(), "manual", now)
         audit(db, "AUDIO_TRANSCRIPTION_UPDATED", "evidence", evidence_id, {"characters": len(payload.text.strip()), "engine": "manual"})
         return dict(db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone())
 
@@ -1125,7 +1237,8 @@ def transcribe_evidence(evidence_id: str, request: Request) -> dict:
             now = utc_now(); status = "completed" if text else "empty"
             engine = f"faster-whisper-{WHISPER_MODEL_NAME}"
             db.execute("UPDATE audio_transcriptions SET text=?,status=?,language=?,engine=?,updated_at=? WHERE evidence_id=? AND tenant_id=? AND case_id=?", (text, status, getattr(info, "language", "es") or "es", engine, now, evidence_id, scope["tenant_id"], scope["case_id"]))
-            audit(db, "AUDIO_TRANSCRIBED", "evidence", evidence_id, {"characters": len(text), "engine": engine, "language": getattr(info, "language", "es")})
+            chunks, embedding_job = store_transcript_for_index(db, evidence_row, scope, text, engine, now)
+            audit(db, "AUDIO_TRANSCRIBED", "evidence", evidence_id, {"characters": len(text), "engine": engine, "language": getattr(info, "language", "es"), "chunks": chunks, "embedding_job": embedding_job})
             return dict(db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone())
     except Exception as error:
         with database() as db:

@@ -1,6 +1,8 @@
 import os
 import tempfile
 import time
+import io
+import wave
 import unittest
 from pathlib import Path
 
@@ -105,6 +107,29 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(fake_pdf.status_code, 415)
         executable = self.client.post("/api/evidence", files={"file": ("programa.exe", b"MZ", "application/octet-stream")})
         self.assertEqual(executable.status_code, 415)
+
+    def test_z_audio_transcript_is_added_to_semantic_search(self):
+        content = io.BytesIO()
+        with wave.open(content, "wb") as audio:
+            audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(8000)
+            audio.writeframes(b"\x00\x00" * 800)
+        uploaded = self.client.post("/api/evidence", files={"file": ("mensaje.wav", content.getvalue(), "audio/wav")})
+        self.assertEqual(uploaded.status_code, 201, uploaded.text)
+        evidence_id = uploaded.json()["id"]
+        for _ in range(40):
+            item = next(row for row in self.client.get("/api/evidence").json() if row["id"] == evidence_id)
+            if item["processingStatus"] == "ready": break
+            time.sleep(0.05)
+        transcript = "Se comunicó un cambio en la organización y modalidad de cuidado de los hijos."
+        updated = self.client.put(f"/api/evidence/{evidence_id}/transcription", json={"text": transcript})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        for _ in range(80):
+            item = next(row for row in self.client.get("/api/evidence").json() if row["id"] == evidence_id)
+            if item["embeddingStatus"] == "ready": break
+            time.sleep(0.05)
+        self.assertEqual(item["embeddingStatus"], "ready")
+        result = self.client.post("/api/ai/search", json={"query": "modalidad de cuidado", "limit": 5}).json()["results"]
+        self.assertTrue(any(row["evidenceId"] == evidence_id and row["sectionLabel"] == "Transcripción del audio" for row in result))
 
 
 if __name__ == "__main__":
