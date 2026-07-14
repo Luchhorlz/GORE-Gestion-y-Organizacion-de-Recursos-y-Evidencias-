@@ -30,6 +30,7 @@ type AudioIndexStatus = { total: number; transcribed: number; empty: number; com
 type AssistantCitation = SemanticSearchResult & { sourceId: string }
 type AssistantAnswer = { question: string; answer: string; insufficientEvidence: boolean; caveats: string[]; citations: AssistantCitation[]; model: string; profile: string }
 type CaseSummary = { id: string; executiveSummary: string; mainFacts: string[]; peopleInvolved: string[]; availableEvidence: string[]; missingInformation: string[]; questionsPending: string[]; confidence: number; insufficientEvidence: boolean; humanReviewRequired: boolean; sources: AssistantCitation[]; model: string; profile: string; generatedAt: string }
+type ChronologyProposal = { id: string; date: string; time: string; description: string; people: string[]; certainty: number; dateBasis: 'explicit' | 'inferred' | 'file_date'; sources: AssistantCitation[]; status: 'pending_review' | 'approved' | 'rejected'; approvedEventId?: string }
 type AuditItem = { id: number; occurred_at: string; actor: string; action: string; entity_type: string; entity_id: string; entry_hash: string }
 type CaseConfig = { caseCode: string; title: string; status: string; mainMilestone: string; previousModality: string }
 type ChatMessage = { id: number; date: string; time: string; sender: string; text: string; system: boolean }
@@ -189,7 +190,7 @@ function App() {
         <div className="content">
           {view === 'inicio' && <Dashboard events={events} evidence={evidence} go={go} openModal={openNewEvent} backendOnline={backendOnline} openEvent={openEvent} />}
           {view === 'calendario' && <CalendarView month={month} setMonth={setMonth} events={events} openDay={setSelectedDay} milestoneDate={caseConfig.mainMilestone} />}
-          {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} />}
+          {view === 'acontecimientos' && <EventsView events={events} openModal={openNewEvent} openEvent={openEvent} caseConfig={caseConfig} onEventApproved={event => setEvents(previous => [event, ...previous.filter(item => item.id !== event.id)])} />}
           {view === 'evidencias' && <EvidenceView evidence={evidence} setEvidence={setEvidence} setBackendOnline={setBackendOnline} events={events} />}
           {view === 'asistente' && <AIAssistantView audioProgress={audioProgress} />}
           {view === 'comunicaciones' && <CommunicationsView events={events} openModal={openNewEvent} openEvent={openEvent} />}
@@ -266,11 +267,28 @@ function CalendarView({ month, setMonth, events, openDay, milestoneDate }: { mon
   </>
 }
 
-function EventsView({ events, openModal, openEvent, caseConfig }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void; caseConfig: CaseConfig }) {
+function EventsView({ events, openModal, openEvent, caseConfig, onEventApproved }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void; caseConfig: CaseConfig; onEventApproved: (event: EventItem) => void }) {
   const [query, setQuery] = useState('')
+  const [proposals, setProposals] = useState<ChronologyProposal[]>([])
+  const [chronologyLoading, setChronologyLoading] = useState(false)
+  const [chronologyError, setChronologyError] = useState('')
+  useEffect(() => { apiGet<ChronologyProposal[]>('/api/ai/chronology/proposals').then(setProposals).catch(() => undefined) }, [])
+  async function generateChronology() {
+    setChronologyLoading(true); setChronologyError('')
+    try { const result = await apiPost<{ proposals: ChronologyProposal[] }>('/api/ai/chronology/generate', {}); setProposals(previous => [...result.proposals, ...previous]) }
+    catch { setChronologyError('No se pudieron generar propuestas. Verificá Ollama y las evidencias indexadas.') }
+    finally { setChronologyLoading(false) }
+  }
+  async function reviewProposal(proposal: ChronologyProposal, action: 'approve' | 'reject') {
+    try {
+      if (action === 'approve') { const result = await apiPost<{ proposal: ChronologyProposal; event: EventItem }>(`/api/ai/chronology/proposals/${proposal.id}/approve`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result.proposal : item)); onEventApproved(result.event) }
+      else { const result = await apiPost<ChronologyProposal>(`/api/ai/chronology/proposals/${proposal.id}/reject`, {}); setProposals(previous => previous.map(item => item.id === proposal.id ? result : item)) }
+    } catch { setChronologyError('No se pudo registrar la revisión de esa propuesta.') }
+  }
   const filtered = events.filter(e => `${e.title} ${e.description} ${e.category}`.toLowerCase().includes(query.toLowerCase()))
   return <><section className="page-heading compact with-action"><div><span className="eyebrow accent">REGISTRO OBJETIVO</span><h1>Acontecimientos</h1><p>Una cronología clara de hechos, comunicaciones y cambios relevantes.</p></div><button className="primary-button" onClick={openModal}><Plus size={18} /> Nuevo acontecimiento</button></section>
     <article className="milestone-banner"><div className="milestone-date"><strong>{format(new Date(`${caseConfig.mainMilestone}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${caseConfig.mainMilestone}T12:00:00`), 'MMM yyyy', { locale: es }).toUpperCase()}</span></div><div><span className="eyebrow">HITO PRINCIPAL DEL EXPEDIENTE</span><h2>{caseConfig.title}</h2><p>Fecha principal configurada para organizar la lectura del expediente. Los hechos anteriores y posteriores permanecen visibles en la misma cronología.</p></div><Gavel size={22} /></article>
+    <article className="panel chronology-agent"><div className="panel-head"><div><span className="eyebrow accent">AGENTE LOCAL · REVISIÓN OBLIGATORIA</span><h2>Propuestas para la cronología</h2><p>Detecta fechas en evidencias, pero nunca modifica el calendario sin tu aprobación.</p></div><button className="primary-button" onClick={generateChronology} disabled={chronologyLoading}><Sparkles size={16} /> {chronologyLoading ? 'Analizando…' : 'Buscar acontecimientos'}</button></div>{chronologyError && <div className="login-error">{chronologyError}</div>}<div className="chronology-proposals">{proposals.map(proposal => <section className={`chronology-proposal ${proposal.status}`} key={proposal.id}><div className="proposal-date"><strong>{format(new Date(`${proposal.date}T12:00:00`), 'dd')}</strong><span>{format(new Date(`${proposal.date}T12:00:00`), 'MMM yyyy', { locale: es })}</span>{proposal.time && <small>{proposal.time}</small>}</div><div><div className="proposal-badges"><span>{proposal.dateBasis === 'explicit' ? 'Fecha explícita' : proposal.dateBasis === 'file_date' ? 'Fecha del archivo' : 'Fecha inferida'}</span><span>Confianza {(proposal.certainty * 100).toFixed(0)}%</span></div><p>{proposal.description}</p>{proposal.people.length > 0 && <small>Personas: {proposal.people.join(', ')}</small>}<div className="proposal-sources">{proposal.sources.map(source => <a href={evidenceDownloadUrl(source.evidenceId)} key={source.sourceId}>{source.sourceId} · {source.evidenceName}</a>)}</div></div><div className="proposal-actions">{proposal.status === 'pending_review' ? <><button onClick={() => reviewProposal(proposal, 'reject')}>Descartar</button><button className="approve" onClick={() => reviewProposal(proposal, 'approve')}><Check size={15} /> Aprobar</button></> : <span>{proposal.status === 'approved' ? 'Incorporado al calendario' : 'Descartado'}</span>}</div></section>)}{proposals.length === 0 && <div className="vault-empty"><Clock3 /><strong>Sin propuestas pendientes</strong><p>GORE sólo mostrará acontecimientos que pueda vincular con fuentes.</p></div>}</div></article>
     <article className="panel list-panel"><div className="list-tools"><label><Search size={18} /><input placeholder="Buscar por palabra, categoría o fecha…" value={query} onChange={e => setQuery(e.target.value)} /></label><button>Todos los estados <ChevronRight size={16} /></button></div><div className="events-list">{filtered.map((event, i) => <EventRow key={event.id} event={event} last={i === filtered.length - 1} onOpen={openEvent} />)}{filtered.length === 0 && <div className="empty-inline">No encontramos acontecimientos con ese criterio.</div>}</div></article></>
 }
 

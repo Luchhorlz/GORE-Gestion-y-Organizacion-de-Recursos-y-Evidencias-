@@ -35,7 +35,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
 from backend.ai.providers import AIProviderError
 from backend.ai.config import PROFILE_NAMES
-from backend.ai.agents import SUMMARY_SCHEMA, build_summary_prompt, normalize_summary
+from backend.ai.agents import CHRONOLOGY_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_summary_prompt, normalize_summary
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
 from backend.migrations import DEFAULT_CASE_ID, DEFAULT_TENANT_ID, DEFAULT_USER_ID, apply_migrations
 
@@ -956,6 +956,100 @@ def generate_case_summary(request: Request) -> dict:
         audit(db, "AI_CASE_SUMMARY_GENERATED", "ai_analysis", analysis_id, {"model": model, "citations": result["sourceIds"], "confidence": result["confidence"]}, scope)
         row = db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone()
         return ai_analysis_dict(row)
+
+
+def chronology_proposal_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"], "date": row["proposed_date"], "time": row["proposed_time"],
+        "description": row["description"], "people": json.loads(row["people_json"]),
+        "certainty": row["certainty"], "dateBasis": row["date_basis"],
+        "sources": json.loads(row["sources_json"]), "status": row["status"],
+        "approvedEventId": row["approved_event_id"], "createdAt": row["created_at"],
+    }
+
+
+@app.get("/api/ai/chronology/proposals")
+def list_chronology_proposals(request: Request) -> list[dict]:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM chronology_proposals WHERE tenant_id=? AND case_id=? ORDER BY proposed_date DESC,created_at DESC", (scope["tenant_id"], scope["case_id"])).fetchall()
+        return [chronology_proposal_dict(row) for row in rows]
+
+
+@app.post("/api/ai/chronology/generate")
+def generate_chronology_proposals(request: Request) -> dict:
+    retrieval = semantic_search(SemanticSearchPayload(query="fechas horarios acontecimientos entregas comunicaciones acuerdos", limit=2), request)
+    sources = retrieval["results"]
+    if not sources:
+        raise HTTPException(422, "Todavía no hay evidencias indexadas suficientes para proponer una cronología")
+    with database() as db:
+        scope = authorized_scope(request, db)
+        setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone()
+        profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+    source_map = {f"S{index}": source for index, source in enumerate(sources, start=1)}
+    context = "\n\n".join(f"[{sid}] Archivo: {source['evidenceName']} | Fecha del archivo: {source['factDate'] or 'sin fecha'} | SHA: {source['textHash']}\n{source['text'][:1000]}" for sid, source in source_map.items())
+    model = AI_CONFIG.model_for(profile)
+    try:
+        raw = ai_provider().generate_structured(build_chronology_prompt(context), model, CHRONOLOGY_SCHEMA)
+    except AIProviderError as error:
+        raise HTTPException(503, "Ollama no pudo generar las propuestas cronológicas") from error
+    accepted: list[dict] = []
+    now = utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        for item in raw.get("events", [])[:3] if isinstance(raw.get("events"), list) else []:
+            date = str(item.get("date", "")).strip()
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                continue
+            source_ids = list(dict.fromkeys(str(value) for value in item.get("source_ids", []) if str(value) in source_map))
+            description = str(item.get("description", "")).strip()[:500]
+            if not source_ids or not description:
+                continue
+            time_value = str(item.get("time", "")).strip()
+            if time_value and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_value):
+                time_value = ""
+            try:
+                certainty = max(0.0, min(float(item.get("certainty", 0)), 1.0))
+            except (TypeError, ValueError):
+                certainty = 0.0
+            basis = str(item.get("date_basis", "")).strip()
+            basis = basis if basis in {"explicit", "inferred", "file_date"} else "inferred"
+            proposal_id = f"CHR-{uuid.uuid4().hex[:12].upper()}"
+            cited = [{"sourceId": sid, **source_map[sid]} for sid in source_ids]
+            people = [str(value).strip()[:120] for value in item.get("people", [])[:8] if str(value).strip()]
+            db.execute("INSERT INTO chronology_proposals (id,tenant_id,case_id,proposed_date,proposed_time,description,people_json,certainty,date_basis,sources_json,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, scope["tenant_id"], scope["case_id"], date, time_value, description, json.dumps(people, ensure_ascii=False), certainty, basis, json.dumps(cited, ensure_ascii=False), "pending_review", scope["user_id"], now, now))
+            accepted.append(chronology_proposal_dict(db.execute("SELECT * FROM chronology_proposals WHERE id=?", (proposal_id,)).fetchone()))
+        audit(db, "AI_CHRONOLOGY_PROPOSED", "case", scope["case_id"], {"count": len(accepted), "model": model}, scope)
+    return {"proposals": accepted, "model": model, "profile": profile}
+
+
+@app.post("/api/ai/chronology/proposals/{proposal_id}/approve")
+def approve_chronology_proposal(proposal_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        proposal = db.execute("SELECT * FROM chronology_proposals WHERE id=? AND tenant_id=? AND case_id=?", (proposal_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not proposal:
+            raise HTTPException(404, "Propuesta no encontrada")
+        if proposal["status"] != "pending_review":
+            raise HTTPException(409, "La propuesta ya fue revisada")
+        event_id, now = f"EVT-{proposal['proposed_date'].replace('-', '')}-{uuid.uuid4().hex[:6].upper()}", utc_now()
+        db.execute("INSERT INTO events (id,date,time,category,title,description,private_notes,expected,actual,status,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (event_id, proposal["proposed_date"], proposal["proposed_time"] or "12:00", "Acontecimiento", proposal["description"][:180], proposal["description"], "", "", "", "Borrador", now, now, scope["tenant_id"], scope["case_id"], scope["user_id"]))
+        db.execute("UPDATE chronology_proposals SET status='approved',approved_event_id=?,updated_at=? WHERE id=?", (event_id, now, proposal_id))
+        audit(db, "AI_CHRONOLOGY_APPROVED", "event", event_id, {"proposal_id": proposal_id}, scope)
+        return {"proposal": chronology_proposal_dict(db.execute("SELECT * FROM chronology_proposals WHERE id=?", (proposal_id,)).fetchone()), "event": event_dict(db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone())}
+
+
+@app.post("/api/ai/chronology/proposals/{proposal_id}/reject")
+def reject_chronology_proposal(proposal_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        updated = db.execute("UPDATE chronology_proposals SET status='rejected',updated_at=? WHERE id=? AND tenant_id=? AND case_id=? AND status='pending_review'", (utc_now(), proposal_id, scope["tenant_id"], scope["case_id"])).rowcount
+        if not updated:
+            raise HTTPException(404, "Propuesta pendiente no encontrada")
+        audit(db, "AI_CHRONOLOGY_REJECTED", "chronology_proposal", proposal_id, {}, scope)
+        return chronology_proposal_dict(db.execute("SELECT * FROM chronology_proposals WHERE id=?", (proposal_id,)).fetchone())
 
 
 @app.post("/api/ai/index/retry")

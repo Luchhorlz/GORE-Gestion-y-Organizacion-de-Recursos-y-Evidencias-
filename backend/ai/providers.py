@@ -66,7 +66,7 @@ class LocalAIProvider(AIProvider):
         return str(result.get("response", "")).strip()
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
-        token_limit = 420 if "executive_summary" in schema.get("properties", {}) else 180
+        token_limit = 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
         result = self._request("/api/generate", {
             "model": model, "prompt": prompt, "stream": False, "think": False,
             "format": schema, "options": {"temperature": 0, "num_predict": token_limit},
@@ -98,6 +98,8 @@ class MockAIProvider(AIProvider):
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if "events" in schema.get("properties", {}):
+            return {"events": [{"date": "2026-07-08", "time": "12:00", "description": "Acontecimiento propuesto respaldado.", "people": ["Persona mencionada"], "certainty": 0.8, "date_basis": "explicit", "source_ids": ["S1"]}]}
         if "executive_summary" in schema.get("properties", {}):
             return {"executive_summary": "Resumen simulado respaldado.", "main_facts": ["Hecho respaldado."], "people_involved": [], "available_evidence": ["Documento de prueba."], "missing_information": [], "questions_pending": [], "source_ids": ["S1"], "confidence": 0.8, "human_review_required": True}
         if "answer" in schema.get("properties", {}):

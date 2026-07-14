@@ -108,6 +108,14 @@ class IsolationTests(unittest.TestCase):
         persisted = self.client.get("/api/ai/analyses/summary")
         self.assertEqual(persisted.status_code, 200, persisted.text)
         self.assertEqual(persisted.json()["analysis"]["id"], summary.json()["id"])
+        chronology = self.client.post("/api/ai/chronology/generate", json={})
+        self.assertEqual(chronology.status_code, 200, chronology.text)
+        proposal = chronology.json()["proposals"][0]
+        self.assertEqual(proposal["status"], "pending_review")
+        approved = self.client.post(f"/api/ai/chronology/proposals/{proposal['id']}/approve", json={})
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(approved.json()["proposal"]["status"], "approved")
+        self.assertEqual(approved.json()["event"]["date"], "2026-07-08")
 
         duplicate = self.client.post("/api/evidence", files={"file": ("copia.txt", content, "text/plain")})
         self.assertEqual(duplicate.status_code, 201, duplicate.text)

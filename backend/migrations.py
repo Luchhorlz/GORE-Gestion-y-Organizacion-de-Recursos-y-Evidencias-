@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 
 def _utc_now() -> str:
@@ -298,6 +298,32 @@ def _migration_006_ai_analyses(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_007_chronology_proposals(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS chronology_proposals (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id),
+            proposed_date TEXT NOT NULL,
+            proposed_time TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL,
+            people_json TEXT NOT NULL DEFAULT '[]',
+            certainty REAL NOT NULL DEFAULT 0,
+            date_basis TEXT NOT NULL,
+            sources_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_review',
+            approved_event_id TEXT,
+            created_by TEXT NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chronology_proposals_scope
+            ON chronology_proposals (tenant_id,case_id,status,proposed_date);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -305,6 +331,7 @@ MIGRATIONS = {
     4: _migration_004_semantic_embeddings,
     5: _migration_005_audio_transcript_indexing,
     6: _migration_006_ai_analyses,
+    7: _migration_007_chronology_proposals,
 }
 
 
