@@ -697,6 +697,11 @@ class AIChatMessagePayload(BaseModel):
     evidenceIds: list[str] = Field(default_factory=list, max_length=10)
 
 
+class AIFeedbackPayload(BaseModel):
+    rating: str = Field(pattern="^(useful|incorrect|review)$")
+    comment: str = Field(default="", max_length=1000)
+
+
 def event_dict(row: sqlite3.Row, evidence_count: int = 0) -> dict:
     return {
         "id": row["id"], "date": row["date"], "time": row["time"],
@@ -933,6 +938,7 @@ def get_ai_operations_status(request: Request) -> dict:
                FROM evidence WHERE tenant_id=? AND case_id=?""", params,
         ).fetchone()
         analyses = db.execute("SELECT COUNT(*) FROM ai_analyses WHERE tenant_id=? AND case_id=? AND status='completed'", params).fetchone()[0]
+        reviewed = db.execute("SELECT COUNT(*) FROM ai_feedback WHERE tenant_id=? AND case_id=? AND target_type='chat_message'", params).fetchone()[0]
         latest = db.execute(
             "SELECT id,status,progress,stage,model,created_at,updated_at FROM ai_chat_jobs WHERE tenant_id=? AND case_id=? ORDER BY created_at DESC LIMIT 6", params,
         ).fetchall()
@@ -943,7 +949,7 @@ def get_ai_operations_status(request: Request) -> dict:
         "processingJobs": counts(processing), "chatJobs": counts(chats),
         "averageChatSeconds": round(float(chats["average_seconds"] or 0), 1),
         "evidence": {"total": int(evidence["total"] or 0), "extracting": int(evidence["extracting"] or 0), "failed": int(evidence["failed"] or 0)},
-        "completedAnalyses": int(analyses),
+        "completedAnalyses": int(analyses), "reviewedResponses": int(reviewed),
         "latestChatJobs": [{"id": row["id"], "status": row["status"], "progress": row["progress"], "stage": row["stage"], "model": row["model"], "createdAt": row["created_at"], "updatedAt": row["updated_at"]} for row in latest],
         "generatedAt": utc_now(),
     }
@@ -1499,10 +1505,12 @@ def generate_ai_draft(payload: AIDraftPayload, request: Request) -> dict:
 
 
 def ai_conversation_dict(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    messages = db.execute("""SELECT m.*,j.id job_id,j.progress,j.stage,j.status job_status,j.model
+    messages = db.execute("""SELECT m.*,j.id job_id,j.progress,j.stage,j.status job_status,j.model,
+        f.rating feedback_rating,f.comment feedback_comment,f.updated_at feedback_updated_at
         FROM ai_chat_messages m LEFT JOIN ai_chat_jobs j ON j.assistant_message_id=m.id
+        LEFT JOIN ai_feedback f ON f.target_type='chat_message' AND f.target_id=m.id AND f.tenant_id=m.tenant_id AND f.case_id=m.case_id
         WHERE m.conversation_id=? ORDER BY m.created_at""", (row["id"],)).fetchall()
-    return {"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"], "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "status": item["status"], "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
+    return {"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"], "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "status": item["status"], "feedback": {"rating": item["feedback_rating"], "comment": item["feedback_comment"], "updatedAt": item["feedback_updated_at"]} if item["feedback_rating"] else None, "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
 
 
 @app.get("/api/ai/chat/conversations")
@@ -1583,6 +1591,27 @@ def cancel_ai_chat_job(job_id: str, request: Request) -> dict:
         event = AI_CHAT_CANCEL_EVENTS.get(job_id)
         if event: event.set()
     return {"id": job_id, "status": "cancelled", "cancelled": True}
+
+
+@app.post("/api/ai/chat/messages/{message_id}/feedback")
+def save_ai_chat_feedback(message_id: str, payload: AIFeedbackPayload, request: Request) -> dict:
+    comment = payload.comment.strip()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        message = db.execute("SELECT id,role,status FROM ai_chat_messages WHERE id=? AND tenant_id=? AND case_id=?", (message_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not message: raise HTTPException(404, "Respuesta de IA no encontrada")
+        if message["role"] != "assistant" or message["status"] != "completed": raise HTTPException(409, "Sólo se pueden revisar respuestas completadas")
+        now = utc_now(); feedback_id = f"FDB-{uuid.uuid4().hex[:12].upper()}"
+        db.execute(
+            """INSERT INTO ai_feedback (id,tenant_id,case_id,target_type,target_id,rating,comment,created_by,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(tenant_id,case_id,target_type,target_id) DO UPDATE SET
+               rating=excluded.rating,comment=excluded.comment,created_by=excluded.created_by,updated_at=excluded.updated_at""",
+            (feedback_id, scope["tenant_id"], scope["case_id"], "chat_message", message_id, payload.rating, comment, scope["user_id"], now, now),
+        )
+        audit(db, "AI_RESPONSE_REVIEWED", "ai_chat_message", message_id, {"rating": payload.rating, "comment_sha256": hashlib.sha256(comment.encode("utf-8")).hexdigest() if comment else ""}, scope)
+        row = db.execute("SELECT rating,comment,updated_at FROM ai_feedback WHERE tenant_id=? AND case_id=? AND target_type='chat_message' AND target_id=?", (scope["tenant_id"], scope["case_id"], message_id)).fetchone()
+        return {"rating": row["rating"], "comment": row["comment"], "updatedAt": row["updated_at"]}
 
 
 @app.post("/api/ai/index/retry")

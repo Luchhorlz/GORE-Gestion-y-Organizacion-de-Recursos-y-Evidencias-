@@ -15,3 +15,5 @@ El chat admite mensajes de hasta 50.000 caracteres y hasta 10 adjuntos. Los arch
 Mientras una respuesta está en espera o siendo analizada aparece “Cancelar análisis”. La cancelación corta la generación local, queda guardada y no se reanuda al reiniciar el servidor. No elimina la consulta ni las evidencias asociadas.
 
 “Herramientas IA > Estado de la IA” muestra la conexión de Ollama, tareas activas, errores acumulados, tiempos medios y las últimas respuestas. Esta pantalla usa solamente metadatos técnicos y se actualiza cada cinco segundos.
+
+Cada respuesta completada puede marcarse como “Útil”, “Incorrecta” o “Revisar”. En los dos últimos casos se puede guardar una observación. Esta revisión sirve como registro humano del expediente: no modifica las evidencias y GORE no la utiliza para entrenar automáticamente a Ollama.

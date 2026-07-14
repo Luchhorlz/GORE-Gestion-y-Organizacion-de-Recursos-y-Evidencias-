@@ -381,6 +381,21 @@ def _migration_009_ai_chat(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_010_ai_feedback(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ai_feedback (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id), target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL, rating TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE (tenant_id,case_id,target_type,target_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_feedback_scope ON ai_feedback (tenant_id,case_id,target_type,updated_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -391,6 +406,7 @@ MIGRATIONS = {
     7: _migration_007_chronology_proposals,
     8: _migration_008_date_proposals,
     9: _migration_009_ai_chat,
+    10: _migration_010_ai_feedback,
 }
 
 

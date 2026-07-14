@@ -102,6 +102,24 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(message["status"], "cancelled")
         self.assertIn("cancelado", message["content"].lower())
 
+    def test_ai_feedback_is_persistent_scoped_and_does_not_log_comment(self):
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            db.execute("INSERT INTO ai_conversations VALUES (?,?,?,?,?,?,?)", ("CNV-FEEDBACK-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Revisión", self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-FEEDBACK-AI", "CNV-FEEDBACK-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "assistant", "Respuesta revisable", 0, "[]", "completed", now, now))
+        first = self.client.post("/api/ai/chat/messages/MSG-FEEDBACK-AI/feedback", json={"rating": "review", "comment": "Confirmar la fecha mencionada"})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["rating"], "review")
+        updated = self.client.post("/api/ai/chat/messages/MSG-FEEDBACK-AI/feedback", json={"rating": "useful", "comment": ""})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        conversation = self.client.get("/api/ai/chat/conversations/CNV-FEEDBACK-TEST").json()
+        self.assertEqual(conversation["messages"][0]["feedback"]["rating"], "useful")
+        with self.module.database() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM ai_feedback WHERE target_id='MSG-FEEDBACK-AI'").fetchone()[0], 1)
+            audit_details = db.execute("SELECT details_json FROM audit_log WHERE action='AI_RESPONSE_REVIEWED' ORDER BY id DESC LIMIT 2").fetchall()
+        self.assertNotIn("Confirmar la fecha mencionada", " ".join(row["details_json"] for row in audit_details))
+        self.assertEqual(self.client.post("/api/ai/chat/messages/MSG-CANCEL-AI/feedback", json={"rating": "useful"}).status_code, 409)
+
     def test_secure_upload_is_verified_and_duplicate_is_reused(self):
         content = b"Texto de prueba juridica para verificar el original."
         first = self.client.post("/api/evidence", files={"file": ("prueba.txt", content, "application/octet-stream")})

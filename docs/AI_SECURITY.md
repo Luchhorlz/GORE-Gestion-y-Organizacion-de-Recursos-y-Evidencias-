@@ -15,6 +15,7 @@
 - La auditoría técnica guarda modelo, fuentes, duración y estado, pero no copia el contenido completo de mensajes o evidencias.
 - Las respuestas siguen siendo resultados derivados sujetos a revisión humana; ningún agente crea eventos ni realiza presentaciones automáticamente.
 - Una tarea de chat puede cancelarse durante la espera o generación. El servidor conserva el estado `cancelled`, corta la respuesta en curso y registra la acción sin borrar fuentes ni originales.
+- La revisión humana de respuestas se conserva por expediente. La observación completa permanece en la tabla de feedback; el registro encadenado de auditoría guarda solamente su SHA-256 y la clasificación, evitando duplicar texto sensible.
 - El acceso futuro se filtra por tenant, usuario, permiso y expediente antes de consultar documentos o vectores.
 - Las fechas detectadas son propuestas `pending_review`.
 - Las respuestas que requieren evidencia deben incluir fuentes o declarar información insuficiente.
