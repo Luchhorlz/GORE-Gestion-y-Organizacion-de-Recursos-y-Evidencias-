@@ -99,6 +99,24 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def authorized_scope(request: Request, db: sqlite3.Connection) -> dict:
+    session = getattr(request.state, "session", None)
+    if not session:
+        raise HTTPException(401, "Autenticación requerida")
+    membership = db.execute(
+        """SELECT m.role FROM case_memberships m
+           JOIN users u ON u.id=m.user_id AND u.tenant_id=m.tenant_id
+           JOIN cases c ON c.id=m.case_id AND c.tenant_id=m.tenant_id
+           JOIN law_firms f ON f.id=m.tenant_id
+           WHERE m.tenant_id=? AND m.case_id=? AND m.user_id=?
+             AND u.status='active' AND f.status='active'""",
+        (session["tenant_id"], session["case_id"], session["user_id"]),
+    ).fetchone()
+    if not membership:
+        raise HTTPException(403, "No tenés acceso al expediente solicitado")
+    return {**session, "case_role": membership["role"]}
+
+
 def init_database() -> None:
     with database() as db:
         db.executescript(
@@ -412,18 +430,20 @@ def case_config_dict(row: sqlite3.Row) -> dict:
 
 
 @app.get("/api/case")
-def get_case_config() -> dict:
+def get_case_config(request: Request) -> dict:
     with database() as db:
-        return case_config_dict(db.execute("SELECT * FROM case_config WHERE id = 1").fetchone())
+        scope = authorized_scope(request, db)
+        return case_config_dict(db.execute("SELECT * FROM case_config WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone())
 
 
 @app.put("/api/case")
-def update_case_config(payload: CaseConfigUpdate) -> dict:
+def update_case_config(payload: CaseConfigUpdate, request: Request) -> dict:
     with database() as db:
-        db.execute("UPDATE case_config SET case_code=?,title=?,status=?,main_milestone=?,previous_modality=?,updated_at=? WHERE id=1", (payload.caseCode, payload.title, payload.status, payload.mainMilestone, payload.previousModality, utc_now()))
-        db.execute("UPDATE cases SET case_code=?,title=?,status=?,updated_at=? WHERE id=? AND tenant_id=?", (payload.caseCode, payload.title, payload.status, utc_now(), DEFAULT_CASE_ID, DEFAULT_TENANT_ID))
+        scope = authorized_scope(request, db)
+        db.execute("UPDATE case_config SET case_code=?,title=?,status=?,main_milestone=?,previous_modality=?,updated_at=? WHERE tenant_id=? AND case_id=?", (payload.caseCode, payload.title, payload.status, payload.mainMilestone, payload.previousModality, utc_now(), scope["tenant_id"], scope["case_id"]))
+        db.execute("UPDATE cases SET case_code=?,title=?,status=?,updated_at=? WHERE id=? AND tenant_id=?", (payload.caseCode, payload.title, payload.status, utc_now(), scope["case_id"], scope["tenant_id"]))
         audit(db, "CASE_CONFIG_UPDATED", "case", payload.caseCode, {"title": payload.title, "status": payload.status})
-        return case_config_dict(db.execute("SELECT * FROM case_config WHERE id = 1").fetchone())
+        return case_config_dict(db.execute("SELECT * FROM case_config WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone())
 
 
 def ai_provider():
@@ -466,12 +486,14 @@ def ai_status_payload() -> dict:
 
 
 @app.get("/api/ai/status")
-def get_ai_status() -> dict:
+def get_ai_status(request: Request) -> dict:
+    with database() as db:
+        authorized_scope(request, db)
     return ai_status_payload()
 
 
 @app.put("/api/ai/settings")
-def update_ai_settings(payload: AISettingsUpdate) -> dict:
+def update_ai_settings(payload: AISettingsUpdate, request: Request) -> dict:
     profile = payload.activeProfile.strip().lower()
     if profile not in PROFILE_NAMES:
         raise HTTPException(422, "El perfil de IA seleccionado no existe")
@@ -480,65 +502,71 @@ def update_ai_settings(payload: AISettingsUpdate) -> dict:
     if not selected["installed"]:
         raise HTTPException(409, "El modelo seleccionado todavía no está instalado en Ollama")
     with database() as db:
+        authorized_scope(request, db)
         db.execute("UPDATE ai_settings SET active_profile=?,updated_at=? WHERE id=1", (profile, utc_now()))
         audit(db, "AI_PROFILE_CHANGED", "ai_settings", "local", {"profile": profile, "model": selected["model"]})
     return ai_status_payload()
 
 
 @app.get("/api/events")
-def list_events() -> list[dict]:
+def list_events(request: Request) -> list[dict]:
     with database() as db:
+        scope = authorized_scope(request, db)
         rows = db.execute(
-            "SELECT e.*, COUNT(v.id) evidence_count FROM events e LEFT JOIN evidence v ON v.event_id = e.id GROUP BY e.id ORDER BY e.date DESC, e.time DESC"
+            "SELECT e.*, COUNT(v.id) evidence_count FROM events e LEFT JOIN evidence v ON v.event_id=e.id AND v.tenant_id=e.tenant_id AND v.case_id=e.case_id WHERE e.tenant_id=? AND e.case_id=? GROUP BY e.id ORDER BY e.date DESC,e.time DESC",
+            (scope["tenant_id"], scope["case_id"]),
         ).fetchall()
         return [event_dict(row, row["evidence_count"]) for row in rows]
 
 
 @app.post("/api/events", status_code=201)
-def create_event(payload: EventCreate) -> dict:
+def create_event(payload: EventCreate, request: Request) -> dict:
     now = utc_now()
     event_id = f"EVT-{payload.date.replace('-', '')}-{uuid.uuid4().hex[:6].upper()}"
     with database() as db:
+        scope = authorized_scope(request, db)
         db.execute(
-            "INSERT INTO events (id,date,time,category,title,description,private_notes,expected,actual,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (event_id, payload.date, payload.time, payload.category, payload.title, payload.description, payload.privateNotes, payload.expected, payload.actual, payload.status, now, now),
+            "INSERT INTO events (id,date,time,category,title,description,private_notes,expected,actual,status,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, payload.date, payload.time, payload.category, payload.title, payload.description, payload.privateNotes, payload.expected, payload.actual, payload.status, now, now, scope["tenant_id"], scope["case_id"], scope["user_id"]),
         )
         audit(db, "EVENT_CREATED", "event", event_id, {"title": payload.title, "date": payload.date})
-    with database() as db:
-        return event_dict(db.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone())
+        return event_dict(db.execute("SELECT * FROM events WHERE id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone())
 
 
 @app.get("/api/events/{event_id}")
-def get_event(event_id: str) -> dict:
+def get_event(event_id: str, request: Request) -> dict:
     with database() as db:
-        row = db.execute("SELECT e.*, COUNT(v.id) evidence_count FROM events e LEFT JOIN evidence v ON v.event_id=e.id WHERE e.id=? GROUP BY e.id", (event_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT e.*,COUNT(v.id) evidence_count FROM events e LEFT JOIN evidence v ON v.event_id=e.id AND v.tenant_id=e.tenant_id AND v.case_id=e.case_id WHERE e.id=? AND e.tenant_id=? AND e.case_id=? GROUP BY e.id", (event_id, scope["tenant_id"], scope["case_id"])).fetchone()
         if not row:
             raise HTTPException(404, "Acontecimiento no encontrado")
-        versions = db.execute("SELECT version_number,changed_at,changed_by,snapshot_json FROM event_versions WHERE event_id=? ORDER BY version_number DESC", (event_id,)).fetchall()
+        versions = db.execute("SELECT version_number,changed_at,changed_by,snapshot_json FROM event_versions WHERE event_id=? AND tenant_id=? AND case_id=? ORDER BY version_number DESC", (event_id, scope["tenant_id"], scope["case_id"])).fetchall()
         result = event_dict(row, row["evidence_count"])
         result["versions"] = [{"versionNumber": item["version_number"], "changedAt": item["changed_at"], "changedBy": item["changed_by"], "snapshot": json.loads(item["snapshot_json"])} for item in versions]
         return result
 
 
 @app.put("/api/events/{event_id}")
-def update_event(event_id: str, payload: EventCreate) -> dict:
+def update_event(event_id: str, payload: EventCreate, request: Request) -> dict:
     with database() as db:
-        current = db.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        current = db.execute("SELECT * FROM events WHERE id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone()
         if not current:
             raise HTTPException(404, "Acontecimiento no encontrado")
-        version = db.execute("SELECT COALESCE(MAX(version_number),0)+1 next_version FROM event_versions WHERE event_id=?", (event_id,)).fetchone()["next_version"]
+        version = db.execute("SELECT COALESCE(MAX(version_number),0)+1 next_version FROM event_versions WHERE event_id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone()["next_version"]
         snapshot = event_dict(current)
-        db.execute("INSERT INTO event_versions (event_id,version_number,snapshot_json,changed_at) VALUES (?,?,?,?)", (event_id, version, json.dumps(snapshot, ensure_ascii=False), utc_now()))
-        db.execute("UPDATE events SET date=?,time=?,category=?,title=?,description=?,private_notes=?,expected=?,actual=?,status=?,updated_at=? WHERE id=?", (payload.date, payload.time, payload.category, payload.title, payload.description, payload.privateNotes, payload.expected, payload.actual, payload.status, utc_now(), event_id))
+        db.execute("INSERT INTO event_versions (event_id,version_number,snapshot_json,changed_at,tenant_id,case_id) VALUES (?,?,?,?,?,?)", (event_id, version, json.dumps(snapshot, ensure_ascii=False), utc_now(), scope["tenant_id"], scope["case_id"]))
+        db.execute("UPDATE events SET date=?,time=?,category=?,title=?,description=?,private_notes=?,expected=?,actual=?,status=?,updated_at=? WHERE id=? AND tenant_id=? AND case_id=?", (payload.date, payload.time, payload.category, payload.title, payload.description, payload.privateNotes, payload.expected, payload.actual, payload.status, utc_now(), event_id, scope["tenant_id"], scope["case_id"]))
         audit(db, "EVENT_UPDATED", "event", event_id, {"version_preserved": version, "title": payload.title})
-        evidence_count = db.execute("SELECT COUNT(*) total FROM evidence WHERE event_id=?", (event_id,)).fetchone()["total"]
-        return event_dict(db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone(), evidence_count)
+        evidence_count = db.execute("SELECT COUNT(*) total FROM evidence WHERE event_id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone()["total"]
+        return event_dict(db.execute("SELECT * FROM events WHERE id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone(), evidence_count)
 
 
 @app.get("/api/evidence")
-def list_evidence() -> list[dict]:
+def list_evidence(request: Request) -> list[dict]:
     with database() as db:
-        return [evidence_dict(row) for row in db.execute("SELECT * FROM evidence ORDER BY added_at DESC").fetchall()]
+        scope = authorized_scope(request, db)
+        return [evidence_dict(row) for row in db.execute("SELECT * FROM evidence WHERE tenant_id=? AND case_id=? ORDER BY added_at DESC", (scope["tenant_id"], scope["case_id"])).fetchall()]
 
 
 @app.post("/api/evidence", status_code=201)
@@ -556,7 +584,8 @@ async def upload_evidence(
         raise HTTPException(400, "El archivo debe conservar su nombre original")
     if chat_message_ref:
         with database() as db:
-            existing = db.execute("SELECT * FROM evidence WHERE chat_message_ref = ?", (chat_message_ref,)).fetchone()
+            scope = authorized_scope(request, db)
+            existing = db.execute("SELECT * FROM evidence WHERE chat_message_ref=? AND tenant_id=? AND case_id=?", (chat_message_ref, scope["tenant_id"], scope["case_id"])).fetchone()
             if existing:
                 return evidence_dict(existing)
     evidence_id = f"EVD-{uuid.uuid4().hex[:12].upper()}"
@@ -577,22 +606,24 @@ async def upload_evidence(
     media_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
     added_at = utc_now()
     with database() as db:
-        if event_id and not db.execute("SELECT 1 FROM events WHERE id = ?", (event_id,)).fetchone():
+        scope = authorized_scope(request, db)
+        if event_id and not db.execute("SELECT 1 FROM events WHERE id=? AND tenant_id=? AND case_id=?", (event_id, scope["tenant_id"], scope["case_id"])).fetchone():
             destination.unlink(missing_ok=True)
             raise HTTPException(404, "El acontecimiento relacionado no existe")
         db.execute(
-            "INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (evidence_id, file.filename, stored_name, media_type, size, sha256, device_origin, event_id, added_at, fact_date, chat_message_ref, match_confidence, match_details),
+            "INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (evidence_id, file.filename, stored_name, media_type, size, sha256, device_origin, event_id, added_at, fact_date, chat_message_ref, match_confidence, match_details, scope["tenant_id"], scope["case_id"], scope["user_id"]),
         )
         audit(db, "EVIDENCE_INCORPORATED", "evidence", evidence_id, {"name": file.filename, "size": size, "sha256": sha256, "source_ip": request.client.host if request.client else "unknown"})
-        row = db.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
+        row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
         return evidence_dict(row)
 
 
 @app.get("/api/evidence/{evidence_id}/download")
-def download_evidence(evidence_id: str) -> FileResponse:
+def download_evidence(evidence_id: str, request: Request) -> FileResponse:
     with database() as db:
-        row = db.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
         if not row:
             raise HTTPException(404, "Evidencia no encontrada")
         path = FILES_DIR / row["stored_name"]
@@ -651,9 +682,10 @@ async def import_whatsapp_package(request: Request, file: Annotated[UploadFile, 
     created_paths: list[Path] = []; imported: list[dict] = []
     try:
         with database() as db:
+            scope = authorized_scope(request, db)
             for entry in staged:
                 message = entry["message"]; message_ref = f"CAPTURE-{chat_key}:{message.get('position')}"
-                existing = db.execute("SELECT * FROM evidence WHERE chat_message_ref = ?", (message_ref,)).fetchone()
+                existing = db.execute("SELECT * FROM evidence WHERE chat_message_ref=? AND tenant_id=? AND case_id=?", (message_ref, scope["tenant_id"], scope["case_id"])).fetchone()
                 if existing:
                     imported.append({"messageId": message.get("id"), "evidence": evidence_dict(existing)}); continue
                 evidence_id = f"EVD-{uuid.uuid4().hex[:12].upper()}"; stored_name = f"{evidence_id}.original"; destination = FILES_DIR / stored_name
@@ -661,9 +693,9 @@ async def import_whatsapp_package(request: Request, file: Annotated[UploadFile, 
                 media_item = entry["item"]; original_name = Path(str(media_item.get("originalFilename") or media_item["exportedFilename"])).name
                 media_type = str(media_item.get("mimeType") or mimetypes.guess_type(original_name)[0] or "application/octet-stream"); added_at = utc_now()
                 details = f"Capturado secuencialmente desde una burbuja específica por la extensión GORE {source.get('extensionVersion', '')}; manifiesto y SHA-256 verificados por el servidor."
-                db.execute("INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (evidence_id, original_name, stored_name, media_type, len(entry["content"]), media_item["sha256"], "Extensión GORE para Chrome", None, added_at, entry["fact_date"], message_ref, "captured", details))
+                db.execute("INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,device_origin,event_id,added_at,fact_date,chat_message_ref,match_confidence,match_details,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (evidence_id, original_name, stored_name, media_type, len(entry["content"]), media_item["sha256"], "Extensión GORE para Chrome", None, added_at, entry["fact_date"], message_ref, "captured", details, scope["tenant_id"], scope["case_id"], scope["user_id"]))
                 audit(db, "WHATSAPP_AUDIO_CAPTURED", "evidence", evidence_id, {"message_ref": message_ref, "sha256": media_item["sha256"], "source_ip": request.client.host if request.client else "unknown"})
-                row = db.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone(); imported.append({"messageId": message.get("id"), "evidence": evidence_dict(row)})
+                row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone(); imported.append({"messageId": message.get("id"), "evidence": evidence_dict(row)})
             audit(db, "WHATSAPP_PACKAGE_IMPORTED", "whatsapp_chat", chat_key, {"package": Path(file.filename).name, "audio_count": len(imported), "schema_version": 1})
     except Exception:
         for path in created_paths: path.unlink(missing_ok=True)
@@ -672,68 +704,78 @@ async def import_whatsapp_package(request: Request, file: Annotated[UploadFile, 
 
 
 @app.get("/api/whatsapp/chats")
-def list_whatsapp_chats() -> list[dict]:
+def list_whatsapp_chats(request: Request) -> list[dict]:
     with database() as db:
-        return [whatsapp_chat_dict(row, False) for row in db.execute("SELECT * FROM whatsapp_chats ORDER BY updated_at DESC").fetchall()]
+        scope = authorized_scope(request, db)
+        return [whatsapp_chat_dict(row, False) for row in db.execute("SELECT * FROM whatsapp_chats WHERE tenant_id=? AND case_id=? ORDER BY updated_at DESC", (scope["tenant_id"], scope["case_id"])).fetchall()]
 
 
 @app.get("/api/whatsapp/chats/{chat_id}")
-def get_whatsapp_chat(chat_id: str) -> dict:
+def get_whatsapp_chat(chat_id: str, request: Request) -> dict:
     with database() as db:
-        row = db.execute("SELECT * FROM whatsapp_chats WHERE id = ?", (chat_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT * FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone()
         if not row: raise HTTPException(404, "Conversación no encontrada")
         return whatsapp_chat_dict(row)
 
 
 @app.put("/api/whatsapp/chats/{chat_id}")
-def save_whatsapp_chat(chat_id: str, payload: WhatsAppChatPayload) -> dict:
+def save_whatsapp_chat(chat_id: str, payload: WhatsAppChatPayload, request: Request) -> dict:
     if chat_id != payload.id: raise HTTPException(400, "El identificador de la conversación no coincide")
     now = utc_now()
     with database() as db:
-        existing = db.execute("SELECT created_at FROM whatsapp_chats WHERE id = ?", (chat_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        any_existing = db.execute("SELECT tenant_id,case_id FROM whatsapp_chats WHERE id=?", (chat_id,)).fetchone()
+        if any_existing and (any_existing["tenant_id"] != scope["tenant_id"] or any_existing["case_id"] != scope["case_id"]):
+            raise HTTPException(409, "El identificador pertenece a otro expediente")
+        existing = db.execute("SELECT created_at FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone()
         created_at = existing["created_at"] if existing else now
-        db.execute("INSERT INTO whatsapp_chats (id,display_name,self_name,source_type,raw_text,messages_json,audio_matches_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,self_name=excluded.self_name,source_type=excluded.source_type,raw_text=excluded.raw_text,messages_json=excluded.messages_json,audio_matches_json=excluded.audio_matches_json,updated_at=excluded.updated_at", (chat_id, payload.displayName, payload.selfName, payload.sourceType, payload.rawText, json.dumps(payload.messages, ensure_ascii=False), json.dumps(payload.audioMatches, ensure_ascii=False), created_at, now))
+        db.execute("INSERT INTO whatsapp_chats (id,display_name,self_name,source_type,raw_text,messages_json,audio_matches_json,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,self_name=excluded.self_name,source_type=excluded.source_type,raw_text=excluded.raw_text,messages_json=excluded.messages_json,audio_matches_json=excluded.audio_matches_json,updated_at=excluded.updated_at", (chat_id, payload.displayName, payload.selfName, payload.sourceType, payload.rawText, json.dumps(payload.messages, ensure_ascii=False), json.dumps(payload.audioMatches, ensure_ascii=False), created_at, now, scope["tenant_id"], scope["case_id"], scope["user_id"]))
         audit(db, "WHATSAPP_CHAT_SAVED", "whatsapp_chat", chat_id, {"display_name": payload.displayName, "messages": len(payload.messages), "audios": len(payload.audioMatches)})
-        return whatsapp_chat_dict(db.execute("SELECT * FROM whatsapp_chats WHERE id = ?", (chat_id,)).fetchone())
+        return whatsapp_chat_dict(db.execute("SELECT * FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone())
 
 
 @app.delete("/api/whatsapp/chats/{chat_id}")
-def delete_whatsapp_chat(chat_id: str) -> dict:
+def delete_whatsapp_chat(chat_id: str, request: Request) -> dict:
     with database() as db:
-        if not db.execute("SELECT 1 FROM whatsapp_chats WHERE id = ?", (chat_id,)).fetchone(): raise HTTPException(404, "Conversación no encontrada")
-        db.execute("DELETE FROM whatsapp_chats WHERE id = ?", (chat_id,)); audit(db, "WHATSAPP_CHAT_REMOVED", "whatsapp_chat", chat_id)
+        scope = authorized_scope(request, db)
+        if not db.execute("SELECT 1 FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone(): raise HTTPException(404, "Conversación no encontrada")
+        db.execute("DELETE FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])); audit(db, "WHATSAPP_CHAT_REMOVED", "whatsapp_chat", chat_id)
     return {"deleted": True}
 
 
 @app.get("/api/evidence/{evidence_id}/transcription")
-def get_transcription(evidence_id: str) -> dict:
+def get_transcription(evidence_id: str, request: Request) -> dict:
     with database() as db:
-        if not db.execute("SELECT 1 FROM evidence WHERE id = ?", (evidence_id,)).fetchone(): raise HTTPException(404, "Evidencia no encontrada")
-        row = db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        if not db.execute("SELECT 1 FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone(): raise HTTPException(404, "Evidencia no encontrada")
+        row = db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
         return dict(row) if row else {"evidence_id": evidence_id, "text": "", "status": "none", "language": "", "engine": "", "updated_at": ""}
 
 
 @app.put("/api/evidence/{evidence_id}/transcription")
-def update_transcription(evidence_id: str, payload: TranscriptionUpdate) -> dict:
+def update_transcription(evidence_id: str, payload: TranscriptionUpdate, request: Request) -> dict:
     with database() as db:
-        if not db.execute("SELECT 1 FROM evidence WHERE id = ?", (evidence_id,)).fetchone(): raise HTTPException(404, "Evidencia no encontrada")
+        scope = authorized_scope(request, db)
+        if not db.execute("SELECT 1 FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone(): raise HTTPException(404, "Evidencia no encontrada")
         now = utc_now(); status = "completed" if payload.text.strip() else "none"
-        db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET text=excluded.text,status=excluded.status,engine=excluded.engine,updated_at=excluded.updated_at", (evidence_id, payload.text.strip(), status, "", "manual", now))
+        db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at,tenant_id,case_id) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET text=excluded.text,status=excluded.status,engine=excluded.engine,updated_at=excluded.updated_at", (evidence_id, payload.text.strip(), status, "", "manual", now, scope["tenant_id"], scope["case_id"]))
         audit(db, "AUDIO_TRANSCRIPTION_UPDATED", "evidence", evidence_id, {"characters": len(payload.text.strip()), "engine": "manual"})
-        return dict(db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id = ?", (evidence_id,)).fetchone())
+        return dict(db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone())
 
 
 @app.post("/api/evidence/{evidence_id}/transcribe")
-def transcribe_evidence(evidence_id: str) -> dict:
+def transcribe_evidence(evidence_id: str, request: Request) -> dict:
     global WHISPER_MODEL
     with database() as db:
-        evidence_row = db.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
+        scope = authorized_scope(request, db)
+        evidence_row = db.execute("SELECT * FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone()
         if not evidence_row: raise HTTPException(404, "Evidencia no encontrada")
         if not str(evidence_row["media_type"]).startswith("audio/") and Path(evidence_row["original_name"]).suffix.lower() not in {".opus", ".ogg", ".oga", ".mp3", ".m4a", ".aac", ".wav", ".webm", ".amr"}:
             raise HTTPException(400, "La evidencia seleccionada no es un audio compatible")
         path = FILES_DIR / evidence_row["stored_name"]
         if not path.is_file(): raise HTTPException(409, "El audio original no está disponible")
-        now = utc_now(); db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at", (evidence_id, "", "processing", "es", f"faster-whisper-{WHISPER_MODEL_NAME}", now))
+        now = utc_now(); db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at,tenant_id,case_id) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evidence_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at", (evidence_id, "", "processing", "es", f"faster-whisper-{WHISPER_MODEL_NAME}", now, scope["tenant_id"], scope["case_id"]))
     try:
         with WHISPER_LOCK:
             if WHISPER_MODEL is None:
@@ -749,12 +791,12 @@ def transcribe_evidence(evidence_id: str) -> dict:
         with database() as db:
             now = utc_now(); status = "completed" if text else "empty"
             engine = f"faster-whisper-{WHISPER_MODEL_NAME}"
-            db.execute("UPDATE audio_transcriptions SET text=?,status=?,language=?,engine=?,updated_at=? WHERE evidence_id=?", (text, status, getattr(info, "language", "es") or "es", engine, now, evidence_id))
+            db.execute("UPDATE audio_transcriptions SET text=?,status=?,language=?,engine=?,updated_at=? WHERE evidence_id=? AND tenant_id=? AND case_id=?", (text, status, getattr(info, "language", "es") or "es", engine, now, evidence_id, scope["tenant_id"], scope["case_id"]))
             audit(db, "AUDIO_TRANSCRIBED", "evidence", evidence_id, {"characters": len(text), "engine": engine, "language": getattr(info, "language", "es")})
-            return dict(db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id = ?", (evidence_id,)).fetchone())
+            return dict(db.execute("SELECT * FROM audio_transcriptions WHERE evidence_id=? AND tenant_id=? AND case_id=?", (evidence_id, scope["tenant_id"], scope["case_id"])).fetchone())
     except Exception as error:
         with database() as db:
-            db.execute("UPDATE audio_transcriptions SET status=?,updated_at=? WHERE evidence_id=?", ("failed", utc_now(), evidence_id)); audit(db, "AUDIO_TRANSCRIPTION_FAILED", "evidence", evidence_id, {"error": type(error).__name__})
+            db.execute("UPDATE audio_transcriptions SET status=?,updated_at=? WHERE evidence_id=? AND tenant_id=? AND case_id=?", ("failed", utc_now(), evidence_id, scope["tenant_id"], scope["case_id"])); audit(db, "AUDIO_TRANSCRIPTION_FAILED", "evidence", evidence_id, {"error": type(error).__name__})
         raise HTTPException(503, "No pudimos transcribir este audio localmente") from error
 
 
@@ -804,12 +846,13 @@ def evidence_folder(media_type: str, original_name: str) -> str:
 
 
 @app.get("/api/exports/report.pdf")
-def export_report_pdf() -> StreamingResponse:
+def export_report_pdf(request: Request) -> StreamingResponse:
     generated_at = utc_now()
     with database() as db:
-        case = db.execute("SELECT * FROM case_config WHERE id=1").fetchone()
-        events = db.execute("SELECT * FROM events ORDER BY date,time,id").fetchall()
-        evidence = db.execute("SELECT * FROM evidence ORDER BY added_at,id").fetchall()
+        scope = authorized_scope(request, db)
+        case = db.execute("SELECT * FROM case_config WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone()
+        events = db.execute("SELECT * FROM events WHERE tenant_id=? AND case_id=? ORDER BY date,time,id", (scope["tenant_id"], scope["case_id"])).fetchall()
+        evidence = db.execute("SELECT * FROM evidence WHERE tenant_id=? AND case_id=? ORDER BY added_at,id", (scope["tenant_id"], scope["case_id"])).fetchall()
         content = build_report_pdf(case, events, evidence, generated_at)
         audit(db, "REPORT_PDF_EXPORTED", "export", case["case_code"], {"events": len(events), "evidence": len(evidence)})
     filename = f"INFORME_{case['case_code']}_{datetime.now().strftime('%Y%m%d')}.pdf"
@@ -817,13 +860,14 @@ def export_report_pdf() -> StreamingResponse:
 
 
 @app.get("/api/exports/package.zip")
-def export_originals_package() -> StreamingResponse:
+def export_originals_package(request: Request) -> StreamingResponse:
     generated_at = utc_now()
     output = io.BytesIO()
     with database() as db:
-        case = db.execute("SELECT * FROM case_config WHERE id=1").fetchone()
-        events = db.execute("SELECT * FROM events ORDER BY date,time,id").fetchall()
-        evidence = db.execute("SELECT * FROM evidence ORDER BY added_at,id").fetchall()
+        scope = authorized_scope(request, db)
+        case = db.execute("SELECT * FROM case_config WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone()
+        events = db.execute("SELECT * FROM events WHERE tenant_id=? AND case_id=? ORDER BY date,time,id", (scope["tenant_id"], scope["case_id"])).fetchall()
+        evidence = db.execute("SELECT * FROM evidence WHERE tenant_id=? AND case_id=? ORDER BY added_at,id", (scope["tenant_id"], scope["case_id"])).fetchall()
         report = build_report_pdf(case, events, evidence, generated_at)
         inventory = io.StringIO(newline="")
         writer = csv.writer(inventory)
@@ -855,9 +899,10 @@ def export_originals_package() -> StreamingResponse:
 
 
 @app.get("/api/audit")
-def list_audit(limit: int = 100) -> list[dict]:
+def list_audit(request: Request, limit: int = 100) -> list[dict]:
     with database() as db:
-        rows = db.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (min(max(limit, 1), 500),)).fetchall()
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM audit_log WHERE tenant_id=? AND case_id=? ORDER BY id DESC LIMIT ?", (scope["tenant_id"], scope["case_id"], min(max(limit, 1), 500))).fetchall()
         return [{**dict(row), "details": json.loads(row["details_json"])} for row in rows]
 
 
