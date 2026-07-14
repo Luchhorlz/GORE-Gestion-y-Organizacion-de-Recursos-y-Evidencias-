@@ -20,6 +20,8 @@ cloudflared-gore.yml
 *.db
 *.sqlite
 *.sqlite3
+__pycache__/
+*.py[cod]
 CONTRASENA_INICIAL.txt
 .env
 .env.*
