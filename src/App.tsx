@@ -486,6 +486,7 @@ type AIOperationsStatus = {
   generatedAt: string;
 };
 type SecurityStatus = {
+  version: string;
   databaseIntegrity: "ok" | "review_required";
   automaticBackups: number;
   latestBackup: { name: string; size: number; updatedAt: string } | null;
@@ -6491,6 +6492,7 @@ function SettingsView({
             </div>
             <FolderLock />
           </div>
+          <small className="security-backup-detail">GORE v{security?.version ?? "1.0.0"} · versión estable de producción</small>
           <div className="security-storage-grid">
             <div>
               <span>Base de datos</span>

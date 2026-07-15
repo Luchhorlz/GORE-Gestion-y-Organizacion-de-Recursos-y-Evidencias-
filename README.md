@@ -4,7 +4,7 @@
 
 GORE es un expediente digital privado orientado a preservar hechos, organizar documentación y construir una cronología clara y verificable para su revisión personal y profesional.
 
-## Primera versión
+## Versión estable 1.0.0
 
 - Panel general del expediente.
 - Calendario histórico sin fecha mínima.
@@ -14,7 +14,7 @@ GORE es un expediente digital privado orientado a preservar hechos, organizar do
 - Bóveda de evidencias con cálculo real de SHA-256 en el navegador.
 - Buscador de acontecimientos.
 - Modo presentación.
-- Persistencia local en el navegador.
+- Persistencia privada en SQLite, independiente de actualizaciones y reinicios.
 - Diseño adaptable a computadora, tablet y teléfono.
 
 ## Abrir GORE
@@ -65,7 +65,7 @@ Con el backend conectado:
 - La creación, incorporación y descarga generan entradas en una auditoría criptográficamente encadenada.
 - Si el servidor no está disponible, la interfaz avisa que está en modo local y permite continuar provisionalmente.
 
-La versión empaquetada incorpora autenticación por contraseña y sesión privada. Tanto `backend/data/` como `dist-server/gore-data/` están excluidos de Git.
+La versión empaquetada incorpora autenticación por contraseña, sesión privada, clave GroqCloud protegida por Windows y copias diarias verificadas. Tanto `backend/data/` como `dist-server/gore-data/` están excluidos de Git.
 
 ### Administración disponible
 
@@ -101,6 +101,10 @@ La versión empaquetada incorpora autenticación por contraseña y sesión priva
 - Selector de conversaciones con recuperación completa después de actualizar o reiniciar el servidor.
 - Transcripción opcional y local de audios mediante Faster Whisper, accesible con **Ver textual**.
 - Texto auxiliar persistente y separado del audio original, que conserva intacto su SHA-256.
+- Herramientas de IA mediante GroqCloud, sin cargar modelos generativos en la computadora.
+- Chat del expediente con acceso trazable a acontecimientos, evidencias, comunicaciones, WhatsApp, informes y auditoría.
+- Informes temáticos persistentes y descargables en PDF con fuentes, limitaciones y revisión humana obligatoria.
+- Copias automáticas diarias de la base, retención de 14 versiones y creación manual desde Configuración.
 
 ### Instalar la extensión de Chrome
 
@@ -108,6 +112,6 @@ Desde **Simulador WhatsApp**, pulsar **Descargar extensión**, descomprimir `GOR
 
 La extensión solamente se ejecuta en `https://web.whatsapp.com/`. No solicita acceso al historial general, cookies, credenciales ni otras páginas. En el chat abierto, pulsar **Analizar chat** y luego **Crear paquete GORE**. El ZIP resultante se incorpora con **Importar paquete GORE**.
 
-Todavía quedan pendientes el segundo factor, cifrado de copias de seguridad, PostgreSQL y exportaciones PDF/ZIP.
+Como ampliaciones futuras opcionales quedan el segundo factor, cifrado adicional de copias fuera del equipo y soporte multiusuario con un servidor de base de datos. No son requisitos para la instalación privada actual.
 
 > GORE organiza y preserva información. No determina responsabilidades ni reemplaza el asesoramiento jurídico profesional.

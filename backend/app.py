@@ -53,6 +53,7 @@ WHISPER_MODEL = None
 WHISPER_MODEL_NAME = "small"
 WHISPER_LOCK = threading.Lock()
 AI_CONFIG = load_ai_config()
+APP_VERSION = "1.0.0"
 MAX_EVIDENCE_BYTES = max(1, min(int(os.environ.get("GORE_MAX_EVIDENCE_MB", "500")), 2048)) * 1024 * 1024
 SEMANTIC_MIN_SCORE = max(0.0, min(float(os.environ.get("GORE_SEMANTIC_MIN_SCORE", "0.30")), 1.0))
 ALLOWED_EVIDENCE_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".opus", ".ogg", ".oga", ".mp3", ".m4a", ".aac", ".wav", ".amr", ".webm", ".mp4", ".mov", ".avi"}
@@ -92,7 +93,7 @@ async def application_lifespan(_app: FastAPI):
 app = FastAPI(
     title="GORE API",
     description="API privada para Gestión y Organización de Recursos y Evidencias",
-    version="0.2.0",
+    version=APP_VERSION,
     lifespan=application_lifespan,
     docs_url=None,
     redoc_url=None,
@@ -1152,7 +1153,7 @@ def start_whatsapp_analysis_worker() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "service": "GORE API"}
+    return {"status": "ok", "service": "GORE API", "version": APP_VERSION}
 
 
 @app.get("/api/security/status")
@@ -1170,6 +1171,7 @@ def security_status(request: Request) -> dict:
         "latestBackup": {"name": latest.name, "size": latest.stat().st_size, "updatedAt": datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc).isoformat()} if latest else None,
         "evidence": {"total": int(evidence["total"] or 0), "verified": int(evidence["verified"] or 0)},
         "groqKeyProtected": bool(encrypted_key and int(encrypted_key["size"] or 0) > 0),
+        "version": APP_VERSION,
         "generatedAt": utc_now(),
     }
 

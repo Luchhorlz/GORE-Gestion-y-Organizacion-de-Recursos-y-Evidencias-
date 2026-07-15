@@ -49,6 +49,7 @@ class IsolationTests(unittest.TestCase):
 
     def test_security_headers_secure_cookie_and_verified_backup(self):
         health = self.client.get("/api/health")
+        self.assertEqual(health.json()["version"], "1.0.0")
         self.assertEqual(health.headers["x-content-type-options"], "nosniff")
         self.assertEqual(health.headers["x-frame-options"], "DENY")
         self.assertIn("frame-ancestors 'none'", health.headers["content-security-policy"])
@@ -61,6 +62,7 @@ class IsolationTests(unittest.TestCase):
         status = self.client.get("/api/security/status")
         self.assertEqual(status.status_code, 200, status.text)
         self.assertEqual(status.json()["databaseIntegrity"], "ok")
+        self.assertEqual(status.json()["version"], "1.0.0")
         self.assertGreaterEqual(status.json()["automaticBackups"], 1)
         backup = self.client.post("/api/security/backup", json={})
         self.assertEqual(backup.status_code, 200, backup.text)
