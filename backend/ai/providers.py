@@ -126,9 +126,18 @@ class GroqAIProvider(AIProvider):
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
+            detail = ""
+            try:
+                error_body = json.loads(error.read().decode("utf-8"))
+                detail = str(error_body.get("error", {}).get("message", "")).strip()
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                pass
             if error.code == 401: raise AIProviderError("La clave de GroqCloud no es válida") from error
+            if error.code == 403:
+                explanation = detail or "la organización o el proyecto no permite utilizar la API"
+                raise AIProviderError(f"GroqCloud rechazó el permiso: {explanation}") from error
             if error.code == 429: raise AIProviderError("GroqCloud alcanzó temporalmente el límite gratuito") from error
-            raise AIProviderError(f"GroqCloud devolvió un error ({error.code})") from error
+            raise AIProviderError(detail or f"GroqCloud devolvió un error ({error.code})") from error
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             raise AIProviderError("GroqCloud no está disponible o no respondió a tiempo") from error
 
