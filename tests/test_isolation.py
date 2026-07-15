@@ -368,6 +368,30 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(conversation["messages"][-1]["status"], "completed")
         self.assertEqual(conversation["messages"][-1]["job"]["progress"], 100)
 
+    def test_ai_actions_link_evidence_and_preserve_event_version(self):
+        self.module.ai_request_times.clear()
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            scope = (self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, self.module.DEFAULT_USER_ID)
+            db.execute("INSERT INTO events (id,date,time,category,title,description,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("EVT-ACTION-TEST", "2026-07-15", "10:00", "Acontecimiento", "Contacto de prueba", "Registro objetivo", now, now, *scope))
+            db.execute("INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,added_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)", ("EVD-ACTION-TEST", "audio-prueba.opus", "action-test.original", "audio/ogg", 10, "a" * 64, now, *scope))
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-ACTION-TEST", scope[0], scope[1], "Organizar", scope[2], now, now))
+            db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-ACTION-TEST", "CNV-ACTION-TEST", scope[0], scope[1], "assistant", "Propuestas", 0, "[]", "completed", now, now))
+            db.execute("INSERT INTO ai_action_proposals (id,tenant_id,case_id,conversation_id,assistant_message_id,action_type,payload_json,source_ids_json,rationale,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ACT-LINK-TEST", scope[0], scope[1], "CNV-ACTION-TEST", "MSG-ACTION-TEST", "link_evidence_to_event", '{"eventId":"EVT-ACTION-TEST","eventTitle":"Contacto de prueba","evidenceId":"EVD-ACTION-TEST","evidenceName":"audio-prueba.opus","previousEventId":""}', '["S1"]', "Coincidencia revisable", "pending_review", scope[2], now, now))
+            db.execute("INSERT INTO ai_action_proposals (id,tenant_id,case_id,conversation_id,assistant_message_id,action_type,payload_json,source_ids_json,rationale,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ACT-CATEGORY-TEST", scope[0], scope[1], "CNV-ACTION-TEST", "MSG-ACTION-TEST", "update_event_category", '{"eventId":"EVT-ACTION-TEST","eventTitle":"Contacto de prueba","previousCategory":"Acontecimiento","newCategory":"Comunicación"}', '["S1"]', "Es una comunicación", "pending_review", scope[2], now, now))
+        linked = self.client.post("/api/ai/chat/actions/ACT-LINK-TEST/approve", json={})
+        self.assertEqual(linked.status_code, 200, linked.text)
+        categorized = self.client.post("/api/ai/chat/actions/ACT-CATEGORY-TEST/approve", json={})
+        self.assertEqual(categorized.status_code, 200, categorized.text)
+        with self.module.database() as db:
+            self.assertEqual(db.execute("SELECT event_id FROM evidence WHERE id='EVD-ACTION-TEST'").fetchone()[0], "EVT-ACTION-TEST")
+            self.assertEqual(db.execute("SELECT category FROM events WHERE id='EVT-ACTION-TEST'").fetchone()[0], "Comunicación")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM event_versions WHERE event_id='EVT-ACTION-TEST'").fetchone()[0], 1)
+            db.execute("DELETE FROM ai_conversations WHERE id='CNV-ACTION-TEST'")
+            db.execute("DELETE FROM evidence WHERE id='EVD-ACTION-TEST'")
+            db.execute("DELETE FROM event_versions WHERE event_id='EVT-ACTION-TEST'")
+            db.execute("DELETE FROM events WHERE id='EVT-ACTION-TEST'")
+
 
 if __name__ == "__main__":
     unittest.main()

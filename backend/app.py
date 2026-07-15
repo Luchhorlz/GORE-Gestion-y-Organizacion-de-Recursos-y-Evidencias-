@@ -572,7 +572,7 @@ REGLAS:
 - No inventes hechos, normas, delitos, diagnósticos ni intenciones. No des asesoramiento jurídico definitivo.
 - Citá S1/S2 cuando afirmes algo proveniente de una evidencia. Diferenciá transcripciones auxiliares del original.
 - Tenés acceso de lectura a configuración, acontecimientos, bóveda, WhatsApp, transcripciones y auditoría incluidos como fuentes.
-- Sólo proponé crear acontecimientos cuando el usuario lo pida expresamente. Nunca modifiques ni elimines evidencia original.
+- Sólo proponé acciones cuando el usuario pida expresamente organizar, registrar, asociar o reclasificar. Nunca modifiques ni elimines evidencia original.
 - No reveles razonamiento interno. Ofrecé una respuesta final y, cuando corresponda, listas concretas.
 
 EVIDENCIAS:
@@ -597,15 +597,16 @@ CONVERSACIÓN:
             "type": "object", "properties": {
                 "answer": {"type": "string"},
                 "proposed_actions": {"type": "array", "items": {"type": "object", "properties": {
-                    "action_type": {"type": "string", "enum": ["create_event"]},
+                    "action_type": {"type": "string", "enum": ["create_event", "link_evidence_to_event", "update_event_category"]},
                     "date": {"type": "string"}, "time": {"type": "string"}, "category": {"type": "string"},
                     "title": {"type": "string"}, "description": {"type": "string"},
                     "expected": {"type": "string"}, "actual": {"type": "string"},
+                    "event_id": {"type": "string"}, "evidence_id": {"type": "string"},
                     "rationale": {"type": "string"}, "source_ids": {"type": "array", "items": {"type": "string"}},
-                }, "required": ["action_type", "date", "time", "category", "title", "description", "expected", "actual", "rationale", "source_ids"]}},
+                }, "required": ["action_type", "date", "time", "category", "title", "description", "expected", "actual", "event_id", "evidence_id", "rationale", "source_ids"]}},
             }, "required": ["answer", "proposed_actions"],
         }
-        raw = ai_provider().generate_structured(prompt + "\nDevolvé JSON con answer y proposed_actions. Si no pidieron organizar o registrar, proposed_actions debe ser [].", job["model"], chat_schema)
+        raw = ai_provider().generate_structured(prompt + "\nDevolvé JSON con answer y proposed_actions. Si no pidieron organizar, registrar, asociar o reclasificar, proposed_actions debe ser []. Para asociaciones usá exclusivamente los IDs exactos visibles en las fuentes.", job["model"], chat_schema)
         answer = str(raw.get("answer", "")).strip()
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
         duration_ms = round((time.perf_counter() - generation_started) * 1000)
@@ -615,18 +616,33 @@ CONVERSACIÓN:
             db.execute("UPDATE ai_chat_messages SET content=?,sources_json=?,status='completed',updated_at=? WHERE id=?", (answer[:20_000], json.dumps(context_items.get("sources", []), ensure_ascii=False), now, job["assistant_message_id"]))
             valid_source_ids = {item["sourceId"] for item in context_items.get("sources", [])}
             for item in raw.get("proposed_actions", [])[:8] if isinstance(raw.get("proposed_actions"), list) else []:
-                if item.get("action_type") != "create_event": continue
-                date_value, title, description = str(item.get("date", "")).strip(), str(item.get("title", "")).strip()[:180], str(item.get("description", "")).strip()[:3000]
-                try: datetime.strptime(date_value, "%Y-%m-%d")
-                except ValueError: continue
-                if not title or not description: continue
-                time_value = str(item.get("time", "")).strip()
-                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_value): time_value = "12:00"
+                action_type = str(item.get("action_type", ""))
+                if action_type not in {"create_event", "link_evidence_to_event", "update_event_category"}: continue
                 source_ids = [value for value in dict.fromkeys(str(value) for value in item.get("source_ids", [])) if value in valid_source_ids]
                 if not source_ids: continue
+                if action_type == "create_event":
+                    date_value, title, description = str(item.get("date", "")).strip(), str(item.get("title", "")).strip()[:180], str(item.get("description", "")).strip()[:3000]
+                    try: datetime.strptime(date_value, "%Y-%m-%d")
+                    except ValueError: continue
+                    if not title or not description: continue
+                    time_value = str(item.get("time", "")).strip()
+                    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_value): time_value = "12:00"
+                    payload = {"date": date_value, "time": time_value, "category": str(item.get("category", "Acontecimiento")).strip()[:80] or "Acontecimiento", "title": title, "description": description, "expected": str(item.get("expected", "")).strip()[:1000], "actual": str(item.get("actual", "")).strip()[:1000]}
+                else:
+                    event_id, evidence_id = str(item.get("event_id", "")).strip(), str(item.get("evidence_id", "")).strip()
+                    event = db.execute("SELECT id,category,title FROM events WHERE id=? AND tenant_id=? AND case_id=?", (event_id, job["tenant_id"], job["case_id"])).fetchone()
+                    if not event: continue
+                    if action_type == "link_evidence_to_event":
+                        evidence = db.execute("SELECT id,original_name,event_id FROM evidence WHERE id=? AND tenant_id=? AND case_id=?", (evidence_id, job["tenant_id"], job["case_id"])).fetchone()
+                        if not evidence or evidence["event_id"] == event_id: continue
+                        payload = {"eventId": event_id, "eventTitle": event["title"], "evidenceId": evidence_id, "evidenceName": evidence["original_name"], "previousEventId": evidence["event_id"] or ""}
+                    else:
+                        category = str(item.get("category", "")).strip()[:80]
+                        allowed_categories = {"Comunicación", "Cambio propuesto", "Permanencia", "Entrega o retiro", "Videollamada", "Salud", "Escuela", "Actividad especial", "Actuación judicial"}
+                        if category not in allowed_categories or category == event["category"]: continue
+                        payload = {"eventId": event_id, "eventTitle": event["title"], "previousCategory": event["category"], "newCategory": category}
                 proposal_id = f"ACT-{uuid.uuid4().hex[:12].upper()}"
-                payload = {"date": date_value, "time": time_value, "category": str(item.get("category", "Acontecimiento")).strip()[:80] or "Acontecimiento", "title": title, "description": description, "expected": str(item.get("expected", "")).strip()[:1000], "actual": str(item.get("actual", "")).strip()[:1000]}
-                db.execute("INSERT INTO ai_action_proposals (id,tenant_id,case_id,conversation_id,assistant_message_id,action_type,payload_json,source_ids_json,rationale,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, job["tenant_id"], job["case_id"], job["conversation_id"], job["assistant_message_id"], "create_event", json.dumps(payload, ensure_ascii=False), json.dumps(source_ids), str(item.get("rationale", "")).strip()[:1000], "pending_review", DEFAULT_USER_ID, now, now))
+                db.execute("INSERT INTO ai_action_proposals (id,tenant_id,case_id,conversation_id,assistant_message_id,action_type,payload_json,source_ids_json,rationale,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, job["tenant_id"], job["case_id"], job["conversation_id"], job["assistant_message_id"], action_type, json.dumps(payload, ensure_ascii=False), json.dumps(source_ids), str(item.get("rationale", "")).strip()[:1000], "pending_review", DEFAULT_USER_ID, now, now))
             db.execute("UPDATE ai_chat_jobs SET status='completed',progress=100,stage='Respuesta guardada',completed_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
             db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, job["conversation_id"]))
             scope = {"tenant_id": job["tenant_id"], "case_id": job["case_id"], "user_id": DEFAULT_USER_ID}
@@ -877,7 +893,7 @@ def case_overview_sources(db: sqlite3.Connection, scope: dict, query: str) -> li
         add("case", "Datos del expediente", "Configuración del caso", f"Código: {case['case_code']}\nTítulo: {case['title']}\nEstado: {case['status']}\nHito principal: {case['main_milestone'] or 'sin registrar'}\nModalidad anterior: {case['previous_modality'] or 'sin registrar'}", source_id=scope["case_id"], score=0.65)
 
     event_rows = db.execute("SELECT * FROM events WHERE tenant_id=? AND case_id=? ORDER BY date DESC,time DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
-    event_lines = [f"{row['date']} {row['time']} · {row['category']} · {row['title']}: {row['description']} | Previsto: {row['expected'] or 'sin dato'} | Efectivo: {row['actual'] or 'sin dato'} | Estado: {row['status']}" for row in event_rows]
+    event_lines = [f"{row['id']} · {row['date']} {row['time']} · {row['category']} · {row['title']}: {row['description']} | Previsto: {row['expected'] or 'sin dato'} | Efectivo: {row['actual'] or 'sin dato'} | Estado: {row['status']}" for row in event_rows]
     if event_lines:
         add("events", "Acontecimientos", "Cronología registrada", "\n".join(event_lines), score=0.82)
 
@@ -1973,13 +1989,31 @@ def approve_ai_chat_action(proposal_id: str, request: Request) -> dict:
         proposal = db.execute("SELECT * FROM ai_action_proposals WHERE id=? AND tenant_id=? AND case_id=?", (proposal_id, scope["tenant_id"], scope["case_id"])).fetchone()
         if not proposal: raise HTTPException(404, "Propuesta no encontrada")
         if proposal["status"] != "pending_review": raise HTTPException(409, "La propuesta ya fue revisada")
-        if proposal["action_type"] != "create_event": raise HTTPException(422, "Acción no permitida")
         payload, now = json.loads(proposal["payload_json"]), utc_now()
-        event_id = f"EVT-{payload['date'].replace('-', '')}-{uuid.uuid4().hex[:6].upper()}"
-        db.execute("INSERT INTO events (id,date,time,category,title,description,private_notes,expected,actual,status,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (event_id, payload["date"], payload["time"], payload["category"], payload["title"], payload["description"], "Propuesto por IA y aprobado por el usuario.", payload["expected"], payload["actual"], "Borrador", now, now, scope["tenant_id"], scope["case_id"], scope["user_id"]))
-        db.execute("UPDATE ai_action_proposals SET status='approved',approved_entity_id=?,updated_at=? WHERE id=?", (event_id, now, proposal_id))
-        audit(db, "AI_CHAT_ACTION_APPROVED", "event", event_id, {"proposal_id": proposal_id, "source_ids": json.loads(proposal["source_ids_json"])}, scope)
-        return {"id": proposal_id, "status": "approved", "approvedEntityId": event_id}
+        action_type = proposal["action_type"]
+        if action_type == "create_event":
+            entity_id = f"EVT-{payload['date'].replace('-', '')}-{uuid.uuid4().hex[:6].upper()}"
+            db.execute("INSERT INTO events (id,date,time,category,title,description,private_notes,expected,actual,status,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (entity_id, payload["date"], payload["time"], payload["category"], payload["title"], payload["description"], "Propuesto por IA y aprobado por el usuario.", payload["expected"], payload["actual"], "Borrador", now, now, scope["tenant_id"], scope["case_id"], scope["user_id"]))
+            message = db.execute("SELECT sources_json FROM ai_chat_messages WHERE id=?", (proposal["assistant_message_id"],)).fetchone()
+            cited_ids = set(json.loads(proposal["source_ids_json"]))
+            cited_evidence = [item.get("evidenceId") for item in json.loads(message["sources_json"]) if item.get("sourceId") in cited_ids and item.get("evidenceId")]
+            for evidence_id in dict.fromkeys(cited_evidence):
+                db.execute("UPDATE evidence SET event_id=? WHERE id=? AND tenant_id=? AND case_id=? AND event_id IS NULL", (entity_id, evidence_id, scope["tenant_id"], scope["case_id"]))
+        elif action_type == "link_evidence_to_event":
+            entity_id = payload["evidenceId"]
+            if not db.execute("UPDATE evidence SET event_id=? WHERE id=? AND tenant_id=? AND case_id=?", (payload["eventId"], entity_id, scope["tenant_id"], scope["case_id"])).rowcount: raise HTTPException(404, "La evidencia ya no está disponible")
+        elif action_type == "update_event_category":
+            entity_id = payload["eventId"]
+            current = db.execute("SELECT * FROM events WHERE id=? AND tenant_id=? AND case_id=?", (entity_id, scope["tenant_id"], scope["case_id"])).fetchone()
+            if not current: raise HTTPException(404, "El acontecimiento ya no está disponible")
+            version = db.execute("SELECT COALESCE(MAX(version_number),0)+1 next_version FROM event_versions WHERE event_id=? AND tenant_id=? AND case_id=?", (entity_id, scope["tenant_id"], scope["case_id"])).fetchone()["next_version"]
+            db.execute("INSERT INTO event_versions (event_id,version_number,snapshot_json,changed_at,tenant_id,case_id) VALUES (?,?,?,?,?,?)", (entity_id, version, json.dumps(event_dict(current), ensure_ascii=False), now, scope["tenant_id"], scope["case_id"]))
+            db.execute("UPDATE events SET category=?,updated_at=? WHERE id=? AND tenant_id=? AND case_id=?", (payload["newCategory"], now, entity_id, scope["tenant_id"], scope["case_id"]))
+        else:
+            raise HTTPException(422, "Acción no permitida")
+        db.execute("UPDATE ai_action_proposals SET status='approved',approved_entity_id=?,updated_at=? WHERE id=?", (entity_id, now, proposal_id))
+        audit(db, "AI_CHAT_ACTION_APPROVED", action_type, entity_id, {"proposal_id": proposal_id, "source_ids": json.loads(proposal["source_ids_json"]), "payload": payload}, scope)
+        return {"id": proposal_id, "status": "approved", "approvedEntityId": entity_id}
 
 
 @app.post("/api/ai/chat/actions/{proposal_id}/reject")

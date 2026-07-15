@@ -298,15 +298,25 @@ type AIChatJob = {
 };
 type AIActionProposal = {
   id: string;
-  actionType: "create_event";
+  actionType:
+    | "create_event"
+    | "link_evidence_to_event"
+    | "update_event_category";
   payload: {
-    date: string;
-    time: string;
-    category: string;
-    title: string;
-    description: string;
-    expected: string;
-    actual: string;
+    date?: string;
+    time?: string;
+    category?: string;
+    title?: string;
+    description?: string;
+    expected?: string;
+    actual?: string;
+    eventId?: string;
+    eventTitle?: string;
+    evidenceId?: string;
+    evidenceName?: string;
+    previousEventId?: string;
+    previousCategory?: string;
+    newCategory?: string;
   };
   sourceIds: string[];
   rationale: string;
@@ -3248,6 +3258,30 @@ function AIActionCard({
   onReviewed: () => void;
 }) {
   const [working, setWorking] = useState(false);
+  const title =
+    action.actionType === "create_event"
+      ? action.payload.title
+      : action.actionType === "link_evidence_to_event"
+        ? `Asociar ${action.payload.evidenceName}`
+        : `Reclasificar ${action.payload.eventTitle}`;
+  const detail =
+    action.actionType === "create_event"
+      ? `${action.payload.date} · ${action.payload.time} · ${action.payload.category}`
+      : action.actionType === "link_evidence_to_event"
+        ? `Destino: ${action.payload.eventTitle}${action.payload.previousEventId ? " · actualmente asociada a otro acontecimiento" : " · actualmente sin asociar"}`
+        : `${action.payload.previousCategory} → ${action.payload.newCategory}`;
+  const description =
+    action.actionType === "create_event"
+      ? action.payload.description
+      : action.actionType === "link_evidence_to_event"
+        ? `La evidencia ${action.payload.evidenceId} quedará vinculada al acontecimiento ${action.payload.eventId}.`
+        : `Sólo cambiará la categoría del acontecimiento ${action.payload.eventId}; el resto de sus datos conservará una versión anterior.`;
+  const approvalLabel =
+    action.actionType === "create_event"
+      ? "Aprobar y crear acontecimiento"
+      : action.actionType === "link_evidence_to_event"
+        ? "Aprobar asociación"
+        : "Aprobar reclasificación";
   async function review(decision: "approve" | "reject") {
     setWorking(true);
     try {
@@ -3261,12 +3295,9 @@ function AIActionCard({
     <div className={`ai-action-card ${action.status}`}>
       <div>
         <span>ACCIÓN PROPUESTA · REQUIERE TU CONFIRMACIÓN</span>
-        <strong>{action.payload.title}</strong>
-        <small>
-          {action.payload.date} · {action.payload.time} ·{" "}
-          {action.payload.category}
-        </small>
-        <p>{action.payload.description}</p>
+        <strong>{title}</strong>
+        <small>{detail}</small>
+        <p>{description}</p>
         {action.rationale && <em>{action.rationale}</em>}
         <small>Fuentes: {action.sourceIds.join(", ")}</small>
       </div>
@@ -3280,7 +3311,7 @@ function AIActionCard({
             disabled={working}
             onClick={() => review("approve")}
           >
-            <Check /> Aprobar y crear acontecimiento
+            <Check /> {approvalLabel}
           </button>
         </div>
       ) : (
