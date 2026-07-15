@@ -301,7 +301,8 @@ type AIActionProposal = {
   actionType:
     | "create_event"
     | "link_evidence_to_event"
-    | "update_event_category";
+    | "update_event_category"
+    | "update_event_details";
   payload: {
     date?: string;
     time?: string;
@@ -317,6 +318,9 @@ type AIActionProposal = {
     previousEventId?: string;
     previousCategory?: string;
     newCategory?: string;
+    previous?: Record<string, string>;
+    new?: Record<string, string>;
+    changes?: Record<string, { before: string; after: string }>;
   };
   sourceIds: string[];
   rationale: string;
@@ -3276,25 +3280,33 @@ function AIActionCard({
       ? action.payload.title
       : action.actionType === "link_evidence_to_event"
         ? `Asociar ${action.payload.evidenceName}`
-        : `Reclasificar ${action.payload.eventTitle}`;
+        : action.actionType === "update_event_category"
+          ? `Reclasificar ${action.payload.eventTitle}`
+          : `Corregir ${action.payload.eventTitle}`;
   const detail =
     action.actionType === "create_event"
       ? `${action.payload.date} · ${action.payload.time} · ${action.payload.category}`
       : action.actionType === "link_evidence_to_event"
         ? `Destino: ${action.payload.eventTitle}${action.payload.previousEventId ? " · actualmente asociada a otro acontecimiento" : " · actualmente sin asociar"}`
-        : `${action.payload.previousCategory} → ${action.payload.newCategory}`;
+        : action.actionType === "update_event_category"
+          ? `${action.payload.previousCategory} → ${action.payload.newCategory}`
+          : `${Object.keys(action.payload.changes ?? {}).length} campos cambiarán`;
   const description =
     action.actionType === "create_event"
       ? action.payload.description
       : action.actionType === "link_evidence_to_event"
         ? `La evidencia ${action.payload.evidenceId} quedará vinculada al acontecimiento ${action.payload.eventId}.`
-        : `Sólo cambiará la categoría del acontecimiento ${action.payload.eventId}; el resto de sus datos conservará una versión anterior.`;
+        : action.actionType === "update_event_category"
+          ? `Sólo cambiará la categoría del acontecimiento ${action.payload.eventId}; el resto de sus datos conservará una versión anterior.`
+          : `Se actualizarán únicamente los campos indicados. La versión completa anterior quedará preservada.`;
   const approvalLabel =
     action.actionType === "create_event"
       ? "Aprobar y crear acontecimiento"
       : action.actionType === "link_evidence_to_event"
         ? "Aprobar asociación"
-        : "Aprobar reclasificación";
+        : action.actionType === "update_event_category"
+          ? "Aprobar reclasificación"
+          : "Aprobar correcciones";
   async function review(decision: "approve" | "reject") {
     setWorking(true);
     try {
@@ -3311,6 +3323,20 @@ function AIActionCard({
         <strong>{title}</strong>
         <small>{detail}</small>
         <p>{description}</p>
+        {action.actionType === "update_event_details" && (
+          <div className="ai-action-changes">
+            {Object.entries(action.payload.changes ?? {}).map(
+              ([field, change]) => (
+                <div key={field}>
+                  <b>{field}</b>
+                  <del>{change.before || "Sin dato"}</del>
+                  <span>→</span>
+                  <ins>{change.after || "Sin dato"}</ins>
+                </div>
+              ),
+            )}
+          </div>
+        )}
         {action.rationale && <em>{action.rationale}</em>}
         <small>Fuentes: {action.sourceIds.join(", ")}</small>
       </div>
