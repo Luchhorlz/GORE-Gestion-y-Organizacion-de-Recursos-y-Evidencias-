@@ -357,6 +357,30 @@ type SavedAIReport = {
   generatedAt: string;
   humanReviewRequired: boolean;
 };
+type AdvancedReportSituation = {
+  date: string;
+  category: string;
+  description: string;
+  sourceIds: string[];
+  limitations: string;
+};
+type AdvancedAIReport = {
+  id: string;
+  type: "advanced_report";
+  reportType: string;
+  title: string;
+  executiveSummary: string;
+  documentedSituations: AdvancedReportSituation[];
+  recurringThemes: string[];
+  missingInformation: string[];
+  questionsForReview: string[];
+  confidence: number;
+  disclaimer: string;
+  sources: AISourcePreview[];
+  model: string;
+  generatedAt: string;
+  humanReviewRequired: boolean;
+};
 type AIConversation = {
   id: string;
   title: string;
@@ -3369,7 +3393,8 @@ function SaveChatReportButton({ message }: { message: AIChatMessage }) {
   const [state, setState] = useState<"idle" | "saving" | "saved" | "error">(
     "idle",
   );
-  if (message.role !== "assistant" || message.status !== "completed") return null;
+  if (message.role !== "assistant" || message.status !== "completed")
+    return null;
   async function save() {
     setState("saving");
     try {
@@ -3775,8 +3800,8 @@ function AIChatView() {
                   ) : item.status === "failed" ? (
                     <div className="chat-failed">
                       <p>
-                        La IA no terminó la respuesta dentro del tiempo permitido
-                        permitido.
+                        La IA no terminó la respuesta dentro del tiempo
+                        permitido permitido.
                       </p>
                       <button
                         onClick={() => retryFailed(index)}
@@ -5223,6 +5248,12 @@ function ReportsView({
 }) {
   const [summary, setSummary] = useState<CaseSummary | null>(null);
   const [savedReports, setSavedReports] = useState<SavedAIReport[]>([]);
+  const [advancedReports, setAdvancedReports] = useState<AdvancedAIReport[]>(
+    [],
+  );
+  const [advancedType, setAdvancedType] = useState("communication_and_contact");
+  const [advancedLoading, setAdvancedLoading] = useState(false);
+  const [advancedError, setAdvancedError] = useState("");
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState("");
   useEffect(() => {
@@ -5232,10 +5263,33 @@ function ReportsView({
     apiGet<SavedAIReport[]>("/api/ai/reports")
       .then(setSavedReports)
       .catch(() => undefined);
+    apiGet<AdvancedAIReport[]>("/api/ai/reports/advanced")
+      .then(setAdvancedReports)
+      .catch(() => undefined);
   }, []);
   async function archiveReport(id: string) {
     await apiPost(`/api/ai/reports/${id}/archive`, {});
     setSavedReports((items) => items.filter((item) => item.id !== id));
+    setAdvancedReports((items) => items.filter((item) => item.id !== id));
+  }
+  async function generateAdvancedReport() {
+    setAdvancedLoading(true);
+    setAdvancedError("");
+    try {
+      const report = await apiPost<AdvancedAIReport>(
+        "/api/ai/reports/generate",
+        {
+          reportType: advancedType,
+        },
+      );
+      setAdvancedReports((items) => [report, ...items]);
+    } catch {
+      setAdvancedError(
+        "No se pudo preparar el informe. VerificÃ¡ la conexiÃ³n con GroqCloud y que el expediente tenga registros analizados.",
+      );
+    } finally {
+      setAdvancedLoading(false);
+    }
   }
   async function generateSummary() {
     setSummaryLoading(true);
@@ -5244,7 +5298,7 @@ function ReportsView({
       setSummary(await apiPost<CaseSummary>("/api/ai/analyses/summary", {}));
     } catch {
       setSummaryError(
-        "No se pudo generar el resumen. Verificá que haya evidencias indexadas y que Ollama esté activo.",
+        "No se pudo generar el resumen. Verificá que haya evidencias indexadas y que GroqCloud esté conectado.",
       );
     } finally {
       setSummaryLoading(false);
@@ -5358,12 +5412,141 @@ function ReportsView({
           </div>
         )}
       </article>
+      <article className="panel advanced-reports-panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow accent">
+              INFORMES TEMÁTICOS CON FUENTES
+            </span>
+            <h2>Lectura asistida para revisión profesional</h2>
+            <p>
+              Reúne situaciones documentadas, sus límites y preguntas pendientes
+              sin modificar los registros originales.
+            </p>
+          </div>
+          <ShieldCheck />
+        </div>
+        <div className="advanced-report-controls">
+          <label>
+            Tema del informe
+            <select
+              value={advancedType}
+              onChange={(event) => setAdvancedType(event.target.value)}
+            >
+              <option value="communication_and_contact">
+                Comunicación y contacto con los hijos
+              </option>
+              <option value="impediments">
+                Posibles impedimentos y restricciones
+              </option>
+              <option value="disqualifications">
+                Expresiones hostiles y descalificaciones
+              </option>
+              <option value="full_chronology">Cronología integral</option>
+            </select>
+          </label>
+          <button
+            className="primary-button"
+            disabled={advancedLoading}
+            onClick={generateAdvancedReport}
+          >
+            <Sparkles size={16} />
+            {advancedLoading ? "Preparando informe…" : "Generar informe"}
+          </button>
+        </div>
+        <small className="advanced-report-notice">
+          La IA no determina culpabilidad ni reemplaza el criterio de tu
+          abogado. Cada resultado exige revisión humana.
+        </small>
+        {advancedError && <div className="login-error">{advancedError}</div>}
+        {advancedReports.length ? (
+          <div className="advanced-report-list">
+            {advancedReports.map((report) => (
+              <section key={report.id}>
+                <header>
+                  <div>
+                    <strong>{report.title}</strong>
+                    <small>
+                      {format(new Date(report.generatedAt), "dd/MM/yyyy HH:mm")}{" "}
+                      · {report.model} · Confianza{" "}
+                      {(report.confidence * 100).toFixed(0)}%
+                    </small>
+                  </div>
+                  <div>
+                    <a href={apiFileUrl(`/api/ai/reports/${report.id}.pdf`)}>
+                      <Download /> PDF
+                    </a>
+                    <button onClick={() => archiveReport(report.id)}>
+                      <Archive /> Archivar
+                    </button>
+                  </div>
+                </header>
+                <p className="advanced-report-summary">
+                  {report.executiveSummary}
+                </p>
+                <div className="advanced-situations">
+                  {report.documentedSituations.map((situation, index) => (
+                    <article key={`${report.id}-${index}`}>
+                      <span>{situation.date || "Sin fecha confirmada"}</span>
+                      <strong>{situation.category}</strong>
+                      <p>{situation.description}</p>
+                      <small>Fuentes: {situation.sourceIds.join(", ")}</small>
+                      <small>Limitaciones: {situation.limitations}</small>
+                    </article>
+                  ))}
+                </div>
+                <div className="advanced-review-grid">
+                  {(
+                    [
+                      [
+                        "Temas recurrentes para revisar",
+                        report.recurringThemes,
+                      ],
+                      ["Información faltante", report.missingInformation],
+                      ["Preguntas pendientes", report.questionsForReview],
+                    ] as [string, string[]][]
+                  ).map(([title, items]) => (
+                    <section key={title}>
+                      <strong>{title}</strong>
+                      {items.length ? (
+                        <ul>
+                          {items.map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p>Sin elementos respaldados.</p>
+                      )}
+                    </section>
+                  ))}
+                </div>
+                <div className="chat-sources">
+                  {report.sources.map((source) => (
+                    <AISourceReference source={source} key={source.sourceId} />
+                  ))}
+                </div>
+                <small className="report-disclaimer">{report.disclaimer}</small>
+              </section>
+            ))}
+          </div>
+        ) : (
+          <div className="vault-empty compact-empty">
+            <Scale />
+            <strong>Todavía no hay informes temáticos</strong>
+            <p>
+              Elegí un tema para crear una versión persistente y descargable.
+            </p>
+          </div>
+        )}
+      </article>
       <article className="panel saved-ai-reports">
         <div className="panel-head">
           <div>
             <span className="eyebrow accent">DESDE EL CHAT DEL EXPEDIENTE</span>
             <h2>Informes internos guardados</h2>
-            <p>Respuestas seleccionadas por vos, con sus fuentes y procedencia.</p>
+            <p>
+              Respuestas seleccionadas por vos, con sus fuentes y procedencia.
+            </p>
           </div>
           <FileText />
         </div>
@@ -5375,8 +5558,8 @@ function ReportsView({
                   <div>
                     <strong>{report.title}</strong>
                     <small>
-                      {format(new Date(report.generatedAt), "dd/MM/yyyy HH:mm")} ·{" "}
-                      {report.model}
+                      {format(new Date(report.generatedAt), "dd/MM/yyyy HH:mm")}{" "}
+                      · {report.model}
                     </small>
                   </div>
                   <button onClick={() => archiveReport(report.id)}>
@@ -5397,7 +5580,9 @@ function ReportsView({
           <div className="vault-empty">
             <FileText />
             <strong>Todavía no guardaste respuestas del chat</strong>
-            <p>Usá “Guardar como informe interno” debajo de una respuesta útil.</p>
+            <p>
+              Usá “Guardar como informe interno” debajo de una respuesta útil.
+            </p>
           </div>
         )}
       </article>

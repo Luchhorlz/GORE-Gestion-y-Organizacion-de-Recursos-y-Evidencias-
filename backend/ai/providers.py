@@ -194,6 +194,20 @@ class MockAIProvider(AIProvider):
         return f"Respuesta simulada para {model}."
 
     def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if "documented_situations" in schema.get("properties", {}):
+            return {
+                "title": "Informe temÃ¡tico simulado",
+                "executive_summary": "Se identificÃ³ una situaciÃ³n documentada que requiere revisiÃ³n humana.",
+                "documented_situations": [{
+                    "date": "2026-07-09", "category": "ComunicaciÃ³n documentada",
+                    "description": "La fuente registra una comunicaciÃ³n relevante para el tema solicitado.",
+                    "source_ids": ["S1"], "limitations": "Debe revisarse junto con el archivo o registro original.",
+                }],
+                "recurring_themes": ["CoordinaciÃ³n de comunicaciones"],
+                "missing_information": ["Contexto anterior y posterior de la comunicaciÃ³n."],
+                "questions_for_review": ["Â¿Existe otra fuente que confirme el contexto completo?"],
+                "source_ids": ["S1"], "confidence": 0.76,
+            }
         if "body" in schema.get("properties", {}):
             return {"title": "Borrador simulado", "body": "Contenido de borrador respaldado por la fuente S1.", "unconfirmed_information": [], "review_fields": ["Revisar destinatario"], "source_ids": ["S1"]}
         if "dates" in schema.get("properties", {}):

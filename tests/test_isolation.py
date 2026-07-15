@@ -432,6 +432,36 @@ class IsolationTests(unittest.TestCase):
             db.execute("DELETE FROM ai_analyses WHERE id=?", (first.json()["id"],))
             db.execute("DELETE FROM ai_conversations WHERE id='CNV-REPORT-TEST'")
 
+    def test_advanced_report_is_persistent_cited_exportable_and_isolated(self):
+        self.module.ai_request_times.clear()
+        generated = self.client.post("/api/ai/reports/generate", json={"reportType": "communication_and_contact"})
+        self.assertEqual(generated.status_code, 200, generated.text)
+        report = generated.json()
+        self.assertEqual(report["type"], "advanced_report")
+        self.assertTrue(report["humanReviewRequired"])
+        self.assertEqual(report["documentedSituations"][0]["sourceIds"], ["S1"])
+        self.assertEqual(report["sources"][0]["sourceId"], "S1")
+        persisted = self.client.get("/api/ai/reports/advanced")
+        self.assertEqual(persisted.status_code, 200, persisted.text)
+        self.assertIn(report["id"], [item["id"] for item in persisted.json()])
+        exported = self.client.get(f"/api/ai/reports/{report['id']}.pdf")
+        self.assertEqual(exported.status_code, 200, exported.text)
+        self.assertTrue(exported.content.startswith(b"%PDF"))
+        with self.module.database() as db:
+            now = self.module.utc_now()
+            db.execute(
+                "INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("RPT-AI-FOREIGN", "TENANT-OTHER", "CASE-OTHER", "advanced_report", "completed", "quality", "mock-chat", "{}", "[]", 1, "USER-OTHER", now, now),
+            )
+        isolated = self.client.get("/api/ai/reports/advanced")
+        self.assertNotIn("RPT-AI-FOREIGN", [item["id"] for item in isolated.json()])
+        self.assertEqual(self.client.get("/api/ai/reports/RPT-AI-FOREIGN.pdf").status_code, 404)
+        archived = self.client.post(f"/api/ai/reports/{report['id']}/archive", json={})
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertNotIn(report["id"], [item["id"] for item in self.client.get("/api/ai/reports/advanced").json()])
+        with self.module.database() as db:
+            db.execute("DELETE FROM ai_analyses WHERE id IN (?,?)", (report["id"], "RPT-AI-FOREIGN"))
+
 
 if __name__ == "__main__":
     unittest.main()
