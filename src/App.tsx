@@ -1024,8 +1024,16 @@ function GroqConnectCard() {
   async function connect(event: React.FormEvent) {
     event.preventDefault(); if (!apiKey.trim()) return
     setConnecting(true); setMessage('Comprobando la clave con GroqCloud…')
-    try { const result = await apiPut<AIStatus>('/api/ai/groq/connect', { apiKey: apiKey.trim() }); setStatus(result); setApiKey(''); setMessage('GroqCloud quedó conectado correctamente.') }
-    catch { setMessage('La clave no pudo verificarse. Volvé a copiarla desde GroqCloud.') }
+    try {
+      const response = await fetch('/api/ai/groq/connect', { method: 'PUT', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey }) })
+      const result = await response.json()
+      if (!response.ok) {
+        const detail = typeof result?.detail === 'string' ? result.detail : 'La clave no pudo verificarse.'
+        throw new Error(detail)
+      }
+      setStatus(result as AIStatus); setApiKey(''); setMessage('GroqCloud quedó conectado correctamente.')
+    }
+    catch (error) { setMessage(error instanceof Error ? error.message : 'La clave no pudo verificarse. Volvé a copiarla desde GroqCloud.') }
     finally { setConnecting(false) }
   }
   return <section className="panel settings-card groq-connect-card"><div className="panel-head"><div><h2>Conectar IA rápida</h2><p>GroqCloud procesa las consultas sin utilizar la memoria ni la placa de video de esta computadora.</p></div><Sparkles /></div><form onSubmit={connect}><label>Clave privada de GroqCloud<input type="password" autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder="Pegá aquí la clave que empieza con gsk_" /></label><button className="primary-button" disabled={connecting || !apiKey.trim()}>{connecting ? 'Comprobando…' : status?.configured ? 'Reemplazar clave' : 'Conectar GroqCloud'}</button></form><div className={`ai-health ${status?.available ? 'online' : 'offline'}`}><span /><div><strong>{status?.available ? 'GroqCloud conectado' : 'Todavía no está conectado'}</strong><small>{message || (status?.configured ? 'La clave está guardada y protegida por Windows.' : 'Pegá la clave una sola vez. GORE no volverá a mostrarla.')}</small></div></div></section>

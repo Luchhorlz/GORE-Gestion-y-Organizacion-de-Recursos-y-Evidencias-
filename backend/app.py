@@ -695,7 +695,7 @@ class AISettingsUpdate(BaseModel):
 
 
 class GroqConnectionPayload(BaseModel):
-    apiKey: str = Field(min_length=20, max_length=300)
+    apiKey: str = Field(min_length=8, max_length=2000)
 
 
 class SemanticSearchPayload(BaseModel):
@@ -1152,8 +1152,9 @@ def update_ai_settings(payload: AISettingsUpdate, request: Request) -> dict:
 
 @app.put("/api/ai/groq/connect")
 def connect_groq(payload: GroqConnectionPayload, request: Request) -> dict:
-    api_key = payload.apiKey.strip()
-    if not api_key.startswith("gsk_"):
+    match = re.search(r"gsk_[A-Za-z0-9_-]+", payload.apiKey)
+    api_key = match.group(0) if match else ""
+    if len(api_key) < 20:
         raise HTTPException(422, "La clave no parece pertenecer a GroqCloud")
     provider = GroqAIProvider(api_key)
     try:
