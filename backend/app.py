@@ -94,6 +94,9 @@ app = FastAPI(
     description="API privada para Gestión y Organización de Recursos y Evidencias",
     version="0.2.0",
     lifespan=application_lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 app.add_middleware(
     CORSMiddleware,
