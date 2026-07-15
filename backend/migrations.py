@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 11
 
 
 def _utc_now() -> str:
@@ -396,6 +396,15 @@ def _migration_010_ai_feedback(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_011_ai_conversation_archiving(db: sqlite3.Connection) -> None:
+    _add_column(db, "ai_conversations", "archived_at TEXT")
+    if _table_exists(db, "ai_conversations"):
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_conversations_archive_scope "
+            "ON ai_conversations (tenant_id,case_id,archived_at,updated_at)"
+        )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -407,6 +416,7 @@ MIGRATIONS = {
     8: _migration_008_date_proposals,
     9: _migration_009_ai_chat,
     10: _migration_010_ai_feedback,
+    11: _migration_011_ai_conversation_archiving,
 }
 
 

@@ -708,6 +708,10 @@ class AIChatMessagePayload(BaseModel):
     evidenceIds: list[str] = Field(default_factory=list, max_length=10)
 
 
+class AIConversationUpdatePayload(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
 class AIFeedbackPayload(BaseModel):
     rating: str = Field(pattern="^(useful|incorrect|review)$")
     comment: str = Field(default="", max_length=1000)
@@ -1540,21 +1544,69 @@ def generate_ai_draft(payload: AIDraftPayload, request: Request) -> dict:
         return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (analysis_id,)).fetchone())
 
 
+def ai_conversation_summary(row: sqlite3.Row) -> dict:
+    return {"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"], "archivedAt": row["archived_at"]}
+
+
 def ai_conversation_dict(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
     messages = db.execute("""SELECT m.*,j.id job_id,j.progress,j.stage,j.status job_status,j.model,
         f.rating feedback_rating,f.comment feedback_comment,f.updated_at feedback_updated_at
         FROM ai_chat_messages m LEFT JOIN ai_chat_jobs j ON j.assistant_message_id=m.id
         LEFT JOIN ai_feedback f ON f.target_type='chat_message' AND f.target_id=m.id AND f.tenant_id=m.tenant_id AND f.case_id=m.case_id
         WHERE m.conversation_id=? ORDER BY m.created_at""", (row["id"],)).fetchall()
-    return {"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"], "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "status": item["status"], "feedback": {"rating": item["feedback_rating"], "comment": item["feedback_comment"], "updatedAt": item["feedback_updated_at"]} if item["feedback_rating"] else None, "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
+    return {**ai_conversation_summary(row), "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "status": item["status"], "feedback": {"rating": item["feedback_rating"], "comment": item["feedback_comment"], "updatedAt": item["feedback_updated_at"]} if item["feedback_rating"] else None, "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
 
 
 @app.get("/api/ai/chat/conversations")
 def list_ai_conversations(request: Request) -> list[dict]:
     with database() as db:
         scope = authorized_scope(request, db)
-        rows = db.execute("SELECT * FROM ai_conversations WHERE tenant_id=? AND case_id=? ORDER BY updated_at DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
-        return [{"id": row["id"], "title": row["title"], "createdAt": row["created_at"], "updatedAt": row["updated_at"]} for row in rows]
+        rows = db.execute("SELECT * FROM ai_conversations WHERE tenant_id=? AND case_id=? AND archived_at IS NULL ORDER BY updated_at DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
+        return [ai_conversation_summary(row) for row in rows]
+
+
+@app.get("/api/ai/chat/conversations/archived")
+def list_archived_ai_conversations(request: Request) -> list[dict]:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM ai_conversations WHERE tenant_id=? AND case_id=? AND archived_at IS NOT NULL ORDER BY archived_at DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
+        return [ai_conversation_summary(row) for row in rows]
+
+
+@app.put("/api/ai/chat/conversations/{conversation_id}")
+def update_ai_conversation(conversation_id: str, payload: AIConversationUpdatePayload, request: Request) -> dict:
+    title = payload.title.strip()
+    if not title: raise HTTPException(422, "El título no puede estar vacío")
+    now = utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT 1 FROM ai_conversations WHERE id=? AND tenant_id=? AND case_id=?", (conversation_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not row: raise HTTPException(404, "Conversación no encontrada")
+        db.execute("UPDATE ai_conversations SET title=?,updated_at=? WHERE id=?", (title, now, conversation_id))
+        audit(db, "AI_CONVERSATION_RENAMED", "ai_conversation", conversation_id, {"title_length": len(title)}, scope)
+        return ai_conversation_summary(db.execute("SELECT * FROM ai_conversations WHERE id=?", (conversation_id,)).fetchone())
+
+
+def set_ai_conversation_archived(conversation_id: str, request: Request, archived: bool) -> dict:
+    now = utc_now()
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT 1 FROM ai_conversations WHERE id=? AND tenant_id=? AND case_id=?", (conversation_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not row: raise HTTPException(404, "Conversación no encontrada")
+        db.execute("UPDATE ai_conversations SET archived_at=?,updated_at=? WHERE id=?", (now if archived else None, now, conversation_id))
+        action = "AI_CONVERSATION_ARCHIVED" if archived else "AI_CONVERSATION_RESTORED"
+        audit(db, action, "ai_conversation", conversation_id, {}, scope)
+        return ai_conversation_summary(db.execute("SELECT * FROM ai_conversations WHERE id=?", (conversation_id,)).fetchone())
+
+
+@app.post("/api/ai/chat/conversations/{conversation_id}/archive")
+def archive_ai_conversation(conversation_id: str, request: Request) -> dict:
+    return set_ai_conversation_archived(conversation_id, request, True)
+
+
+@app.post("/api/ai/chat/conversations/{conversation_id}/restore")
+def restore_ai_conversation(conversation_id: str, request: Request) -> dict:
+    return set_ai_conversation_archived(conversation_id, request, False)
 
 
 @app.get("/api/ai/chat/conversations/{conversation_id}")
@@ -1594,6 +1646,8 @@ def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> di
         if payload.conversationId:
             conversation = db.execute("SELECT * FROM ai_conversations WHERE id=? AND tenant_id=? AND case_id=?", (payload.conversationId, scope["tenant_id"], scope["case_id"])).fetchone()
             if not conversation: raise HTTPException(404, "Conversación no encontrada")
+        if conversation and conversation["archived_at"]:
+            raise HTTPException(409, "La conversación está archivada; restaurala antes de enviar un mensaje")
         conversation_id = conversation["id"] if conversation else f"CNV-{uuid.uuid4().hex[:12].upper()}"
         if not conversation:
             db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (conversation_id, scope["tenant_id"], scope["case_id"], message[:70], scope["user_id"], now, now))

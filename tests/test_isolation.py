@@ -88,7 +88,7 @@ class IsolationTests(unittest.TestCase):
     def test_ai_chat_job_can_be_cancelled_and_stays_cancelled(self):
         now = self.module.utc_now()
         with self.module.database() as db:
-            db.execute("INSERT INTO ai_conversations VALUES (?,?,?,?,?,?,?)", ("CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Cancelar", self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Cancelar", self.module.DEFAULT_USER_ID, now, now))
             db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-CANCEL-USER", "CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "user", "Consulta a cancelar", 1, "[]", "completed", now, now))
             db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-CANCEL-AI", "CNV-CANCEL-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "assistant", "", 0, "[]", "processing", now, now))
             db.execute("INSERT INTO ai_chat_jobs (id,conversation_id,user_message_id,assistant_message_id,tenant_id,case_id,status,progress,stage,model,context_json,created_at,started_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("AIJ-CANCEL-TEST", "CNV-CANCEL-TEST", "MSG-CANCEL-USER", "MSG-CANCEL-AI", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "processing", 60, "Analizando", "mock-chat", "{}", now, now, now))
@@ -105,7 +105,7 @@ class IsolationTests(unittest.TestCase):
     def test_ai_feedback_is_persistent_scoped_and_does_not_log_comment(self):
         now = self.module.utc_now()
         with self.module.database() as db:
-            db.execute("INSERT INTO ai_conversations VALUES (?,?,?,?,?,?,?)", ("CNV-FEEDBACK-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Revisión", self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-FEEDBACK-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Revisión", self.module.DEFAULT_USER_ID, now, now))
             db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-FEEDBACK-AI", "CNV-FEEDBACK-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "assistant", "Respuesta revisable", 0, "[]", "completed", now, now))
         first = self.client.post("/api/ai/chat/messages/MSG-FEEDBACK-AI/feedback", json={"rating": "review", "comment": "Confirmar la fecha mencionada"})
         self.assertEqual(first.status_code, 200, first.text)
@@ -119,6 +119,45 @@ class IsolationTests(unittest.TestCase):
             audit_details = db.execute("SELECT details_json FROM audit_log WHERE action='AI_RESPONSE_REVIEWED' ORDER BY id DESC LIMIT 2").fetchall()
         self.assertNotIn("Confirmar la fecha mencionada", " ".join(row["details_json"] for row in audit_details))
         self.assertEqual(self.client.post("/api/ai/chat/messages/MSG-CANCEL-AI/feedback", json={"rating": "useful"}).status_code, 409)
+
+    def test_ai_conversation_can_be_renamed_archived_and_restored_without_data_loss(self):
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-MANAGE-LOCAL", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Titulo inicial", self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-MANAGE-LOCAL", "CNV-MANAGE-LOCAL", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "user", "Mensaje que debe conservarse", 1, "[]", "completed", now, now))
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-MANAGE-FOREIGN", "TENANT-OTHER", "CASE-OTHER", "Conversacion ajena", "USER-OTHER", now, now))
+
+        renamed = self.client.put("/api/ai/chat/conversations/CNV-MANAGE-LOCAL", json={"title": "  Consulta sobre pruebas  "})
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(renamed.json()["title"], "Consulta sobre pruebas")
+        self.assertIsNone(renamed.json()["archivedAt"])
+        self.assertEqual(self.client.put("/api/ai/chat/conversations/CNV-MANAGE-LOCAL", json={"title": "   "}).status_code, 422)
+
+        archived = self.client.post("/api/ai/chat/conversations/CNV-MANAGE-LOCAL/archive")
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertIsNotNone(archived.json()["archivedAt"])
+        self.assertFalse(any(row["id"] == "CNV-MANAGE-LOCAL" for row in self.client.get("/api/ai/chat/conversations").json()))
+        self.assertTrue(any(row["id"] == "CNV-MANAGE-LOCAL" for row in self.client.get("/api/ai/chat/conversations/archived").json()))
+        blocked_message = self.client.post("/api/ai/chat/messages", json={"conversationId": "CNV-MANAGE-LOCAL", "message": "No debe agregarse"})
+        self.assertEqual(blocked_message.status_code, 409)
+        stored = self.client.get("/api/ai/chat/conversations/CNV-MANAGE-LOCAL")
+        self.assertEqual(stored.status_code, 200, stored.text)
+        self.assertEqual([message["content"] for message in stored.json()["messages"]], ["Mensaje que debe conservarse"])
+
+        restored = self.client.post("/api/ai/chat/conversations/CNV-MANAGE-LOCAL/restore")
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertIsNone(restored.json()["archivedAt"])
+        self.assertTrue(any(row["id"] == "CNV-MANAGE-LOCAL" for row in self.client.get("/api/ai/chat/conversations").json()))
+        self.assertFalse(any(row["id"] == "CNV-MANAGE-LOCAL" for row in self.client.get("/api/ai/chat/conversations/archived").json()))
+        with self.module.database() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM ai_chat_messages WHERE conversation_id='CNV-MANAGE-LOCAL'").fetchone()[0], 1)
+            actions = {row[0] for row in db.execute("SELECT action FROM audit_log WHERE entity_id='CNV-MANAGE-LOCAL'").fetchall()}
+        self.assertTrue({"AI_CONVERSATION_RENAMED", "AI_CONVERSATION_ARCHIVED", "AI_CONVERSATION_RESTORED"}.issubset(actions))
+
+        for method, path in (("put", "/api/ai/chat/conversations/CNV-MANAGE-FOREIGN"), ("post", "/api/ai/chat/conversations/CNV-MANAGE-FOREIGN/archive"), ("post", "/api/ai/chat/conversations/CNV-MANAGE-FOREIGN/restore")):
+            response = getattr(self.client, method)(path, json={"title": "Intrusion"} if method == "put" else None)
+            self.assertEqual(response.status_code, 404)
+        self.assertNotIn("CNV-MANAGE-FOREIGN", self.client.get("/api/ai/chat/conversations/archived").text)
 
     def test_ai_history_is_scoped_and_returns_safe_metadata(self):
         now = self.module.utc_now()

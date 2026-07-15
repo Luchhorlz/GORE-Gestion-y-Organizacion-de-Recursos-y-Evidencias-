@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Archive, ArrowRight, CalendarDays, Check, ChevronLeft, ChevronRight,
   Clock3, Download, Eye, FileCheck2, FileText, FolderLock, Gavel,
-  Home, Info, Menu, MessageCircle, MoreHorizontal, Plus, Scale,
+  Home, Info, Menu, MessageCircle, MoreHorizontal, Pencil, Plus, RotateCcw, Scale,
   LogOut, Search, Settings, ShieldCheck, Sparkles, Upload, Users, X,
   CheckCheck, FileArchive, Image, Paperclip, Phone, Smile, Video,
 } from 'lucide-react'
@@ -521,12 +521,18 @@ function AIMessageFeedback({ message, onSaved }: { message: AIChatMessage; onSav
 
 function AIChatView() {
   const [conversations, setConversations] = useState<AIConversationSummary[]>([])
+  const [archivedConversations, setArchivedConversations] = useState<AIConversationSummary[]>([])
   const [active, setActive] = useState<AIConversation | null>(null)
   const [message, setMessage] = useState('')
   const [attachments, setAttachments] = useState<File[]>([])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
+  const [showArchived, setShowArchived] = useState(false)
+  const [editingConversation, setEditingConversation] = useState<string | null>(null)
+  const [conversationTitle, setConversationTitle] = useState('')
+  const [conversationAction, setConversationAction] = useState<string | null>(null)
   const refreshList = () => apiGet<AIConversationSummary[]>('/api/ai/chat/conversations').then(setConversations).catch(() => undefined)
+  const refreshArchived = () => apiGet<AIConversationSummary[]>('/api/ai/chat/conversations/archived').then(setArchivedConversations).catch(() => undefined)
   const loadConversation = (id: string) => apiGet<AIConversation>(`/api/ai/chat/conversations/${id}`).then(setActive)
   useEffect(() => { refreshList() }, [])
   useEffect(() => {
@@ -575,8 +581,50 @@ function AIChatView() {
       refreshList()
     } catch { setError('No se pudo cancelar la tarea. Es posible que ya haya terminado.') }
   }
+  function beginRename(item: AIConversationSummary) {
+    setEditingConversation(item.id)
+    setConversationTitle(item.title)
+    setError('')
+  }
+  async function renameConversation(event: React.FormEvent, id: string) {
+    event.preventDefault()
+    const title = conversationTitle.trim()
+    if (!title) return
+    setConversationAction(id); setError('')
+    try {
+      const updated = await apiPut<AIConversationSummary>(`/api/ai/chat/conversations/${id}`, { title })
+      setConversations(previous => previous.map(item => item.id === id ? { ...item, ...updated } : item))
+      setActive(previous => previous?.id === id ? { ...previous, title: updated.title } : previous)
+      setEditingConversation(null)
+    } catch { setError('No se pudo cambiar el nombre de la conversación.') }
+    finally { setConversationAction(null) }
+  }
+  async function archiveConversation(id: string) {
+    setConversationAction(id); setError('')
+    try {
+      await apiPost(`/api/ai/chat/conversations/${id}/archive`, {})
+      if (active?.id === id) setActive(null)
+      setEditingConversation(null)
+      await Promise.all([refreshList(), refreshArchived()])
+    } catch { setError('No se pudo archivar la conversación.') }
+    finally { setConversationAction(null) }
+  }
+  async function restoreConversation(id: string) {
+    setConversationAction(id); setError('')
+    try {
+      await apiPost(`/api/ai/chat/conversations/${id}/restore`, {})
+      await Promise.all([refreshList(), refreshArchived()])
+    } catch { setError('No se pudo restaurar la conversación.') }
+    finally { setConversationAction(null) }
+  }
+  function toggleArchived() {
+    setShowArchived(previous => {
+      if (!previous) refreshArchived()
+      return !previous
+    })
+  }
   const waiting = active?.messages.findLast(item => item.job && ['pending', 'processing'].includes(item.job.status))
-  return <><section className="page-heading compact"><div><span className="eyebrow accent">CONVERSACIÓN PRIVADA EN SEGUNDO PLANO</span><h1>Chat con Ollama</h1><p>Conversá en lenguaje neutral usando evidencias, análisis guardados y aclaraciones aportadas por vos.</p></div></section><div className="ai-chat-layout"><aside className="panel ai-chat-history"><button className="primary-button" onClick={() => setActive(null)}><Plus size={15} /> Nueva conversación</button>{conversations.map(item => <button className={active?.id === item.id ? 'active' : ''} key={item.id} onClick={() => loadConversation(item.id)}><MessageCircle /><span><strong>{item.title}</strong><small>{format(new Date(item.updatedAt), 'dd/MM HH:mm')}</small></span></button>)}</aside><section className="panel ai-chat-main"><div className="ai-chat-notice"><ShieldCheck /><div><strong>Modelo avanzado · carga moderada</strong><span>Una sola tarea a la vez, contexto reducido y liberación automática del modelo. Las aclaraciones tuyas se identifican como datos aportados por el usuario.</span></div></div><div className="ai-chat-messages">{active?.messages.map((item, index) => <div className={`ai-chat-message ${item.role} ${['failed', 'cancelled'].includes(item.status) ? 'failed' : ''}`} key={item.id}><div><span>{item.role === 'user' ? 'Vos · dato aportado por el usuario' : 'GORE · Ollama local'}</span>{item.status === 'queued' || item.status === 'processing' ? <div className="ai-job-progress"><div><strong>{item.job?.stage ?? 'En cola'}</strong><small>{item.job?.model} · {item.job?.progress ?? 0}%</small></div><div className="ai-job-track"><i style={{ width: `${item.job?.progress ?? 0}%` }} /></div><p>Podés cambiar de pestaña o cerrar GORE. La tarea continuará y se recuperará al reiniciar.</p>{item.job && <button type="button" className="cancel-ai-job" onClick={() => cancelJob(item.job!.id)}><X size={13} /> Cancelar análisis</button>}</div> : item.status === 'failed' ? <div className="chat-failed"><p>Ollama se detuvo o no terminó dentro del tiempo permitido.</p><button onClick={() => retryFailed(index)} disabled={sending}><Clock3 size={14} /> Reintentar este mensaje</button></div> : <p>{item.content}</p>}{item.sources.length > 0 && <div className="chat-sources">{item.sources.map(source => <AISourceReference source={source} key={source.sourceId} />)}</div>}<AIMessageFeedback message={item} onSaved={() => active && loadConversation(active.id)} /></div></div>)}{!active && <div className="vault-empty"><MessageCircle /><strong>Iniciá una conversación</strong><p>Podés saludar, consultar pendientes o adjuntar archivos para analizarlos. GORE distinguirá tus aclaraciones de las evidencias originales.</p></div>}</div>{waiting && <div className="chat-background-indicator"><Clock3 /> Ollama está trabajando en segundo plano. Podés seguir usando el resto de GORE.</div>}<form className="ai-chat-form" onSubmit={send}><textarea value={message} onChange={event => setMessage(event.target.value)} maxLength={50000} placeholder="Escribí tu consulta o adjuntá archivos para que Ollama los analice…" />{attachments.length > 0 && <div className="ai-chat-attachments">{attachments.map((file, index) => <div key={`${file.name}-${file.lastModified}`}><FileCheck2 /><span><strong>{file.name}</strong><small>{(file.size / 1024 / 1024).toFixed(2)} MB</small></span><button type="button" onClick={() => setAttachments(previous => previous.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Quitar ${file.name}`}><X /></button></div>)}</div>}<div><span className="ai-chat-form-meta"><label className={attachments.length >= 10 ? 'disabled' : ''}><input type="file" multiple disabled={sending || attachments.length >= 10} accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.jpg,.jpeg,.png,.gif,.webp,.bmp,.tif,.tiff,.mp3,.wav,.ogg,.opus,.m4a,.aac,.mp4,.webm" onChange={event => { addAttachments(event.target.files); event.currentTarget.value = '' }} /><Paperclip /> Adjuntar</label><small>{message.length.toLocaleString('es-AR')}/50.000 · {attachments.length}/10 archivos</small></span><button className="primary-button" disabled={sending || (!message.trim() && attachments.length === 0)}><ArrowRight size={16} /> {sending ? 'Subiendo y encolando…' : 'Enviar'}</button></div></form>{error && <div className="login-error">{error}</div>}</section></div></>
+  return <><section className="page-heading compact"><div><span className="eyebrow accent">CONVERSACIÓN PRIVADA EN SEGUNDO PLANO</span><h1>Chat con Ollama</h1><p>Conversá en lenguaje neutral usando evidencias, análisis guardados y aclaraciones aportadas por vos.</p></div></section><div className="ai-chat-layout"><aside className="panel ai-chat-history"><button className="primary-button" onClick={() => setActive(null)}><Plus size={15} /> Nueva conversación</button><div className="ai-conversation-list">{conversations.map(item => <div className={`ai-conversation-row ${active?.id === item.id ? 'active' : ''}`} key={item.id}>{editingConversation === item.id ? <form className="ai-conversation-rename" onSubmit={event => renameConversation(event, item.id)}><input autoFocus maxLength={100} value={conversationTitle} onChange={event => setConversationTitle(event.target.value)} aria-label="Nombre de la conversación" /><button type="submit" disabled={!conversationTitle.trim() || conversationAction === item.id} aria-label="Guardar nombre"><Check /></button><button type="button" onClick={() => setEditingConversation(null)} aria-label="Cancelar"><X /></button></form> : <><button className="ai-conversation-open" onClick={() => loadConversation(item.id)}><MessageCircle /><span><strong>{item.title}</strong><small>{format(new Date(item.updatedAt), 'dd/MM HH:mm')}</small></span></button><div className="ai-conversation-actions"><button onClick={() => beginRename(item)} aria-label={`Renombrar ${item.title}`} title="Renombrar"><Pencil /></button><button onClick={() => archiveConversation(item.id)} disabled={conversationAction === item.id} aria-label={`Archivar ${item.title}`} title="Archivar"><Archive /></button></div></>}</div>)}</div><button className={`ai-archived-toggle ${showArchived ? 'open' : ''}`} onClick={toggleArchived}><Archive /><span>{showArchived ? 'Ocultar archivadas' : 'Ver archivadas'}</span><small>{archivedConversations.length || ''}</small></button>{showArchived && <div className="ai-archived-list">{archivedConversations.map(item => <div className="ai-archived-row" key={item.id}><span><strong>{item.title}</strong><small>{format(new Date(item.updatedAt), 'dd/MM HH:mm')}</small></span><button onClick={() => restoreConversation(item.id)} disabled={conversationAction === item.id} title="Restaurar"><RotateCcw /> Restaurar</button></div>)}{archivedConversations.length === 0 && <p>No hay conversaciones archivadas.</p>}</div>}</aside><section className="panel ai-chat-main"><div className="ai-chat-notice"><ShieldCheck /><div><strong>Modelo avanzado · carga moderada</strong><span>Una sola tarea a la vez, contexto reducido y liberación automática del modelo. Las aclaraciones tuyas se identifican como datos aportados por el usuario.</span></div></div><div className="ai-chat-messages">{active?.messages.map((item, index) => <div className={`ai-chat-message ${item.role} ${['failed', 'cancelled'].includes(item.status) ? 'failed' : ''}`} key={item.id}><div><span>{item.role === 'user' ? 'Vos · dato aportado por el usuario' : 'GORE · Ollama local'}</span>{item.status === 'queued' || item.status === 'processing' ? <div className="ai-job-progress"><div><strong>{item.job?.stage ?? 'En cola'}</strong><small>{item.job?.model} · {item.job?.progress ?? 0}%</small></div><div className="ai-job-track"><i style={{ width: `${item.job?.progress ?? 0}%` }} /></div><p>Podés cambiar de pestaña o cerrar GORE. La tarea continuará y se recuperará al reiniciar.</p>{item.job && <button type="button" className="cancel-ai-job" onClick={() => cancelJob(item.job!.id)}><X size={13} /> Cancelar análisis</button>}</div> : item.status === 'failed' ? <div className="chat-failed"><p>Ollama se detuvo o no terminó dentro del tiempo permitido.</p><button onClick={() => retryFailed(index)} disabled={sending}><Clock3 size={14} /> Reintentar este mensaje</button></div> : <p>{item.content}</p>}{item.sources.length > 0 && <div className="chat-sources">{item.sources.map(source => <AISourceReference source={source} key={source.sourceId} />)}</div>}<AIMessageFeedback message={item} onSaved={() => active && loadConversation(active.id)} /></div></div>)}{!active && <div className="vault-empty"><MessageCircle /><strong>Iniciá una conversación</strong><p>Podés saludar, consultar pendientes o adjuntar archivos para analizarlos. GORE distinguirá tus aclaraciones de las evidencias originales.</p></div>}</div>{waiting && <div className="chat-background-indicator"><Clock3 /> Ollama está trabajando en segundo plano. Podés seguir usando el resto de GORE.</div>}<form className="ai-chat-form" onSubmit={send}><textarea value={message} onChange={event => setMessage(event.target.value)} maxLength={50000} placeholder="Escribí tu consulta o adjuntá archivos para que Ollama los analice…" />{attachments.length > 0 && <div className="ai-chat-attachments">{attachments.map((file, index) => <div key={`${file.name}-${file.lastModified}`}><FileCheck2 /><span><strong>{file.name}</strong><small>{(file.size / 1024 / 1024).toFixed(2)} MB</small></span><button type="button" onClick={() => setAttachments(previous => previous.filter((_, itemIndex) => itemIndex !== index))} aria-label={`Quitar ${file.name}`}><X /></button></div>)}</div>}<div><span className="ai-chat-form-meta"><label className={attachments.length >= 10 ? 'disabled' : ''}><input type="file" multiple disabled={sending || attachments.length >= 10} accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.jpg,.jpeg,.png,.gif,.webp,.bmp,.tif,.tiff,.mp3,.wav,.ogg,.opus,.m4a,.aac,.mp4,.webm" onChange={event => { addAttachments(event.target.files); event.currentTarget.value = '' }} /><Paperclip /> Adjuntar</label><small>{message.length.toLocaleString('es-AR')}/50.000 · {attachments.length}/10 archivos</small></span><button className="primary-button" disabled={sending || (!message.trim() && attachments.length === 0)}><ArrowRight size={16} /> {sending ? 'Subiendo y encolando…' : 'Enviar'}</button></div></form>{error && <div className="login-error">{error}</div>}</section></div></>
 }
 
 function CommunicationsView({ events, openModal, openEvent }: { events: EventItem[]; openModal: () => void; openEvent: (event: EventItem) => void }) {
