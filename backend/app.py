@@ -17,7 +17,7 @@ import time
 import zipfile
 import re
 import threading
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -70,10 +70,27 @@ AI_RATE_MAX_REQUESTS = 30
 AI_RATE_LOCK = threading.Lock()
 ai_request_times: dict[str, list[float]] = {}
 
+
+@asynccontextmanager
+async def application_lifespan(_app: FastAPI):
+    init_database()
+    recover_interrupted_processing()
+    start_processing_worker()
+    start_ai_chat_worker()
+    start_whatsapp_analysis_worker()
+    try:
+        yield
+    finally:
+        global WHATSAPP_ANALYSIS_WORKER_STARTED
+        WHATSAPP_ANALYSIS_STOP.set()
+        WHATSAPP_ANALYSIS_WORKER_STARTED = False
+
+
 app = FastAPI(
     title="GORE API",
     description="API privada para Gestión y Organización de Recursos y Evidencias",
     version="0.2.0",
+    lifespan=application_lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1084,22 +1101,6 @@ def start_whatsapp_analysis_worker() -> None:
         WHATSAPP_ANALYSIS_WORKER_STARTED = True
         WHATSAPP_ANALYSIS_STOP.clear()
         threading.Thread(target=whatsapp_analysis_worker, name="gore-whatsapp-analysis-worker", daemon=True).start()
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_database()
-    recover_interrupted_processing()
-    start_processing_worker()
-    start_ai_chat_worker()
-    start_whatsapp_analysis_worker()
-
-
-@app.on_event("shutdown")
-def shutdown() -> None:
-    global WHATSAPP_ANALYSIS_WORKER_STARTED
-    WHATSAPP_ANALYSIS_STOP.set()
-    WHATSAPP_ANALYSIS_WORKER_STARTED = False
 
 
 @app.get("/api/health")

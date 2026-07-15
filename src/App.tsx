@@ -4213,6 +4213,9 @@ function WhatsAppSimulator({
   const [writtenAnalysis, setWrittenAnalysis] =
     useState<WhatsAppAnalysisStatus | null>(null);
   const [writtenStarting, setWrittenStarting] = useState(false);
+  const refreshSavedChatsRef = useRef<
+    (openLatest?: boolean) => Promise<void>
+  >(async () => undefined);
   const senders = useMemo(
     () =>
       Array.from(
@@ -4233,6 +4236,7 @@ function WhatsAppSimulator({
       /* modo local */
     }
   }
+  refreshSavedChatsRef.current = refreshSavedChats;
   async function analyzeWrittenMessages() {
     if (!chatId) return;
     setWrittenStarting(true);
@@ -4690,9 +4694,8 @@ function WhatsAppSimulator({
     );
   }
   // Se ejecuta una sola vez para restaurar la conversación más reciente sin reabrirla ante cada cambio de evidencia.
-  // oxlint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    refreshSavedChats(true);
+    void refreshSavedChatsRef.current(true);
   }, []);
   useEffect(() => {
     const other = senders.find((sender) => sender !== self);
