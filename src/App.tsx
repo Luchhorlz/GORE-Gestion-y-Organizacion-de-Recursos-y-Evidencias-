@@ -303,7 +303,8 @@ type AIActionProposal = {
     | "create_event"
     | "link_evidence_to_event"
     | "update_event_category"
-    | "update_event_details";
+    | "update_event_details"
+    | "update_report";
   payload: {
     date?: string;
     time?: string;
@@ -322,6 +323,12 @@ type AIActionProposal = {
     previous?: Record<string, string>;
     new?: Record<string, string>;
     changes?: Record<string, { before: string; after: string }>;
+    reportId?: string;
+    previousTitle?: string;
+    newTitle?: string;
+    previousBody?: string;
+    newBody?: string;
+    userProvidedClarification?: boolean;
   };
   sourceIds: string[];
   rationale: string;
@@ -528,6 +535,23 @@ type Workspace = {
     role: string;
   };
 };
+type LegajoSummary = {
+  id: string;
+  code: string;
+  title: string;
+  status: string;
+  role: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+type CaseContext = {
+  userPosition: string;
+  otherPartyPosition: string;
+  neutralContext: string;
+  confirmedFacts: string;
+  updatedAt: string;
+};
 
 const seedEvents: EventItem[] = [
   {
@@ -646,6 +670,15 @@ function App() {
     previousModality: "Organización semanal alternada",
   });
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [cases, setCases] = useState<LegajoSummary[]>([]);
+  const [caseContext, setCaseContext] = useState<CaseContext>({
+    userPosition: "",
+    otherPartyPosition: "",
+    neutralContext: "",
+    confirmedFacts: "",
+    updatedAt: "",
+  });
+  const [caseManagerOpen, setCaseManagerOpen] = useState(false);
   const [audioProgress, setAudioProgress] = useState<AudioIndexStatus | null>(
     null,
   );
@@ -675,13 +708,17 @@ function App() {
       apiGet<Evidence[]>("/api/evidence"),
       apiGet<CaseConfig>("/api/case"),
       apiGet<Workspace>("/api/workspace"),
+      apiGet<LegajoSummary[]>("/api/cases"),
+      apiGet<CaseContext>("/api/case/context"),
     ])
-      .then(([serverEvents, serverEvidence, serverCase, serverWorkspace]) => {
+      .then(([serverEvents, serverEvidence, serverCase, serverWorkspace, serverCases, serverContext]) => {
         setBackendOnline(true);
         setEvents(serverEvents);
         setEvidence(serverEvidence);
         setCaseConfig(serverCase);
         setWorkspace(serverWorkspace);
+        setCases(serverCases);
+        setCaseContext(serverContext);
       })
       .catch(() => setBackendOnline(false));
   }, [authenticated]);
@@ -807,7 +844,7 @@ function App() {
           <span className="eyebrow">Expediente activo</span>
           <strong>{caseConfig.title}</strong>
           <span className="case-code">{caseConfig.caseCode}</span>
-          <button>
+          <button onClick={() => setCaseManagerOpen(true)} title="Cambiar o crear legajo" aria-label="Cambiar o crear legajo">
             <MoreHorizontal size={17} />
           </button>
         </div>
@@ -1009,6 +1046,14 @@ function App() {
           )}
         </div>
       </main>
+      {caseManagerOpen && (
+        <CaseManagerModal
+          cases={cases}
+          context={caseContext}
+          close={() => setCaseManagerOpen(false)}
+          contextSaved={setCaseContext}
+        />
+      )}
       {eventModal && (
         <EventModal
           initial={selectedEvent}
@@ -1051,6 +1096,90 @@ function App() {
           <X size={15} />
         </button>
       )}
+    </div>
+  );
+}
+
+function CaseManagerModal({ cases, context, close, contextSaved }: { cases: LegajoSummary[]; context: CaseContext; close: () => void; contextSaved: (value: CaseContext) => void }) {
+  const [creating, setCreating] = useState(false);
+  const [form, setForm] = useState({ caseCode: "", title: "", status: "En documentaciÃ³n" });
+  const [draftContext, setDraftContext] = useState(context);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  async function activate(id: string) {
+    setBusy(true);
+    setNotice("");
+    try {
+      await apiPost(`/api/cases/${id}/activate`, {});
+      window.location.reload();
+    } catch {
+      setNotice("No se pudo abrir ese legajo.");
+      setBusy(false);
+    }
+  }
+  async function create(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setNotice("");
+    try {
+      const created = await apiPost<LegajoSummary>("/api/cases", form);
+      await apiPost(`/api/cases/${created.id}/activate`, {});
+      window.location.reload();
+    } catch {
+      setNotice("No se pudo crear el legajo. RevisÃ¡ que el cÃ³digo no estÃ© repetido.");
+      setBusy(false);
+    }
+  }
+  async function saveContext() {
+    setBusy(true);
+    setNotice("");
+    try {
+      const saved = await apiPut<CaseContext>("/api/case/context", draftContext);
+      contextSaved(saved);
+      setDraftContext(saved);
+      setNotice("Contexto guardado. La IA lo identificarÃ¡ como informaciÃ³n aportada por vos.");
+    } catch {
+      setNotice("No se pudo guardar el contexto.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="modal-backdrop">
+      <section className="modal case-manager-modal">
+        <header className="modal-head">
+          <div><span className="eyebrow">LEGAJOS</span><h2>Casos separados</h2><p>Cada legajo conserva sus propios chats, evidencias, informes y anÃ¡lisis.</p></div>
+          <button onClick={close}><X /></button>
+        </header>
+        <div className="case-manager-body">
+          <div className="case-manager-list">
+            {cases.map((item) => (
+              <button key={item.id} className={item.active ? "active" : ""} disabled={busy || item.active} onClick={() => activate(item.id)}>
+                <span><strong>{item.title}</strong><small>{item.code} Â· {item.status}</small></span>
+                {item.active ? <Check size={16} /> : <ArrowRight size={16} />}
+              </button>
+            ))}
+            <button className="new-case-toggle" onClick={() => setCreating((value) => !value)}><Plus size={16} /> Crear legajo desde cero</button>
+          </div>
+          {creating && <form className="new-case-form" onSubmit={create}>
+            <label>CÃ³digo del legajo<input required value={form.caseCode} onChange={(e) => setForm({ ...form, caseCode: e.target.value })} placeholder="Ejemplo: GORE-2026-002" /></label>
+            <label>TÃ­tulo<input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Nombre descriptivo del caso" /></label>
+            <label>Estado<input required value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} /></label>
+            <button className="primary-button" disabled={busy}><Plus size={15} /> Crear y abrir vacÃ­o</button>
+          </form>}
+          <div className="case-context-form">
+            <h3>Contexto declarado del legajo activo</h3>
+            <p>Esto ayuda a la IA a comprender ambas posiciones. Se conserva separado de la evidencia y se marca como dato aportado por vos.</p>
+            <label>Mi posiciÃ³n<textarea value={draftContext.userPosition} onChange={(e) => setDraftContext({ ...draftContext, userPosition: e.target.value })} placeholder="ExplicÃ¡ tu posiciÃ³n con lenguaje neutral." /></label>
+            <label>PosiciÃ³n de la otra parte<textarea value={draftContext.otherPartyPosition} onChange={(e) => setDraftContext({ ...draftContext, otherPartyPosition: e.target.value })} placeholder="ExplicÃ¡, sin interpretar intenciones, quÃ© sostiene la otra parte." /></label>
+            <label>Contexto neutral compartido<textarea value={draftContext.neutralContext} onChange={(e) => setDraftContext({ ...draftContext, neutralContext: e.target.value })} placeholder="Antecedentes, acuerdos previos y situaciÃ³n general." /></label>
+            <label>Datos confirmados por mÃ­<textarea value={draftContext.confirmedFacts} onChange={(e) => setDraftContext({ ...draftContext, confirmedFacts: e.target.value })} placeholder="Respuestas a preguntas pendientes o aclaraciones tuyas." /></label>
+            <button className="primary-button" disabled={busy} onClick={saveContext}><Check size={15} /> Guardar contexto</button>
+          </div>
+          {notice && <p className="case-manager-notice">{notice}</p>}
+        </div>
+      </section>
     </div>
   );
 }
@@ -3311,7 +3440,9 @@ function AIActionCard({
 }) {
   const [working, setWorking] = useState(false);
   const title =
-    action.actionType === "create_event"
+    action.actionType === "update_report"
+      ? `Actualizar informe: ${action.payload.newTitle}`
+      : action.actionType === "create_event"
       ? action.payload.title
       : action.actionType === "link_evidence_to_event"
         ? `Asociar ${action.payload.evidenceName}`
@@ -3319,7 +3450,9 @@ function AIActionCard({
           ? `Reclasificar ${action.payload.eventTitle}`
           : `Corregir ${action.payload.eventTitle}`;
   const detail =
-    action.actionType === "create_event"
+    action.actionType === "update_report"
+      ? "Se conservarÃ¡ una versiÃ³n completa del informe anterior"
+      : action.actionType === "create_event"
       ? `${action.payload.date} · ${action.payload.time} · ${action.payload.category}`
       : action.actionType === "link_evidence_to_event"
         ? `Destino: ${action.payload.eventTitle}${action.payload.previousEventId ? " · actualmente asociada a otro acontecimiento" : " · actualmente sin asociar"}`
@@ -3327,7 +3460,9 @@ function AIActionCard({
           ? `${action.payload.previousCategory} → ${action.payload.newCategory}`
           : `${Object.keys(action.payload.changes ?? {}).length} campos cambiarán`;
   const description =
-    action.actionType === "create_event"
+    action.actionType === "update_report"
+      ? "El informe se actualizarÃ¡ sÃ³lo despuÃ©s de tu aprobaciÃ³n. Tus aclaraciones quedarÃ¡n identificadas como datos aportados por vos."
+      : action.actionType === "create_event"
       ? action.payload.description
       : action.actionType === "link_evidence_to_event"
         ? `La evidencia ${action.payload.evidenceId} quedará vinculada al acontecimiento ${action.payload.eventId}.`
@@ -3335,7 +3470,9 @@ function AIActionCard({
           ? `Sólo cambiará la categoría del acontecimiento ${action.payload.eventId}; el resto de sus datos conservará una versión anterior.`
           : `Se actualizarán únicamente los campos indicados. La versión completa anterior quedará preservada.`;
   const approvalLabel =
-    action.actionType === "create_event"
+    action.actionType === "update_report"
+      ? "Aprobar actualizaciÃ³n del informe"
+      : action.actionType === "create_event"
       ? "Aprobar y crear acontecimiento"
       : action.actionType === "link_evidence_to_event"
         ? "Aprobar asociación"
@@ -3372,6 +3509,7 @@ function AIActionCard({
             )}
           </div>
         )}
+        {action.actionType === "update_report" && <div className="ai-action-changes"><div><b>Informe</b><del>{action.payload.previousTitle}</del><span>â†’</span><ins>{action.payload.newTitle}</ins></div></div>}
         {action.rationale && <em>{action.rationale}</em>}
         <small>Fuentes: {action.sourceIds.join(", ")}</small>
       </div>
@@ -4264,6 +4402,19 @@ function WhatsAppSimulator({
       setWrittenStarting(false);
     }
   }
+  async function analyzeAllChats() {
+    setWrittenStarting(true);
+    setError("");
+    try {
+      const result = await apiPost<{ items: WhatsAppAnalysisStatus[] }>("/api/ai/whatsapp-analysis/start-all", {});
+      const current = result.items.find((item) => item.chatId === chatId);
+      if (current) setWrittenAnalysis(current);
+    } catch {
+      setError("No se pudo iniciar el anÃ¡lisis completo de las conversaciones.");
+    } finally {
+      setWrittenStarting(false);
+    }
+  }
   useEffect(() => {
     if (!chatId) {
       setWrittenAnalysis(null);
@@ -4732,7 +4883,7 @@ function WhatsAppSimulator({
                 : "La IA creará un mapa trazable del chat completo y después revisará solamente los mensajes nuevos."}
             </span>
           </div>
-          <button
+          <div className="wa-analysis-actions"><button type="button" disabled={writtenStarting || savedChats.length === 0} onClick={analyzeAllChats}>Analizar todas las conversaciones</button><button
             type="button"
             disabled={
               writtenStarting ||
@@ -4754,7 +4905,7 @@ function WhatsAppSimulator({
                   : writtenAnalysis?.status === "failed"
                     ? "Reintentar análisis"
                     : "Analizar chat y transcripciones"}
-          </button>
+          </button></div>
         </div>
         {writtenAnalysis && (
           <>

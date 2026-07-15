@@ -339,10 +339,11 @@ def init_database() -> None:
             db.execute("ALTER TABLE evidence ADD COLUMN match_confidence TEXT NOT NULL DEFAULT ''")
         if "match_details" not in evidence_columns:
             db.execute("ALTER TABLE evidence ADD COLUMN match_details TEXT NOT NULL DEFAULT ''")
-        db.execute(
-            "INSERT OR IGNORE INTO case_config (id,case_code,title,status,main_milestone,previous_modality,updated_at) VALUES (1,?,?,?,?,?,?)",
+        if "id" in {row["name"] for row in db.execute("PRAGMA table_info(case_config)").fetchall()}:
+            db.execute(
+                "INSERT OR IGNORE INTO case_config (id,case_code,title,status,main_milestone,previous_modality,updated_at) VALUES (1,?,?,?,?,?,?)",
             ("GORE-2026-001", "Organización familiar", "En documentación", "2026-07-01", "Organización semanal alternada", utc_now()),
-        )
+            )
         db.execute("INSERT OR IGNORE INTO ai_settings (id,active_profile,updated_at) VALUES (1,?,?)", (AI_CONFIG.default_profile, utc_now()))
         if not db.execute("SELECT 1 FROM auth_config WHERE id = 1").fetchone():
             password = secrets.token_urlsafe(12)
@@ -532,6 +533,12 @@ def process_next_job() -> bool:
                     db.execute("UPDATE evidence SET extraction_status='queued',extraction_error='' WHERE id=? AND tenant_id=? AND case_id=?", (job["evidence_id"], job["tenant_id"], job["case_id"]))
                 audit(db, "EVIDENCE_INTAKE_VERIFIED", "evidence", job["evidence_id"], {"job_id": job["id"], "sha256_verified": True}, scope)
             db.execute("UPDATE processing_jobs SET status='completed',completed_at=?,updated_at=?,error_code='' WHERE id=?", (now, now, job["id"]))
+    except AIProviderError:
+        with database() as db:
+            now = utc_now()
+            db.execute("UPDATE whatsapp_analysis_jobs SET status='pending',stage='Esperando disponibilidad de GroqCloud',error_code='temporary_provider_limit',updated_at=? WHERE id=?", (now, job["id"]))
+            db.execute("UPDATE whatsapp_analysis_state SET status='pending',updated_at=? WHERE chat_id=?", (now, job["chat_id"]))
+        return True
     except Exception as error:
         code = str(error) if str(error) in {"evidence_missing", "original_missing", "integrity_mismatch"} else type(error).__name__
         with database() as db:
@@ -622,6 +629,13 @@ def process_next_ai_chat_job() -> bool:
         with database() as db: db.execute("UPDATE ai_chat_jobs SET context_json=?,progress=42,stage='Adjuntos preparados',updated_at=? WHERE id=?", (json.dumps(context_items, ensure_ascii=False), utc_now(), job["id"]))
     evidence_context = "\n\n".join(f"[{item['sourceId']}] {item['evidenceName']} | SHA {item['textHash']}\n{item['text'][:700]}" for item in context_items.get("sources", []))
     analysis_context = "\n".join(context_items.get("analyses", []))
+    case_context = context_items.get("caseContext", {})
+    declared_context = "\n".join(part for part in (
+        f"PosiciÃ³n declarada por el usuario: {case_context.get('userPosition', '')}" if case_context.get("userPosition") else "",
+        f"PosiciÃ³n atribuida por el usuario a la otra parte: {case_context.get('otherPartyPosition', '')}" if case_context.get("otherPartyPosition") else "",
+        f"Contexto neutral aportado: {case_context.get('neutralContext', '')}" if case_context.get("neutralContext") else "",
+        f"Hechos confirmados por el usuario: {case_context.get('confirmedFacts', '')}" if case_context.get("confirmedFacts") else "",
+    ) if part)
     current = history[0] if history else None
     previous_rows = list(reversed(history[1:]))
     previous_context = "\n".join(("[DATO APORTADO POR EL USUARIO] " if row["role"] == "user" else "[RESPUESTA PREVIA DE GORE] ") + row["content"] for row in previous_rows)[-8_000:]
@@ -649,6 +663,9 @@ ANÁLISIS GUARDADOS:
 {analysis_context or 'Sin análisis previos disponibles.'}
 
 CONVERSACIÓN:
+CONTEXTO DECLARADO DEL LEGAJO (dato aportado por el usuario; no sustituye evidencia):
+{declared_context or 'TodavÃ­a no fue cargado.'}
+
 {conversation}
 """
     stop = threading.Event(); ticker = threading.Thread(target=ai_chat_progress_ticker, args=(job["id"], stop), daemon=True); ticker.start()
@@ -662,15 +679,17 @@ CONVERSACIÓN:
             "type": "object", "properties": {
                 "answer": {"type": "string"},
                 "proposed_actions": {"type": "array", "items": {"type": "object", "properties": {
-                    "action_type": {"type": "string", "enum": ["create_event", "link_evidence_to_event", "update_event_category", "update_event_details"]},
+                    "action_type": {"type": "string", "enum": ["create_event", "link_evidence_to_event", "update_event_category", "update_event_details", "update_report"]},
                     "date": {"type": "string"}, "time": {"type": "string"}, "category": {"type": "string"},
                     "title": {"type": "string"}, "description": {"type": "string"},
                     "expected": {"type": "string"}, "actual": {"type": "string"},
                     "event_id": {"type": "string"}, "evidence_id": {"type": "string"},
+                    "report_id": {"type": "string"}, "report_title": {"type": "string"}, "report_body": {"type": "string"},
                     "rationale": {"type": "string"}, "source_ids": {"type": "array", "items": {"type": "string"}},
-                }, "required": ["action_type", "date", "time", "category", "title", "description", "expected", "actual", "event_id", "evidence_id", "rationale", "source_ids"]}},
+                }, "required": ["action_type", "date", "time", "category", "title", "description", "expected", "actual", "event_id", "evidence_id", "report_id", "report_title", "report_body", "rationale", "source_ids"]}},
             }, "required": ["answer", "proposed_actions"],
         }
+        prompt += "\nSi el usuario pide actualizar expresamente un informe, podes proponer update_report usando solo un ID DE INFORME/ANALISIS visible y conservando la informacion previa que siga vigente. Las aclaraciones del usuario deben quedar identificadas como tales."
         raw = ai_provider().generate_structured(prompt + "\nDevolvé JSON con answer y proposed_actions. Si no pidieron organizar, registrar, asociar o reclasificar, proposed_actions debe ser []. Para asociaciones usá exclusivamente los IDs exactos visibles en las fuentes.", job["model"], chat_schema)
         answer = str(raw.get("answer", "")).strip()
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
@@ -682,10 +701,17 @@ CONVERSACIÓN:
             valid_source_ids = {item["sourceId"] for item in context_items.get("sources", [])}
             for item in raw.get("proposed_actions", [])[:8] if isinstance(raw.get("proposed_actions"), list) else []:
                 action_type = str(item.get("action_type", ""))
-                if action_type not in {"create_event", "link_evidence_to_event", "update_event_category", "update_event_details"}: continue
+                if action_type not in {"create_event", "link_evidence_to_event", "update_event_category", "update_event_details", "update_report"}: continue
                 source_ids = [value for value in dict.fromkeys(str(value) for value in item.get("source_ids", [])) if value in valid_source_ids]
-                if not source_ids: continue
-                if action_type == "create_event":
+                if not source_ids and action_type != "update_report": continue
+                if action_type == "update_report":
+                    report_id = str(item.get("report_id", "")).strip()
+                    report = db.execute("SELECT id,result_json FROM ai_analyses WHERE id=? AND tenant_id=? AND case_id=? AND status='completed'", (report_id, job["tenant_id"], job["case_id"])).fetchone()
+                    title, body = str(item.get("report_title", "")).strip()[:180], str(item.get("report_body", "")).strip()[:20_000]
+                    if not report or not body: continue
+                    previous_result = json.loads(report["result_json"])
+                    payload = {"reportId": report_id, "previousTitle": str(previous_result.get("title", "Informe")), "newTitle": title or str(previous_result.get("title", "Informe")), "previousBody": str(previous_result.get("body", previous_result.get("executiveSummary", "")))[:20_000], "newBody": body, "userProvidedClarification": True}
+                elif action_type == "create_event":
                     date_value, title, description = str(item.get("date", "")).strip(), str(item.get("title", "")).strip()[:180], str(item.get("description", "")).strip()[:3000]
                     try: datetime.strptime(date_value, "%Y-%m-%d")
                     except ValueError: continue
@@ -815,6 +841,19 @@ class CaseConfigUpdate(BaseModel):
     status: str = Field(min_length=1, max_length=80)
     mainMilestone: str
     previousModality: str = Field(default="", max_length=2000)
+
+
+class CaseCreatePayload(BaseModel):
+    caseCode: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=180)
+    status: str = Field(default="En documentaciÃ³n", min_length=1, max_length=80)
+
+
+class CaseContextUpdate(BaseModel):
+    userPosition: str = Field(default="", max_length=20_000)
+    otherPartyPosition: str = Field(default="", max_length=20_000)
+    neutralContext: str = Field(default="", max_length=20_000)
+    confirmedFacts: str = Field(default="", max_length=20_000)
 
 
 class AISettingsUpdate(BaseModel):
@@ -1035,7 +1074,22 @@ def written_whatsapp_messages(chat: sqlite3.Row) -> list[dict]:
         messages = json.loads(chat["messages_json"])
     except (TypeError, json.JSONDecodeError):
         return []
-    return [item for item in messages if isinstance(item, dict) and not item.get("system") and str(item.get("text", "")).strip() and "multimedia omitido" not in str(item.get("text", "")).lower()]
+    try:
+        audio_message_ids = {str(item.get("messageId", "")) for item in json.loads(chat["audio_matches_json"] or "[]") if isinstance(item, dict)}
+    except (TypeError, json.JSONDecodeError):
+        audio_message_ids = set()
+    result: list[dict] = []
+    for item in messages:
+        if not isinstance(item, dict) or item.get("system"): continue
+        text = str(item.get("text", "")).strip()
+        message_id = str(item.get("id", ""))
+        has_linked_audio = message_id in audio_message_ids
+        if not text and not has_linked_audio: continue
+        if "multimedia omitido" in text.lower() and not has_linked_audio: continue
+        if has_linked_audio and (not text or "multimedia omitido" in text.lower()):
+            item = {**item, "text": "[Audio vinculado; revisar transcripciÃ³n auxiliar]"}
+        result.append(item)
+    return result
 
 
 def whatsapp_message_key(item: dict) -> str:
@@ -1131,14 +1185,25 @@ def process_next_whatsapp_analysis_job() -> bool:
         return True
     except Exception as error:
         with database() as db:
-            now = utc_now(); db.execute("UPDATE whatsapp_analysis_jobs SET status='failed',stage='Requiere reintento',error_code=?,updated_at=? WHERE id=?", (type(error).__name__, now, job["id"])); db.execute("UPDATE whatsapp_analysis_state SET status='failed',updated_at=? WHERE chat_id=?", (now, job["chat_id"]))
+            now = utc_now()
+            if type(error).__name__ == "AIProviderError":
+                db.execute("UPDATE whatsapp_analysis_jobs SET status='pending',stage='Esperando disponibilidad de GroqCloud',error_code='temporary_provider_limit',updated_at=? WHERE id=?", (now, job["id"]))
+                db.execute("UPDATE whatsapp_analysis_state SET status='pending',updated_at=? WHERE chat_id=?", (now, job["chat_id"]))
+            else:
+                db.execute("UPDATE whatsapp_analysis_jobs SET status='failed',stage='Requiere reintento',error_code=?,updated_at=? WHERE id=?", (type(error).__name__, now, job["id"]))
+                db.execute("UPDATE whatsapp_analysis_state SET status='failed',updated_at=? WHERE chat_id=?", (now, job["chat_id"]))
         return True
 
 
 def whatsapp_analysis_worker() -> None:
     while not WHATSAPP_ANALYSIS_STOP.is_set():
         try:
-            if not process_next_whatsapp_analysis_job(): WHATSAPP_ANALYSIS_STOP.wait(1.5)
+            if process_next_whatsapp_analysis_job():
+                # El plan gratuito de Groq limita tokens por minuto. Una sola
+                # tanda espaciada mantiene el trabajo estable y persistente.
+                WHATSAPP_ANALYSIS_STOP.wait(65 if AI_CONFIG.provider == "groq" else 0.05)
+            else:
+                WHATSAPP_ANALYSIS_STOP.wait(1.5)
         except sqlite3.Error: WHATSAPP_ANALYSIS_STOP.wait(2)
 
 
@@ -1226,6 +1291,83 @@ def logout(request: Request):
     response = JSONResponse({"authenticated": False})
     response.delete_cookie("gore_session", secure=request_uses_https(request), httponly=True, samesite="strict", path="/")
     return response
+
+
+def case_summary(row: sqlite3.Row, active_case_id: str) -> dict:
+    return {"id": row["id"], "code": row["case_code"], "title": row["title"], "status": row["status"], "role": row["case_role"], "active": row["id"] == active_case_id, "createdAt": row["created_at"], "updatedAt": row["updated_at"]}
+
+
+@app.get("/api/cases")
+def list_cases(request: Request) -> list[dict]:
+    session = request.state.session
+    with database() as db:
+        rows = db.execute(
+            """SELECT c.*,m.role case_role FROM cases c
+               JOIN case_memberships m ON m.case_id=c.id AND m.tenant_id=c.tenant_id
+               WHERE m.tenant_id=? AND m.user_id=? ORDER BY c.updated_at DESC""",
+            (session["tenant_id"], session["user_id"]),
+        ).fetchall()
+        return [case_summary(row, session["case_id"]) for row in rows]
+
+
+@app.post("/api/cases", status_code=201)
+def create_case(payload: CaseCreatePayload, request: Request) -> dict:
+    session = request.state.session
+    code, title, status = payload.caseCode.strip(), payload.title.strip(), payload.status.strip()
+    now, case_id = utc_now(), f"CASE-{uuid.uuid4().hex[:12].upper()}"
+    with database() as db:
+        if db.execute("SELECT 1 FROM cases WHERE tenant_id=? AND lower(case_code)=lower(?)", (session["tenant_id"], code)).fetchone():
+            raise HTTPException(409, "Ya existe un legajo con ese cÃ³digo")
+        db.execute("INSERT INTO cases (id,tenant_id,case_code,title,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", (case_id, session["tenant_id"], code, title, status, session["user_id"], now, now))
+        db.execute("INSERT INTO case_memberships (tenant_id,case_id,user_id,role,created_at) VALUES (?,?,?,?,?)", (session["tenant_id"], case_id, session["user_id"], "owner", now))
+        db.execute("INSERT INTO case_config (tenant_id,case_id,case_code,title,status,main_milestone,previous_modality,updated_at) VALUES (?,?,?,?,?,?,?,?)", (session["tenant_id"], case_id, code, title, status, "", "", now))
+        db.execute("INSERT INTO case_context (tenant_id,case_id,updated_by,updated_at) VALUES (?,?,?,?)", (session["tenant_id"], case_id, session["user_id"], now))
+        audit(db, "CASE_CREATED", "case", case_id, {"case_code": code, "title": title}, {**session, "case_id": case_id})
+        row = db.execute("SELECT c.*,m.role case_role FROM cases c JOIN case_memberships m ON m.case_id=c.id AND m.user_id=? WHERE c.id=?", (session["user_id"], case_id)).fetchone()
+        return case_summary(row, session["case_id"])
+
+
+@app.post("/api/cases/{case_id}/activate")
+def activate_case(case_id: str, request: Request) -> dict:
+    session = request.state.session
+    with database() as db:
+        row = db.execute(
+            """SELECT c.*,m.role case_role FROM cases c JOIN case_memberships m
+               ON m.case_id=c.id AND m.tenant_id=c.tenant_id
+               WHERE c.id=? AND c.tenant_id=? AND m.user_id=?""",
+            (case_id, session["tenant_id"], session["user_id"]),
+        ).fetchone()
+        if not row: raise HTTPException(404, "Legajo no encontrado")
+        previous = session["case_id"]
+        session["case_id"] = case_id
+        audit(db, "CASE_ACTIVATED", "case", case_id, {"previous_case_id": previous}, session)
+        return case_summary(row, case_id)
+
+
+def case_context_dict(row: sqlite3.Row | None) -> dict:
+    return {"userPosition": row["user_position"] if row else "", "otherPartyPosition": row["other_party_position"] if row else "", "neutralContext": row["neutral_context"] if row else "", "confirmedFacts": row["confirmed_facts"] if row else "", "updatedAt": row["updated_at"] if row else ""}
+
+
+@app.get("/api/case/context")
+def get_case_context(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        row = db.execute("SELECT * FROM case_context WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone()
+        return case_context_dict(row)
+
+
+@app.put("/api/case/context")
+def update_case_context(payload: CaseContextUpdate, request: Request) -> dict:
+    with database() as db:
+        scope, now = authorized_scope(request, db), utc_now()
+        values = (payload.userPosition.strip(), payload.otherPartyPosition.strip(), payload.neutralContext.strip(), payload.confirmedFacts.strip())
+        db.execute("""INSERT INTO case_context (tenant_id,case_id,user_position,other_party_position,neutral_context,confirmed_facts,updated_by,updated_at)
+                      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id,case_id) DO UPDATE SET
+                      user_position=excluded.user_position,other_party_position=excluded.other_party_position,
+                      neutral_context=excluded.neutral_context,confirmed_facts=excluded.confirmed_facts,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+                   (scope["tenant_id"], scope["case_id"], *values, scope["user_id"], now))
+        audit(db, "CASE_CONTEXT_UPDATED", "case", scope["case_id"], {"field_lengths": [len(value) for value in values]}, scope)
+        return case_context_dict(db.execute("SELECT * FROM case_context WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone())
 
 
 @app.get("/api/workspace")
@@ -2119,12 +2261,13 @@ def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> di
         conversation_id = conversation["id"] if conversation else f"CNV-{uuid.uuid4().hex[:12].upper()}"
         if not conversation:
             db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (conversation_id, scope["tenant_id"], scope["case_id"], message[:70], scope["user_id"], now, now))
-        analyses = db.execute("SELECT analysis_type,result_json FROM ai_analyses WHERE tenant_id=? AND case_id=? AND status='completed' ORDER BY created_at DESC LIMIT 8", (scope["tenant_id"], scope["case_id"])).fetchall()
-        analysis_context = [f"{row['analysis_type']}: {row['result_json'][:900]}" for row in analyses]
+        analyses = db.execute("SELECT id,analysis_type,result_json FROM ai_analyses WHERE tenant_id=? AND case_id=? AND status='completed' ORDER BY created_at DESC LIMIT 12", (scope["tenant_id"], scope["case_id"])).fetchall()
+        analysis_context = [f"ID DE INFORME/ANÃLISIS {row['id']} Â· {row['analysis_type']}: {row['result_json'][:1600]}" for row in analyses]
         user_id, assistant_id, job_id = f"MSG-{uuid.uuid4().hex[:12].upper()}", f"MSG-{uuid.uuid4().hex[:12].upper()}", f"AIJ-{uuid.uuid4().hex[:12].upper()}"
         db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (user_id, conversation_id, scope["tenant_id"], scope["case_id"], "user", message, 1, "[]", "completed", now, now))
         db.execute("INSERT INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (assistant_id, conversation_id, scope["tenant_id"], scope["case_id"], "assistant", "", 0, "[]", "queued", now, now))
-        context_json = json.dumps({"sources": sources, "analyses": analysis_context, "attachments": attachments}, ensure_ascii=False)
+        context_row = db.execute("SELECT * FROM case_context WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone()
+        context_json = json.dumps({"sources": sources, "analyses": analysis_context, "attachments": attachments, "caseContext": case_context_dict(context_row)}, ensure_ascii=False)
         model = AI_CONFIG.model_for("quality")
         db.execute("INSERT INTO ai_chat_jobs (id,conversation_id,user_message_id,assistant_message_id,tenant_id,case_id,status,progress,stage,model,context_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, conversation_id, user_id, assistant_id, scope["tenant_id"], scope["case_id"], "pending", 20, "En cola para análisis local", model, context_json, now, now))
         db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, conversation_id))
@@ -2190,6 +2333,17 @@ def approve_ai_chat_action(proposal_id: str, request: Request) -> dict:
             db.execute("INSERT INTO event_versions (event_id,version_number,snapshot_json,changed_at,tenant_id,case_id) VALUES (?,?,?,?,?,?)", (entity_id, version, json.dumps(event_dict(current), ensure_ascii=False), now, scope["tenant_id"], scope["case_id"]))
             values = payload["new"]
             db.execute("UPDATE events SET date=?,time=?,category=?,title=?,description=?,expected=?,actual=?,updated_at=? WHERE id=? AND tenant_id=? AND case_id=?", (values["date"], values["time"], values["category"], values["title"], values["description"], values["expected"], values["actual"], now, entity_id, scope["tenant_id"], scope["case_id"]))
+        elif action_type == "update_report":
+            entity_id = payload["reportId"]
+            report = db.execute("SELECT * FROM ai_analyses WHERE id=? AND tenant_id=? AND case_id=? AND status='completed'", (entity_id, scope["tenant_id"], scope["case_id"])).fetchone()
+            if not report: raise HTTPException(404, "El informe ya no estÃ¡ disponible")
+            result = json.loads(report["result_json"])
+            db.execute("INSERT INTO ai_report_versions (report_id,tenant_id,case_id,result_json,changed_by,change_origin,created_at) VALUES (?,?,?,?,?,?,?)", (entity_id, scope["tenant_id"], scope["case_id"], report["result_json"], scope["user_id"], "ai_chat_approved", now))
+            result["title"] = payload["newTitle"]
+            result["body"] = payload["newBody"]
+            result["userProvidedClarification"] = True
+            result["lastEditedFromChatAt"] = now
+            db.execute("UPDATE ai_analyses SET result_json=?,human_review_required=1,updated_at=? WHERE id=?", (json.dumps(result, ensure_ascii=False), now, entity_id))
         else:
             raise HTTPException(422, "Acción no permitida")
         db.execute("UPDATE ai_action_proposals SET status='approved',approved_entity_id=?,updated_at=? WHERE id=?", (entity_id, now, proposal_id))
@@ -2815,6 +2969,12 @@ def start_whatsapp_incremental_analysis(chat_id: str, request: Request) -> dict:
         if segment_count and state and state["last_message_key"]:
             keys = [whatsapp_message_key(item) for item in messages]
             if state["last_message_key"] in keys: start_index = keys.index(state["last_message_key"]) + 1
+        # Si cambiÃ³ la composiciÃ³n del corpus (por ejemplo, ahora se incorporan
+        # audios vinculados que antes se omitÃ­an), el cursor histÃ³rico ya no es
+        # seguro. Rehacer el mapa evita saltar mensajes anteriores al cursor.
+        if state and start_index != int(state["analyzed_messages"]):
+            db.execute("DELETE FROM whatsapp_analysis_segments WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"]))
+            start_index = 0
         now = utc_now()
         if start_index >= len(messages):
             db.execute("UPDATE whatsapp_analysis_state SET analyzed_messages=?,total_messages=?,status='completed',updated_at=? WHERE chat_id=?", (len(messages), len(messages), now, chat_id)); state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=?", (chat_id,)).fetchone(); return whatsapp_analysis_status_dict(chat, state, None)
@@ -2823,6 +2983,15 @@ def start_whatsapp_incremental_analysis(chat_id: str, request: Request) -> dict:
         db.execute("INSERT INTO whatsapp_analysis_state (chat_id,tenant_id,case_id,last_message_key,analyzed_messages,total_messages,status,last_job_id,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET total_messages=excluded.total_messages,status=excluded.status,last_job_id=excluded.last_job_id,updated_at=excluded.updated_at", (chat_id, scope["tenant_id"], scope["case_id"], state["last_message_key"] if state else "", start_index, len(messages), "pending", job_id, now))
         audit(db, "WHATSAPP_INCREMENTAL_ANALYSIS_STARTED", "whatsapp_chat", chat_id, {"job_id": job_id, "start_index": start_index, "new_messages": len(messages) - start_index}, scope)
         return whatsapp_analysis_status_dict(chat, db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=?", (chat_id,)).fetchone(), db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE id=?", (job_id,)).fetchone())
+
+
+@app.post("/api/ai/whatsapp-analysis/start-all")
+def start_all_whatsapp_analyses(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        chat_ids = [row["id"] for row in db.execute("SELECT id FROM whatsapp_chats WHERE tenant_id=? AND case_id=? ORDER BY created_at", (scope["tenant_id"], scope["case_id"])).fetchall()]
+    items = [start_whatsapp_incremental_analysis(chat_id, request) for chat_id in chat_ids]
+    return {"started": len(items), "items": items, "pendingMessages": sum(item["pendingMessages"] for item in items)}
 
 
 @app.get("/api/evidence/{evidence_id}/transcription")

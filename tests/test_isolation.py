@@ -80,6 +80,48 @@ class IsolationTests(unittest.TestCase):
         finally:
             session["case_id"] = original_case
 
+    def test_multiple_cases_are_created_empty_and_keep_separate_context(self):
+        token = self.client.cookies.get("gore_session")
+        original_case = self.module.active_sessions[token]["case_id"]
+        created = self.client.post("/api/cases", json={"caseCode": "GORE-TEST-EMPTY", "title": "Legajo paralelo", "status": "En documentaciÃ³n"})
+        self.assertEqual(created.status_code, 201, created.text)
+        new_case = created.json()
+        self.assertFalse(new_case["active"])
+        activated = self.client.post(f"/api/cases/{new_case['id']}/activate", json={})
+        self.assertEqual(activated.status_code, 200, activated.text)
+        try:
+            self.assertEqual(self.client.get("/api/events").json(), [])
+            self.assertEqual(self.client.get("/api/evidence").json(), [])
+            self.assertEqual(self.client.get("/api/whatsapp/chats").json(), [])
+            context = {"userPosition": "Mi explicaciÃ³n", "otherPartyPosition": "Su explicaciÃ³n", "neutralContext": "Contexto comÃºn", "confirmedFacts": "Dato confirmado por mÃ­"}
+            saved = self.client.put("/api/case/context", json=context)
+            self.assertEqual(saved.status_code, 200, saved.text)
+            for key, value in context.items(): self.assertEqual(saved.json()[key], value)
+            cases = self.client.get("/api/cases").json()
+            self.assertEqual(sum(1 for item in cases if item["active"]), 1)
+            self.assertTrue(next(item for item in cases if item["id"] == new_case["id"])["active"])
+        finally:
+            self.client.post(f"/api/cases/{original_case}/activate", json={})
+        self.assertEqual(self.client.get("/api/case/context").json()["userPosition"], "")
+
+    def test_ai_report_update_requires_approval_and_preserves_version(self):
+        scope = (self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, self.module.DEFAULT_USER_ID)
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            db.execute("INSERT OR IGNORE INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-REPORT-EDIT", scope[0], scope[1], "EdiciÃ³n de informe", scope[2], now, now))
+            db.execute("INSERT OR IGNORE INTO ai_chat_messages (id,conversation_id,tenant_id,case_id,role,content,user_provided,sources_json,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-REPORT-EDIT", "CNV-REPORT-EDIT", scope[0], scope[1], "assistant", "Propuesta", 0, "[]", "completed", now, now))
+            original = '{"title":"Informe original","body":"Pregunta pendiente"}'
+            db.execute("INSERT OR REPLACE INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("RPT-EDIT-TEST", scope[0], scope[1], "chat_report", "completed", "quality", "mock", original, "[]", 1, scope[2], now, now))
+            payload = '{"reportId":"RPT-EDIT-TEST","previousTitle":"Informe original","newTitle":"Informe actualizado","previousBody":"Pregunta pendiente","newBody":"Respuesta aclarada (dato aportado por el usuario)","userProvidedClarification":true}'
+            db.execute("INSERT INTO ai_action_proposals (id,tenant_id,case_id,conversation_id,assistant_message_id,action_type,payload_json,source_ids_json,rationale,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ACT-REPORT-EDIT", scope[0], scope[1], "CNV-REPORT-EDIT", "MSG-REPORT-EDIT", "update_report", payload, "[]", "AclaraciÃ³n solicitada", "pending_review", scope[2], now, now))
+        approved = self.client.post("/api/ai/chat/actions/ACT-REPORT-EDIT/approve", json={})
+        self.assertEqual(approved.status_code, 200, approved.text)
+        with self.module.database() as db:
+            report = db.execute("SELECT result_json FROM ai_analyses WHERE id='RPT-EDIT-TEST'").fetchone()
+            versions = db.execute("SELECT COUNT(*) FROM ai_report_versions WHERE report_id='RPT-EDIT-TEST'").fetchone()[0]
+        self.assertIn("Informe actualizado", report["result_json"])
+        self.assertEqual(versions, 1)
+
     def test_ai_rate_limit_returns_safe_retry_response(self):
         original_limit = self.module.AI_RATE_MAX_REQUESTS
         self.module.AI_RATE_MAX_REQUESTS = 1

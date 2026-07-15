@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 15
+LATEST_SCHEMA_VERSION = 17
 
 
 def _utc_now() -> str:
@@ -470,6 +470,66 @@ def _migration_015_whatsapp_analysis_segments(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_016_multiple_cases_and_context(db: sqlite3.Connection) -> None:
+    now = _utc_now()
+    if _table_exists(db, "case_config") and "id" in _columns(db, "case_config"):
+        db.execute("ALTER TABLE case_config RENAME TO case_config_legacy")
+        db.executescript(
+            """
+            CREATE TABLE case_config (
+                tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+                case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                case_code TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL,
+                main_milestone TEXT NOT NULL DEFAULT '', previous_modality TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id,case_id)
+            );
+            """
+        )
+        legacy_columns = [row[1] for row in db.execute("PRAGMA table_info(case_config_legacy)").fetchall()]
+        legacy_row = db.execute("SELECT * FROM case_config_legacy LIMIT 1").fetchone()
+        legacy = dict(zip(legacy_columns, legacy_row)) if legacy_row else None
+        if legacy:
+            db.execute(
+                "INSERT INTO case_config VALUES (?,?,?,?,?,?,?,?)",
+                (legacy["tenant_id"] or DEFAULT_TENANT_ID, legacy["case_id"] or DEFAULT_CASE_ID,
+                 legacy["case_code"], legacy["title"], legacy["status"],
+                 legacy.get("main_milestone", ""), legacy.get("previous_modality", ""), legacy.get("updated_at", now)),
+            )
+        db.execute("DROP TABLE case_config_legacy")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS case_context (
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+            user_position TEXT NOT NULL DEFAULT '', other_party_position TEXT NOT NULL DEFAULT '',
+            neutral_context TEXT NOT NULL DEFAULT '', confirmed_facts TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id,case_id)
+        );
+        """
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO case_context (tenant_id,case_id,updated_by,updated_at) VALUES (?,?,?,?)",
+        (DEFAULT_TENANT_ID, DEFAULT_CASE_ID, DEFAULT_USER_ID, now),
+    )
+
+
+def _migration_017_report_versions(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ai_report_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id TEXT NOT NULL REFERENCES ai_analyses(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            result_json TEXT NOT NULL, changed_by TEXT NOT NULL REFERENCES users(id),
+            change_origin TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_report_versions_scope ON ai_report_versions(tenant_id,case_id,report_id,id);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -486,6 +546,8 @@ MIGRATIONS = {
     13: _migration_013_remote_ai_provider,
     14: _migration_014_ai_action_proposals,
     15: _migration_015_whatsapp_analysis_segments,
+    16: _migration_016_multiple_cases_and_context,
+    17: _migration_017_report_versions,
 }
 
 
