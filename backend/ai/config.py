@@ -37,14 +37,14 @@ def load_ai_config() -> AIConfig:
         profile = "balanced"
     return AIConfig(
         enabled=_env_bool("AI_FEATURE_ENABLED", True),
-        provider=os.environ.get("AI_PROVIDER", "local").strip().lower(),
+        provider=os.environ.get("AI_PROVIDER", "groq").strip().lower(),
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
         chat_models={
-            "fast": os.environ.get("OLLAMA_CHAT_MODEL_FAST", "qwen3:4b-instruct").strip(),
-            "balanced": os.environ.get("OLLAMA_CHAT_MODEL_BALANCED", "qwen3:8b").strip(),
-            "quality": os.environ.get("OLLAMA_CHAT_MODEL_QUALITY", "qwen3:14b").strip(),
+            "fast": os.environ.get("GROQ_CHAT_MODEL_FAST", "openai/gpt-oss-20b").strip(),
+            "balanced": os.environ.get("GROQ_CHAT_MODEL_BALANCED", "openai/gpt-oss-120b").strip(),
+            "quality": os.environ.get("GROQ_CHAT_MODEL_QUALITY", "openai/gpt-oss-120b").strip(),
         },
-        embedding_model=os.environ.get("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b").strip(),
+        embedding_model="gore-lexical-256",
         default_profile=profile,
         request_timeout=max(10, min(int(os.environ.get("AI_REQUEST_TIMEOUT", "420")), 600)),
         max_context_chunks=max(1, min(int(os.environ.get("AI_MAX_CONTEXT_CHUNKS", "12")), 50)),

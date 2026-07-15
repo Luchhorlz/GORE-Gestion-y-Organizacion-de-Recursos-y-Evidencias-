@@ -33,7 +33,8 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
-from backend.ai.providers import AIProviderError
+from backend.ai.providers import AIProviderError, GroqAIProvider
+from backend.secure_store import protect_secret, unprotect_secret
 from backend.ai.config import PROFILE_NAMES
 from backend.ai.agents import CHRONOLOGY_SCHEMA, CONTRADICTIONS_SCHEMA, DATES_SCHEMA, DRAFT_SCHEMA, EVIDENCE_ANALYSIS_SCHEMA, SUMMARY_SCHEMA, build_chronology_prompt, build_contradictions_prompt, build_dates_prompt, build_draft_prompt, build_evidence_analysis_prompt, build_summary_prompt, normalize_summary
 from backend.extraction import SUPPORTED_MEDIA_TYPES, chunk_text, extract_document
@@ -693,6 +694,10 @@ class AISettingsUpdate(BaseModel):
     activeProfile: str
 
 
+class GroqConnectionPayload(BaseModel):
+    apiKey: str = Field(min_length=20, max_length=300)
+
+
 class SemanticSearchPayload(BaseModel):
     query: str = Field(min_length=2, max_length=1000)
     limit: int = Field(default=8, ge=1, le=20)
@@ -1032,6 +1037,12 @@ def update_case_config(payload: CaseConfigUpdate, request: Request) -> dict:
 def ai_provider():
     if AI_CONFIG.provider == "mock":
         return MockAIProvider()
+    if AI_CONFIG.provider == "groq":
+        with database() as db:
+            row = db.execute("SELECT api_key_encrypted FROM ai_settings WHERE id=1").fetchone()
+        try: api_key = unprotect_secret(row["api_key_encrypted"]) if row and row["api_key_encrypted"] else ""
+        except OSError: api_key = ""
+        return GroqAIProvider(api_key)
     return LocalAIProvider(AI_CONFIG)
 
 
@@ -1064,7 +1075,8 @@ def ai_status_payload() -> dict:
         "activeModel": AI_CONFIG.model_for(active_profile),
         "profiles": profiles,
         "embeddingModel": AI_CONFIG.embedding_model,
-        "embeddingInstalled": AI_CONFIG.embedding_model in models,
+        "embeddingInstalled": AI_CONFIG.provider == "groq" or AI_CONFIG.embedding_model in models,
+        "configured": bool(models) if AI_CONFIG.provider == "groq" else True,
     }
 
 
@@ -1130,11 +1142,32 @@ def update_ai_settings(payload: AISettingsUpdate, request: Request) -> dict:
     status = ai_status_payload()
     selected = next(item for item in status["profiles"] if item["id"] == profile)
     if not selected["installed"]:
-        raise HTTPException(409, "El modelo seleccionado todavía no está instalado en Ollama")
+        raise HTTPException(409, "El modelo seleccionado no está disponible en el proveedor configurado")
     with database() as db:
         authorized_scope(request, db)
         db.execute("UPDATE ai_settings SET active_profile=?,updated_at=? WHERE id=1", (profile, utc_now()))
         audit(db, "AI_PROFILE_CHANGED", "ai_settings", "local", {"profile": profile, "model": selected["model"]})
+    return ai_status_payload()
+
+
+@app.put("/api/ai/groq/connect")
+def connect_groq(payload: GroqConnectionPayload, request: Request) -> dict:
+    api_key = payload.apiKey.strip()
+    if not api_key.startswith("gsk_"):
+        raise HTTPException(422, "La clave no parece pertenecer a GroqCloud")
+    provider = GroqAIProvider(api_key)
+    try:
+        models = provider.list_available_models()
+    except AIProviderError as error:
+        raise HTTPException(422, str(error)) from error
+    required = AI_CONFIG.model_for("balanced")
+    if required not in models:
+        raise HTTPException(409, "GroqCloud respondió, pero el modelo principal de GORE no está disponible")
+    encrypted = protect_secret(api_key)
+    with database() as db:
+        scope = authorized_scope(request, db)
+        db.execute("UPDATE ai_settings SET provider='groq',api_key_encrypted=?,remote_model=?,updated_at=? WHERE id=1", (encrypted, required, utc_now()))
+        audit(db, "GROQ_CONNECTED", "ai_settings", "remote", {"provider": "groq", "model": required}, scope)
     return ai_status_payload()
 
 

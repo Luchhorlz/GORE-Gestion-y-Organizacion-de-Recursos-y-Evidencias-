@@ -11,7 +11,7 @@ class AIConfigTests(unittest.TestCase):
         with patch.dict("os.environ", {"OLLAMA_CHAT_PROFILE": "invalid"}, clear=False):
             config = load_ai_config()
         self.assertEqual(config.default_profile, "balanced")
-        self.assertEqual(config.model_for("fast"), "qwen3:4b-instruct")
+        self.assertEqual(config.model_for("fast"), "openai/gpt-oss-20b")
 
     def test_mock_provider_is_predictable_and_offline(self):
         provider = MockAIProvider()

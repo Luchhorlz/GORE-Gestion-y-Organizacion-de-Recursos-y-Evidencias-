@@ -4,6 +4,9 @@ import json
 import os
 import urllib.error
 import urllib.request
+import hashlib
+import math
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
@@ -104,6 +107,68 @@ class LocalAIProvider(AIProvider):
         if len(embeddings) != len(texts):
             raise AIProviderError("Ollama devolvió una cantidad inesperada de vectores")
         return embeddings
+
+
+class GroqAIProvider(AIProvider):
+    BASE_URL = "https://api.groq.com/openai/v1"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _request(self, path: str, payload: dict[str, Any] | None = None, timeout: int = 120) -> dict[str, Any]:
+        request = urllib.request.Request(
+            self.BASE_URL + path,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method="POST" if payload is not None else "GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code == 401: raise AIProviderError("La clave de GroqCloud no es válida") from error
+            if error.code == 429: raise AIProviderError("GroqCloud alcanzó temporalmente el límite gratuito") from error
+            raise AIProviderError(f"GroqCloud devolvió un error ({error.code})") from error
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise AIProviderError("GroqCloud no está disponible o no respondió a tiempo") from error
+
+    def health_check(self) -> dict[str, Any]:
+        if not self.api_key: return {"available": False, "version": ""}
+        try:
+            self._request("/models", timeout=15)
+            return {"available": True, "version": "GroqCloud"}
+        except AIProviderError:
+            return {"available": False, "version": ""}
+
+    def list_available_models(self) -> list[str]:
+        return sorted(str(item.get("id", "")) for item in self._request("/models", timeout=20).get("data", []) if item.get("id"))
+
+    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None, timeout: int | None = None) -> str:
+        if cancel_check and cancel_check(): raise AIProviderError("Generación cancelada por el usuario")
+        result = self._request("/chat/completions", {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_completion_tokens": 1400, "reasoning_effort": "low"}, timeout or 180)
+        if cancel_check and cancel_check(): raise AIProviderError("Generación cancelada por el usuario")
+        choices = result.get("choices", [])
+        return str(choices[0].get("message", {}).get("content", "")).strip() if choices else ""
+
+    def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
+        result = self._request("/chat/completions", {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_completion_tokens": 1800, "reasoning_effort": "low", "response_format": {"type": "json_schema", "json_schema": {"name": "gore_result", "strict": False, "schema": schema}}}, 180)
+        choices = result.get("choices", [])
+        try: parsed = json.loads(str(choices[0].get("message", {}).get("content", "")))
+        except (IndexError, json.JSONDecodeError) as error: raise AIProviderError("GroqCloud no devolvió una respuesta estructurada válida") from error
+        if not isinstance(parsed, dict): raise AIProviderError("El resultado de GroqCloud no es un objeto")
+        return parsed
+
+    def create_embeddings(self, texts: list[str], model: str) -> list[list[float]]:
+        # Vector lexical local liviano: no carga modelos, GPU ni contenido en otro servicio.
+        vectors = []
+        for text in texts:
+            vector = [0.0] * 256
+            for token in re.findall(r"[\wáéíóúüñ]+", text.lower()):
+                digest = hashlib.sha256(token.encode("utf-8")).digest(); index = int.from_bytes(digest[:2], "big") % len(vector)
+                vector[index] += -1.0 if digest[2] & 1 else 1.0
+            norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+            vectors.append([value / norm for value in vector])
+        return vectors
 
 
 class MockAIProvider(AIProvider):
