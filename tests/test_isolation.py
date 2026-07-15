@@ -392,6 +392,27 @@ class IsolationTests(unittest.TestCase):
             db.execute("DELETE FROM event_versions WHERE event_id='EVT-ACTION-TEST'")
             db.execute("DELETE FROM events WHERE id='EVT-ACTION-TEST'")
 
+    def test_chat_response_can_be_saved_once_and_archived_as_report(self):
+        self.module.ai_request_times.clear()
+        now = self.module.utc_now()
+        with self.module.database() as db:
+            db.execute("INSERT INTO ai_conversations (id,tenant_id,case_id,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("CNV-REPORT-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "Resumen de prueba", self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_chat_messages VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("MSG-REPORT-TEST", "CNV-REPORT-TEST", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "assistant", "Contenido objetivo del informe", 0, "[]", "completed", now, now))
+        first = self.client.post("/api/ai/chat/messages/MSG-REPORT-TEST/save-report", json={})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post("/api/ai/chat/messages/MSG-REPORT-TEST/save-report", json={})
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json()["id"], second.json()["id"])
+        reports = self.client.get("/api/ai/reports")
+        self.assertEqual(reports.status_code, 200, reports.text)
+        self.assertEqual([item["id"] for item in reports.json()].count(first.json()["id"]), 1)
+        archived = self.client.post(f"/api/ai/reports/{first.json()['id']}/archive", json={})
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertFalse(any(item["id"] == first.json()["id"] for item in self.client.get("/api/ai/reports").json()))
+        with self.module.database() as db:
+            db.execute("DELETE FROM ai_analyses WHERE id=?", (first.json()["id"],))
+            db.execute("DELETE FROM ai_conversations WHERE id='CNV-REPORT-TEST'")
+
 
 if __name__ == "__main__":
     unittest.main()

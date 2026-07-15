@@ -1418,6 +1418,7 @@ def list_ai_analysis_history(request: Request, limit: int = 50) -> list[dict]:
         result = json.loads(row["result_json"]); sources = json.loads(row["sources_json"])
         if row["analysis_type"] == "case_summary": preview = str(result.get("executiveSummary", ""))
         elif row["analysis_type"] == "draft": preview = f"{result.get('title', '')}: {result.get('body', '')}"
+        elif row["analysis_type"] == "chat_report": preview = f"{result.get('title', '')}: {result.get('body', '')}"
         elif row["analysis_type"] == "contradictions": preview = f"{len(result.get('contradictions', []))} posibles contradicciones identificadas para revisión."
         elif row["analysis_type"] == "evidence_organization": preview = f"{len(result.get('items', []))} evidencias organizadas; {len(result.get('missingEvidence', []))} faltantes señalados."
         else: preview = "Análisis local guardado."
@@ -2045,6 +2046,47 @@ def save_ai_chat_feedback(message_id: str, payload: AIFeedbackPayload, request: 
         audit(db, "AI_RESPONSE_REVIEWED", "ai_chat_message", message_id, {"rating": payload.rating, "comment_sha256": hashlib.sha256(comment.encode("utf-8")).hexdigest() if comment else ""}, scope)
         row = db.execute("SELECT rating,comment,updated_at FROM ai_feedback WHERE tenant_id=? AND case_id=? AND target_type='chat_message' AND target_id=?", (scope["tenant_id"], scope["case_id"], message_id)).fetchone()
         return {"rating": row["rating"], "comment": row["comment"], "updatedAt": row["updated_at"]}
+
+
+@app.post("/api/ai/chat/messages/{message_id}/save-report")
+def save_ai_chat_message_as_report(message_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        message = db.execute(
+            """SELECT m.*,c.title conversation_title,j.model
+                 FROM ai_chat_messages m JOIN ai_conversations c ON c.id=m.conversation_id
+                 LEFT JOIN ai_chat_jobs j ON j.assistant_message_id=m.id
+                WHERE m.id=? AND m.tenant_id=? AND m.case_id=?""",
+            (message_id, scope["tenant_id"], scope["case_id"]),
+        ).fetchone()
+        if not message: raise HTTPException(404, "Respuesta de IA no encontrada")
+        if message["role"] != "assistant" or message["status"] != "completed" or not message["content"].strip(): raise HTTPException(409, "La respuesta todavía no puede guardarse como informe")
+        report_id = f"RPT-{message_id.removeprefix('MSG-')}"
+        existing = db.execute("SELECT * FROM ai_analyses WHERE id=? AND tenant_id=? AND case_id=?", (report_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if existing: return ai_analysis_dict(existing)
+        now = utc_now()
+        result = {"title": message["conversation_title"][:180] or "Informe interno desde el chat", "body": message["content"][:20_000], "messageId": message_id, "conversationId": message["conversation_id"], "disclaimer": "Informe interno generado por IA. Requiere revisión humana antes de compartir, presentar o utilizar como conclusión."}
+        db.execute("INSERT INTO ai_analyses (id,tenant_id,case_id,analysis_type,status,profile,model,result_json,sources_json,human_review_required,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (report_id, scope["tenant_id"], scope["case_id"], "chat_report", "completed", "quality", message["model"] or AI_CONFIG.model_for("quality"), json.dumps(result, ensure_ascii=False), message["sources_json"], 1, scope["user_id"], now, now))
+        audit(db, "AI_CHAT_REPORT_SAVED", "ai_analysis", report_id, {"message_id": message_id, "conversation_id": message["conversation_id"], "source_count": len(json.loads(message["sources_json"]))}, scope)
+        return ai_analysis_dict(db.execute("SELECT * FROM ai_analyses WHERE id=?", (report_id,)).fetchone())
+
+
+@app.get("/api/ai/reports")
+def list_ai_chat_reports(request: Request) -> list[dict]:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        rows = db.execute("SELECT * FROM ai_analyses WHERE tenant_id=? AND case_id=? AND analysis_type='chat_report' AND status='completed' ORDER BY created_at DESC", (scope["tenant_id"], scope["case_id"])).fetchall()
+        return [ai_analysis_dict(row) for row in rows]
+
+
+@app.post("/api/ai/reports/{report_id}/archive")
+def archive_ai_chat_report(report_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        updated = db.execute("UPDATE ai_analyses SET status='archived',updated_at=? WHERE id=? AND tenant_id=? AND case_id=? AND analysis_type='chat_report' AND status='completed'", (utc_now(), report_id, scope["tenant_id"], scope["case_id"])).rowcount
+        if not updated: raise HTTPException(404, "Informe activo no encontrado")
+        audit(db, "AI_CHAT_REPORT_ARCHIVED", "ai_analysis", report_id, {}, scope)
+        return {"id": report_id, "status": "archived"}
 
 
 @app.post("/api/ai/index/retry")

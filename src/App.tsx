@@ -339,6 +339,19 @@ type AIChatMessage = {
   job?: AIChatJob;
   createdAt: string;
 };
+type SavedAIReport = {
+  id: string;
+  type: "chat_report";
+  title: string;
+  body: string;
+  messageId: string;
+  conversationId: string;
+  disclaimer: string;
+  sources: AssistantCitation[];
+  model: string;
+  generatedAt: string;
+  humanReviewRequired: boolean;
+};
 type AIConversation = {
   id: string;
   title: string;
@@ -3325,6 +3338,39 @@ function AIActionCard({
   );
 }
 
+function SaveChatReportButton({ message }: { message: AIChatMessage }) {
+  const [state, setState] = useState<"idle" | "saving" | "saved" | "error">(
+    "idle",
+  );
+  if (message.role !== "assistant" || message.status !== "completed") return null;
+  async function save() {
+    setState("saving");
+    try {
+      await apiPost(`/api/ai/chat/messages/${message.id}/save-report`, {});
+      setState("saved");
+    } catch {
+      setState("error");
+    }
+  }
+  return (
+    <button
+      type="button"
+      className={`save-chat-report ${state}`}
+      disabled={state === "saving" || state === "saved"}
+      onClick={save}
+    >
+      <FileText />
+      {state === "saving"
+        ? "Guardando informe…"
+        : state === "saved"
+          ? "Guardado en Informes"
+          : state === "error"
+            ? "Reintentar guardado"
+            : "Guardar como informe interno"}
+    </button>
+  );
+}
+
 function AIChatView() {
   const [conversations, setConversations] = useState<AIConversationSummary[]>(
     [],
@@ -3732,6 +3778,7 @@ function AIChatView() {
                       key={action.id}
                     />
                   ))}
+                  <SaveChatReportButton message={item} />
                   <AIMessageFeedback
                     message={item}
                     onSaved={() => active && loadConversation(active.id)}
@@ -5145,13 +5192,21 @@ function ReportsView({
   evidence: Evidence[];
 }) {
   const [summary, setSummary] = useState<CaseSummary | null>(null);
+  const [savedReports, setSavedReports] = useState<SavedAIReport[]>([]);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState("");
   useEffect(() => {
     apiGet<{ analysis: CaseSummary | null }>("/api/ai/analyses/summary")
       .then((result) => setSummary(result.analysis))
       .catch(() => undefined);
+    apiGet<SavedAIReport[]>("/api/ai/reports")
+      .then(setSavedReports)
+      .catch(() => undefined);
   }, []);
+  async function archiveReport(id: string) {
+    await apiPost(`/api/ai/reports/${id}/archive`, {});
+    setSavedReports((items) => items.filter((item) => item.id !== id));
+  }
   async function generateSummary() {
     setSummaryLoading(true);
     setSummaryError("");
@@ -5270,6 +5325,49 @@ function ReportsView({
               El resultado quedará guardado y seguirá disponible después de
               reiniciar GORE.
             </p>
+          </div>
+        )}
+      </article>
+      <article className="panel saved-ai-reports">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow accent">DESDE EL CHAT DEL EXPEDIENTE</span>
+            <h2>Informes internos guardados</h2>
+            <p>Respuestas seleccionadas por vos, con sus fuentes y procedencia.</p>
+          </div>
+          <FileText />
+        </div>
+        {savedReports.length ? (
+          <div className="saved-ai-report-list">
+            {savedReports.map((report) => (
+              <section key={report.id}>
+                <header>
+                  <div>
+                    <strong>{report.title}</strong>
+                    <small>
+                      {format(new Date(report.generatedAt), "dd/MM/yyyy HH:mm")} ·{" "}
+                      {report.model}
+                    </small>
+                  </div>
+                  <button onClick={() => archiveReport(report.id)}>
+                    <Archive /> Archivar
+                  </button>
+                </header>
+                <p>{report.body}</p>
+                <div className="chat-sources">
+                  {report.sources.map((source) => (
+                    <AISourceReference source={source} key={source.sourceId} />
+                  ))}
+                </div>
+                <small className="report-disclaimer">{report.disclaimer}</small>
+              </section>
+            ))}
+          </div>
+        ) : (
+          <div className="vault-empty">
+            <FileText />
+            <strong>Todavía no guardaste respuestas del chat</strong>
+            <p>Usá “Guardar como informe interno” debajo de una respuesta útil.</p>
           </div>
         )}
       </article>
@@ -5444,6 +5542,7 @@ function AIHistoryView() {
     contradictions: "Posibles contradicciones",
     evidence_organization: "Organización de evidencias",
     draft: "Borrador asistido",
+    chat_report: "Informe interno desde el chat",
   };
   async function refresh() {
     setLoading(true);
