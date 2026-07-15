@@ -2561,6 +2561,7 @@ def delete_whatsapp_chat(chat_id: str, request: Request) -> dict:
 
 def whatsapp_analysis_status_dict(chat: sqlite3.Row, state: sqlite3.Row | None, job: sqlite3.Row | None, summary_segments: int = 0) -> dict:
     total = len(written_whatsapp_messages(chat)); analyzed = min(int(state["analyzed_messages"]), total) if state else 0
+    if total and summary_segments == 0 and (not job or job["status"] not in {"pending", "processing"}): analyzed = 0
     status = job["status"] if job else (state["status"] if state else "not_started")
     return {"chatId": chat["id"], "displayName": chat["display_name"], "status": status, "totalMessages": total, "analyzedMessages": analyzed, "pendingMessages": max(0, total - analyzed), "percent": 100 if total == 0 else round(analyzed / total * 100), "jobId": job["id"] if job else (state["last_job_id"] if state else None), "stage": job["stage"] if job else ("Análisis completo" if total and analyzed == total else "Pendiente"), "proposalsCreated": int(job["proposals_created"]) if job else 0, "summarySegments": summary_segments, "updatedAt": (job["updated_at"] if job else state["updated_at"] if state else chat["updated_at"])}
 
@@ -2588,7 +2589,8 @@ def start_whatsapp_incremental_analysis(chat_id: str, request: Request) -> dict:
         if active:
             state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=?", (chat_id,)).fetchone(); return whatsapp_analysis_status_dict(chat, state, active)
         messages = written_whatsapp_messages(chat); state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone(); start_index = 0
-        if state and state["last_message_key"]:
+        segment_count = db.execute("SELECT COUNT(*) FROM whatsapp_analysis_segments WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone()[0]
+        if segment_count and state and state["last_message_key"]:
             keys = [whatsapp_message_key(item) for item in messages]
             if state["last_message_key"] in keys: start_index = keys.index(state["last_message_key"]) + 1
         now = utc_now()
