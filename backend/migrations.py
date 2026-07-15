@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 12
 
 
 def _utc_now() -> str:
@@ -405,6 +405,32 @@ def _migration_011_ai_conversation_archiving(db: sqlite3.Connection) -> None:
         )
 
 
+def _migration_012_whatsapp_incremental_analysis(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_analysis_state (
+            chat_id TEXT PRIMARY KEY REFERENCES whatsapp_chats(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            last_message_key TEXT NOT NULL DEFAULT '', analyzed_messages INTEGER NOT NULL DEFAULT 0,
+            total_messages INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'not_started',
+            last_job_id TEXT, last_completed_at TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS whatsapp_analysis_jobs (
+            id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES whatsapp_chats(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            status TEXT NOT NULL, start_index INTEGER NOT NULL DEFAULT 0, cursor_index INTEGER NOT NULL DEFAULT 0,
+            total_messages INTEGER NOT NULL DEFAULT 0, processed_messages INTEGER NOT NULL DEFAULT 0,
+            proposals_created INTEGER NOT NULL DEFAULT 0, progress INTEGER NOT NULL DEFAULT 0,
+            stage TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+            started_at TEXT, completed_at TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_analysis_jobs_queue ON whatsapp_analysis_jobs(status,created_at);
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_analysis_jobs_scope ON whatsapp_analysis_jobs(tenant_id,case_id,chat_id,created_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -417,6 +443,7 @@ MIGRATIONS = {
     9: _migration_009_ai_chat,
     10: _migration_010_ai_feedback,
     11: _migration_011_ai_conversation_archiving,
+    12: _migration_012_whatsapp_incremental_analysis,
 }
 
 

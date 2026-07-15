@@ -95,6 +95,45 @@ class IsolationTests(unittest.TestCase):
         unrelated_chat_sources = [item for item in unrelated.json()["results"] if item.get("chatId") == chat_id]
         self.assertEqual(unrelated_chat_sources, [])
 
+    def test_whatsapp_analysis_is_persistent_incremental_and_resumable(self):
+        chat_id = "CHAT-INCREMENTAL-AI"
+        def messages(count):
+            return [{"id": index, "date": "15/07/2026", "time": f"12:{index % 60:02d}", "sender": "Contacto", "text": f"Mensaje escrito numero {index} sobre una entrega acordada", "system": False} for index in range(1, count + 1)]
+        def save(count):
+            response = self.client.put(f"/api/whatsapp/chats/{chat_id}", json={"id": chat_id, "displayName": "Incremental", "selfName": "Yo", "sourceType": "whatsapp_export", "rawText": "", "messages": messages(count), "audioMatches": []})
+            self.assertEqual(response.status_code, 200, response.text)
+        def wait_complete():
+            latest = None
+            for _ in range(100):
+                response = self.client.get(f"/api/ai/whatsapp-analysis/status?chatId={chat_id}")
+                self.assertEqual(response.status_code, 200, response.text); latest = response.json()["items"][0]
+                if latest["status"] == "completed": return latest
+                time.sleep(0.05)
+            self.fail(f"El análisis incremental no finalizó: {latest}")
+        save(30)
+        first = self.client.post(f"/api/ai/whatsapp-analysis/{chat_id}/start", json={})
+        self.assertEqual(first.status_code, 200, first.text)
+        completed = wait_complete()
+        self.assertEqual(completed["analyzedMessages"], 30)
+        self.assertEqual(completed["pendingMessages"], 0)
+        with self.module.database() as db:
+            first_job = db.execute("SELECT start_index,cursor_index,status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at LIMIT 1", (chat_id,)).fetchone()
+            self.assertEqual(tuple(first_job), (0, 30, "completed"))
+            db.execute("UPDATE whatsapp_analysis_jobs SET status='processing' WHERE id=(SELECT id FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at DESC LIMIT 1)", (chat_id,))
+        self.module.recover_interrupted_processing()
+        with self.module.database() as db:
+            recovered = db.execute("SELECT status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at DESC LIMIT 1", (chat_id,)).fetchone()[0]
+            self.assertEqual(recovered, "pending")
+            db.execute("UPDATE whatsapp_analysis_jobs SET status='completed' WHERE chat_id=?", (chat_id,))
+        save(35)
+        second = self.client.post(f"/api/ai/whatsapp-analysis/{chat_id}/start", json={})
+        self.assertEqual(second.status_code, 200, second.text)
+        completed = wait_complete()
+        self.assertEqual(completed["analyzedMessages"], 35)
+        with self.module.database() as db:
+            latest_job = db.execute("SELECT start_index,cursor_index,processed_messages,status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at DESC LIMIT 1", (chat_id,)).fetchone()
+            self.assertEqual(tuple(latest_job), (30, 35, 5, "completed"))
+
     def test_ai_chat_rejects_foreign_attachment(self):
         response = self.client.post("/api/ai/chat/messages", json={"message": "Analizar adjunto", "evidenceIds": ["EVD-FOREIGN"]})
         self.assertEqual(response.status_code, 404)

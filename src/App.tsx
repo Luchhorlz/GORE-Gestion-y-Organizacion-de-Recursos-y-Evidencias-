@@ -27,6 +27,7 @@ type ExtractedText = { evidenceId: string; status: string; error: string; summar
 type SemanticSearchResult = { score: number; sourceType?: 'evidence' | 'whatsapp_chat'; chatId?: string; evidenceId: string; evidenceName: string; evidenceHash: string; factDate: string; eventId?: string; sectionLabel: string; sectionIndex: number; chunkIndex: number; text: string; textHash: string; method: string }
 type SemanticSearchResponse = { query: string; model: string; indexedEvidence: number; indexedChats?: number; results: SemanticSearchResult[] }
 type AudioIndexStatus = { total: number; transcribed: number; empty: number; completed: number; indexed: number; queued: number; failed: number; percent: number; finished: boolean }
+type WhatsAppAnalysisStatus = { chatId: string; displayName: string; status: string; totalMessages: number; analyzedMessages: number; pendingMessages: number; percent: number; jobId?: string; stage: string; proposalsCreated: number; updatedAt: string }
 type AssistantCitation = SemanticSearchResult & { sourceId: string }
 type AssistantAnswer = { question: string; answer: string; insufficientEvidence: boolean; caveats: string[]; citations: AssistantCitation[]; model: string; profile: string }
 type CaseSummary = { id: string; executiveSummary: string; mainFacts: string[]; peopleInvolved: string[]; availableEvidence: string[]; missingInformation: string[]; questionsPending: string[]; confidence: number; insufficientEvidence: boolean; humanReviewRequired: boolean; sources: AssistantCitation[]; model: string; profile: string; generatedAt: string }
@@ -737,18 +738,18 @@ function WhatsAppSimulator({ evidence, onEvidence, audioProgress, prepareAllAudi
   const [savedChats, setSavedChats] = useState<StoredChatSummary[]>([])
   const [transcriptions, setTranscriptions] = useState<Record<string, AudioTranscription>>({})
   const [bulkStarting, setBulkStarting] = useState(false)
-  const [writtenAnalysis, setWrittenAnalysis] = useState({ loading: false, message: '' })
+  const [writtenAnalysis, setWrittenAnalysis] = useState<WhatsAppAnalysisStatus | null>(null)
+  const [writtenStarting, setWrittenStarting] = useState(false)
   const senders = useMemo(() => Array.from(new Set(messages.filter(message => !message.system).map(message => message.sender))), [messages])
   async function refreshSavedChats(openLatest = false) { try { const rows = await apiGet<StoredChatSummary[]>('/api/whatsapp/chats'); setSavedChats(rows); if (openLatest && rows[0]) await loadSavedChat(rows[0].id) } catch { /* modo local */ } }
-  async function analyzeWrittenMessages() {
-    setWrittenAnalysis({ loading: true, message: '' })
-    try {
-      const result = await apiPost<{ proposals: ChronologyProposal[] }>('/api/ai/chronology/generate', {})
-      setWrittenAnalysis({ loading: false, message: result.proposals.length ? `${result.proposals.length} acontecimiento${result.proposals.length === 1 ? '' : 's'} propuesto${result.proposals.length === 1 ? '' : 's'} para revisar en Herramientas IA · Cronología asistida.` : 'No se detectaron acontecimientos suficientemente respaldados en esta revisión.' })
-    } catch {
-      setWrittenAnalysis({ loading: false, message: 'No se pudo completar el análisis. Verificá que Ollama esté activo y que el chat esté guardado.' })
-    }
-  }
+  async function analyzeWrittenMessages() { if (!chatId) return; setWrittenStarting(true); try { setWrittenAnalysis(await apiPost<WhatsAppAnalysisStatus>(`/api/ai/whatsapp-analysis/${encodeURIComponent(chatId)}/start`, {})) } catch { setError('No se pudo iniciar el análisis incremental. Verificá que el chat esté guardado y Ollama activo.') } finally { setWrittenStarting(false) } }
+  useEffect(() => {
+    if (!chatId) { setWrittenAnalysis(null); return }
+    let active = true
+    const refresh = () => apiGet<{ items: WhatsAppAnalysisStatus[] }>(`/api/ai/whatsapp-analysis/status?chatId=${encodeURIComponent(chatId)}`).then(result => active && setWrittenAnalysis(result.items[0] ?? null)).catch(() => undefined)
+    refresh(); const timer = window.setInterval(refresh, 2_000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [chatId])
   async function persistChat(id: string, display: string, ownName: string, sourceRaw: string, chatMessages: ChatMessage[], matches: AudioMatch[], sourceType = 'whatsapp_export') {
     if (!id || !chatMessages.length) return
     await apiPut(`/api/whatsapp/chats/${encodeURIComponent(id)}`, { id, displayName: display || 'Contacto', selfName: ownName, sourceType, rawText: sourceRaw, messages: chatMessages, audioMatches: matches.filter(item => item.evidence).map(item => ({ messageId: item.messageId, evidenceId: item.evidence?.id, confidence: item.confidence, reason: item.reason })) })
@@ -907,7 +908,7 @@ function WhatsAppSimulator({ evidence, onEvidence, audioProgress, prepareAllAudi
   useEffect(() => { const other = senders.find(sender => sender !== self); if (other) setContactName(other) }, [self, senders])
   return <>
     <section className="page-heading compact"><div><span className="eyebrow accent">RECONSTRUCCIÓN VISUAL AUXILIAR</span><h1>Simulador de chats de WhatsApp</h1><p>Importá el ZIP o TXT original, o pegá un fragmento, para reconstruirlo visualmente sin modificar la fuente.</p></div></section>
-    <section className="wa-transcription-progress"><div className="wa-progress-head"><div><strong>Análisis de mensajes escritos</strong><span>Ollama puede leer los textos guardados, detectar hechos y proponer su ubicación cronológica.</span></div><button type="button" disabled={writtenAnalysis.loading || messages.length === 0} onClick={analyzeWrittenMessages}>{writtenAnalysis.loading ? 'Analizando…' : 'Analizar mensajes escritos'}</button></div>{writtenAnalysis.message && <small>{writtenAnalysis.message} Nada se incorpora al calendario sin tu aprobación.</small>}</section>
+    <section className="wa-transcription-progress"><div className="wa-progress-head"><div><strong>Análisis incremental de mensajes escritos</strong><span>{writtenAnalysis ? `${writtenAnalysis.analyzedMessages} de ${writtenAnalysis.totalMessages} analizados · ${writtenAnalysis.pendingMessages} nuevos o pendientes` : 'Ollama revisará el chat completo y después solamente los mensajes nuevos.'}</span></div><button type="button" disabled={writtenStarting || !chatId || messages.length === 0 || ['pending', 'processing'].includes(writtenAnalysis?.status ?? '')} onClick={analyzeWrittenMessages}>{writtenStarting ? 'Preparando…' : ['pending', 'processing'].includes(writtenAnalysis?.status ?? '') ? 'Trabajando en segundo plano' : writtenAnalysis?.pendingMessages === 0 && writtenAnalysis.totalMessages > 0 ? 'Todo actualizado' : writtenAnalysis?.status === 'failed' ? 'Reintentar análisis' : 'Analizar mensajes escritos'}</button></div>{writtenAnalysis && <><div className="wa-progress-track"><span style={{ width: `${writtenAnalysis.percent}%` }} /></div><small>{writtenAnalysis.percent}% · {writtenAnalysis.stage}{writtenAnalysis.proposalsCreated ? ` · ${writtenAnalysis.proposalsCreated} propuestas creadas` : ''}. Podés cerrar GORE; continuará al volver a iniciar el servidor. Nada pasa al calendario sin aprobación.</small></>}</section>
     {audioProgress && audioProgress.total > 0 && <section className="wa-transcription-progress"><div className="wa-progress-head"><div><strong>Transcripción de todos los audios</strong><span>{audioProgress.completed} de {audioProgress.total} procesados{audioProgress.failed ? ` · ${audioProgress.failed} requieren revisión` : ''}</span></div><button type="button" disabled={bulkStarting || audioProgress.queued > 0 || audioProgress.finished} onClick={async () => { setBulkStarting(true); try { await prepareAllAudios() } finally { setBulkStarting(false) } }}>{audioProgress.finished ? 'Completado' : audioProgress.queued ? 'Trabajando en segundo plano' : bulkStarting ? 'Preparando…' : 'Transcribir todos los audios'}</button></div><div className="wa-progress-track"><span style={{ width: `${audioProgress.percent}%` }} /></div><small>{audioProgress.percent}% · Podés cambiar de pestaña o cerrar esta página. El servidor conservará y retomará el progreso.</small></section>}
     <div className="wa-workspace">
       <aside className="panel wa-import">

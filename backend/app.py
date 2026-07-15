@@ -61,6 +61,9 @@ AI_CHAT_WORKER_STARTED = False
 AI_CHAT_WORKER_LOCK = threading.Lock()
 AI_CHAT_CANCEL_LOCK = threading.Lock()
 AI_CHAT_CANCEL_EVENTS: dict[str, threading.Event] = {}
+WHATSAPP_ANALYSIS_WORKER_LOCK = threading.Lock()
+WHATSAPP_ANALYSIS_WORKER_STARTED = False
+WHATSAPP_ANALYSIS_STOP = threading.Event()
 AI_RATE_WINDOW_SECONDS = 10 * 60
 AI_RATE_MAX_REQUESTS = 30
 AI_RATE_LOCK = threading.Lock()
@@ -637,6 +640,8 @@ def recover_interrupted_processing() -> None:
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_chat_jobs'").fetchone():
             db.execute("UPDATE ai_chat_jobs SET status='pending',progress=20,stage='Retomando tarea interrumpida',updated_at=? WHERE status='processing'", (now,))
             db.execute("UPDATE ai_chat_messages SET status='queued',updated_at=? WHERE status='processing'", (now,))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whatsapp_analysis_jobs'").fetchone():
+            db.execute("UPDATE whatsapp_analysis_jobs SET status='pending',stage='Retomando análisis interrumpido',updated_at=? WHERE status='processing'", (now,))
         if interrupted:
             audit(db, "PROCESSING_JOBS_RECOVERED", "system", "worker", {"jobs": interrupted})
 
@@ -816,12 +821,103 @@ def whatsapp_text_sources(db: sqlite3.Connection, scope: dict, query: str) -> li
     return results
 
 
+def written_whatsapp_messages(chat: sqlite3.Row) -> list[dict]:
+    try:
+        messages = json.loads(chat["messages_json"])
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [item for item in messages if isinstance(item, dict) and not item.get("system") and str(item.get("text", "")).strip() and "multimedia omitido" not in str(item.get("text", "")).lower()]
+
+
+def whatsapp_message_key(item: dict) -> str:
+    stable = "|".join(str(item.get(key, "")) for key in ("id", "date", "time", "sender", "text"))
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def process_next_whatsapp_analysis_job() -> bool:
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        job = db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE status='pending' ORDER BY created_at LIMIT 1").fetchone()
+        if not job:
+            db.rollback(); return False
+        now = utc_now()
+        if not db.execute("UPDATE whatsapp_analysis_jobs SET status='processing',stage='Preparando el siguiente bloque',started_at=COALESCE(started_at,?),updated_at=? WHERE id=? AND status='pending'", (now, now, job["id"])).rowcount:
+            db.rollback(); return False
+        db.commit()
+    scope = {"tenant_id": job["tenant_id"], "case_id": job["case_id"], "user_id": job["created_by"]}
+    try:
+        with database() as db:
+            chat = db.execute("SELECT * FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (job["chat_id"], job["tenant_id"], job["case_id"])).fetchone()
+            if not chat: raise ValueError("chat_missing")
+            messages = written_whatsapp_messages(chat)
+        cursor = min(job["cursor_index"], len(messages)); batch = messages[cursor:cursor + 24]
+        if not batch:
+            now = utc_now(); last_key = whatsapp_message_key(messages[-1]) if messages else ""
+            with database() as db:
+                db.execute("UPDATE whatsapp_analysis_jobs SET status='completed',progress=100,stage='Análisis incremental completo',completed_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
+                db.execute("INSERT INTO whatsapp_analysis_state (chat_id,tenant_id,case_id,last_message_key,analyzed_messages,total_messages,status,last_job_id,last_completed_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_message_key=excluded.last_message_key,analyzed_messages=excluded.analyzed_messages,total_messages=excluded.total_messages,status=excluded.status,last_job_id=excluded.last_job_id,last_completed_at=excluded.last_completed_at,updated_at=excluded.updated_at", (job["chat_id"], job["tenant_id"], job["case_id"], last_key, len(messages), len(messages), "completed", job["id"], now, now))
+            return True
+        text_value = "\n".join(f"{item.get('date', 'sin fecha')} {item.get('time', '')} · {item.get('sender', 'Participante')}: {str(item.get('text', '')).strip()}" for item in batch)
+        digest = hashlib.sha256(text_value.encode("utf-8")).hexdigest()
+        source = {"sourceId": "S1", "sourceType": "whatsapp_chat", "chatId": job["chat_id"], "evidenceId": "", "evidenceName": f"Chat con {chat['display_name']}", "evidenceHash": "", "factDate": str(batch[0].get("date", "")), "eventId": "", "sectionLabel": "Mensajes escritos de WhatsApp", "sectionIndex": 1, "chunkIndex": cursor // 24 + 1, "text": text_value, "textHash": digest, "method": f"{chat['source_type']}:analisis_incremental", "messageIds": [item.get("id") for item in batch]}
+        with database() as db:
+            setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone(); profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
+        raw = ai_provider().generate_structured(build_chronology_prompt(f"[S1] Fuente: {source['evidenceName']} | SHA: {digest}\n{text_value}"), AI_CONFIG.model_for(profile), CHRONOLOGY_SCHEMA)
+        created = 0; now = utc_now()
+        with database() as db:
+            for item in raw.get("events", [])[:3] if isinstance(raw.get("events"), list) else []:
+                date = str(item.get("date", "")).strip(); description = str(item.get("description", "")).strip()[:500]
+                try: datetime.strptime(date, "%Y-%m-%d")
+                except ValueError: continue
+                if not description or "S1" not in [str(value) for value in item.get("source_ids", [])]: continue
+                time_value = str(item.get("time", "")).strip()
+                if time_value and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_value): time_value = ""
+                try: certainty = max(0.0, min(float(item.get("certainty", 0)), 1.0))
+                except (TypeError, ValueError): certainty = 0.0
+                basis = str(item.get("date_basis", "inferred")); basis = basis if basis in {"explicit", "inferred", "file_date"} else "inferred"
+                proposal_id = f"CHR-{uuid.uuid4().hex[:12].upper()}"; people = [str(value).strip()[:120] for value in item.get("people", [])[:8] if str(value).strip()]
+                db.execute("INSERT INTO chronology_proposals (id,tenant_id,case_id,proposed_date,proposed_time,description,people_json,certainty,date_basis,sources_json,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, job["tenant_id"], job["case_id"], date, time_value, description, json.dumps(people, ensure_ascii=False), certainty, basis, json.dumps([source], ensure_ascii=False), "pending_review", job["created_by"], now, now)); created += 1
+            next_cursor = cursor + len(batch); complete = next_cursor >= len(messages); progress = 100 if complete else max(1, round(next_cursor / len(messages) * 100)); status = "completed" if complete else "pending"; last_key = whatsapp_message_key(messages[next_cursor - 1])
+            db.execute("UPDATE whatsapp_analysis_jobs SET status=?,cursor_index=?,processed_messages=?,proposals_created=proposals_created+?,progress=?,stage=?,completed_at=?,updated_at=? WHERE id=?", (status, next_cursor, next_cursor - job["start_index"], created, progress, "Análisis incremental completo" if complete else f"{next_cursor} de {len(messages)} mensajes revisados", now if complete else None, now, job["id"]))
+            db.execute("INSERT INTO whatsapp_analysis_state (chat_id,tenant_id,case_id,last_message_key,analyzed_messages,total_messages,status,last_job_id,last_completed_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_message_key=excluded.last_message_key,analyzed_messages=excluded.analyzed_messages,total_messages=excluded.total_messages,status=excluded.status,last_job_id=excluded.last_job_id,last_completed_at=excluded.last_completed_at,updated_at=excluded.updated_at", (job["chat_id"], job["tenant_id"], job["case_id"], last_key, next_cursor, len(messages), status, job["id"], now if complete else None, now))
+            audit(db, "WHATSAPP_TEXT_BATCH_ANALYZED", "whatsapp_chat", job["chat_id"], {"job_id": job["id"], "from": cursor, "to": next_cursor, "proposals": created, "complete": complete}, scope)
+        return True
+    except Exception as error:
+        with database() as db:
+            now = utc_now(); db.execute("UPDATE whatsapp_analysis_jobs SET status='failed',stage='Requiere reintento',error_code=?,updated_at=? WHERE id=?", (type(error).__name__, now, job["id"])); db.execute("UPDATE whatsapp_analysis_state SET status='failed',updated_at=? WHERE chat_id=?", (now, job["chat_id"]))
+        return True
+
+
+def whatsapp_analysis_worker() -> None:
+    while not WHATSAPP_ANALYSIS_STOP.is_set():
+        try:
+            if not process_next_whatsapp_analysis_job(): WHATSAPP_ANALYSIS_STOP.wait(1.5)
+        except sqlite3.Error: WHATSAPP_ANALYSIS_STOP.wait(2)
+
+
+def start_whatsapp_analysis_worker() -> None:
+    global WHATSAPP_ANALYSIS_WORKER_STARTED
+    with WHATSAPP_ANALYSIS_WORKER_LOCK:
+        if WHATSAPP_ANALYSIS_WORKER_STARTED: return
+        WHATSAPP_ANALYSIS_WORKER_STARTED = True
+        WHATSAPP_ANALYSIS_STOP.clear()
+        threading.Thread(target=whatsapp_analysis_worker, name="gore-whatsapp-analysis-worker", daemon=True).start()
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_database()
     recover_interrupted_processing()
     start_processing_worker()
     start_ai_chat_worker()
+    start_whatsapp_analysis_worker()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    global WHATSAPP_ANALYSIS_WORKER_STARTED
+    WHATSAPP_ANALYSIS_STOP.set()
+    WHATSAPP_ANALYSIS_WORKER_STARTED = False
 
 
 @app.get("/api/health")
@@ -2146,6 +2242,47 @@ def delete_whatsapp_chat(chat_id: str, request: Request) -> dict:
         if not db.execute("SELECT 1 FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone(): raise HTTPException(404, "Conversación no encontrada")
         db.execute("DELETE FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])); audit(db, "WHATSAPP_CHAT_REMOVED", "whatsapp_chat", chat_id)
     return {"deleted": True}
+
+
+def whatsapp_analysis_status_dict(chat: sqlite3.Row, state: sqlite3.Row | None, job: sqlite3.Row | None) -> dict:
+    total = len(written_whatsapp_messages(chat)); analyzed = min(int(state["analyzed_messages"]), total) if state else 0
+    status = job["status"] if job else (state["status"] if state else "not_started")
+    return {"chatId": chat["id"], "displayName": chat["display_name"], "status": status, "totalMessages": total, "analyzedMessages": analyzed, "pendingMessages": max(0, total - analyzed), "percent": 100 if total == 0 else round(analyzed / total * 100), "jobId": job["id"] if job else (state["last_job_id"] if state else None), "stage": job["stage"] if job else ("Análisis completo" if total and analyzed == total else "Pendiente"), "proposalsCreated": int(job["proposals_created"]) if job else 0, "updatedAt": (job["updated_at"] if job else state["updated_at"] if state else chat["updated_at"])}
+
+
+@app.get("/api/ai/whatsapp-analysis/status")
+def whatsapp_analysis_status(request: Request, chatId: str | None = None) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db); params: list = [scope["tenant_id"], scope["case_id"]]; sql = "SELECT * FROM whatsapp_chats WHERE tenant_id=? AND case_id=?"
+        if chatId: sql += " AND id=?"; params.append(chatId)
+        chats = db.execute(sql + " ORDER BY updated_at DESC", params).fetchall(); items = []
+        for chat in chats:
+            state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()
+            job = db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE chat_id=? AND tenant_id=? AND case_id=? ORDER BY created_at DESC LIMIT 1", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()
+            items.append(whatsapp_analysis_status_dict(chat, state, job))
+        return {"items": items, "totalChats": len(items), "completeChats": sum(1 for item in items if item["totalMessages"] == item["analyzedMessages"] and item["totalMessages"] > 0), "pendingMessages": sum(item["pendingMessages"] for item in items)}
+
+
+@app.post("/api/ai/whatsapp-analysis/{chat_id}/start")
+def start_whatsapp_incremental_analysis(chat_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db); chat = db.execute("SELECT * FROM whatsapp_chats WHERE id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not chat: raise HTTPException(404, "Conversación no encontrada")
+        active = db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE chat_id=? AND tenant_id=? AND case_id=? AND status IN ('pending','processing') ORDER BY created_at DESC LIMIT 1", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if active:
+            state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=?", (chat_id,)).fetchone(); return whatsapp_analysis_status_dict(chat, state, active)
+        messages = written_whatsapp_messages(chat); state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat_id, scope["tenant_id"], scope["case_id"])).fetchone(); start_index = 0
+        if state and state["last_message_key"]:
+            keys = [whatsapp_message_key(item) for item in messages]
+            if state["last_message_key"] in keys: start_index = keys.index(state["last_message_key"]) + 1
+        now = utc_now()
+        if start_index >= len(messages):
+            db.execute("UPDATE whatsapp_analysis_state SET analyzed_messages=?,total_messages=?,status='completed',updated_at=? WHERE chat_id=?", (len(messages), len(messages), now, chat_id)); state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=?", (chat_id,)).fetchone(); return whatsapp_analysis_status_dict(chat, state, None)
+        job_id = f"WAJ-{uuid.uuid4().hex[:12].upper()}"
+        db.execute("INSERT INTO whatsapp_analysis_jobs (id,chat_id,tenant_id,case_id,status,start_index,cursor_index,total_messages,processed_messages,proposals_created,progress,stage,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, chat_id, scope["tenant_id"], scope["case_id"], "pending", start_index, start_index, len(messages), 0, 0, round(start_index / len(messages) * 100), f"{len(messages) - start_index} mensajes nuevos en espera", scope["user_id"], now, now))
+        db.execute("INSERT INTO whatsapp_analysis_state (chat_id,tenant_id,case_id,last_message_key,analyzed_messages,total_messages,status,last_job_id,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET total_messages=excluded.total_messages,status=excluded.status,last_job_id=excluded.last_job_id,updated_at=excluded.updated_at", (chat_id, scope["tenant_id"], scope["case_id"], state["last_message_key"] if state else "", start_index, len(messages), "pending", job_id, now))
+        audit(db, "WHATSAPP_INCREMENTAL_ANALYSIS_STARTED", "whatsapp_chat", chat_id, {"job_id": job_id, "start_index": start_index, "new_messages": len(messages) - start_index}, scope)
+        return whatsapp_analysis_status_dict(chat, db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=?", (chat_id,)).fetchone(), db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE id=?", (job_id,)).fetchone())
 
 
 @app.get("/api/evidence/{evidence_id}/transcription")

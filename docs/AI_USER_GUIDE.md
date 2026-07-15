@@ -4,7 +4,9 @@
 
 Los mensajes de texto guardados en el simulador también pueden ser utilizados por las herramientas de IA. GORE conserva el chat en su tabla original y genera fragmentos auxiliares con contacto, fecha, hora, remitente y huella SHA-256; no los convierte en archivos originales ficticios.
 
-En el simulador, “Analizar mensajes escritos” busca posibles acontecimientos y los deja en “Herramientas IA > Cronología asistida”. Ninguna propuesta se incorpora al calendario hasta que una persona la aprueba. Los avisos de sistema y las etiquetas de multimedia omitida no se analizan como declaraciones.
+En el simulador, “Analizar mensajes escritos” recorre la conversación completa en bloques persistentes de 24 mensajes. La pantalla muestra analizados, pendientes, porcentaje y propuestas creadas. Si GORE se reinicia, el trabajo se retoma; cuando el chat recibe mensajes posteriores, el próximo análisis comienza después del último mensaje ya revisado.
+
+Los posibles acontecimientos quedan en “Herramientas IA > Cronología asistida”. Ninguna propuesta se incorpora al calendario hasta que una persona la aprueba. Los avisos de sistema y las etiquetas de multimedia omitida no se analizan como declaraciones.
 
 El módulo se utilizará dentro de un expediente. Cada resultado mostrará el modelo empleado, fuentes y advertencias de revisión.
 
