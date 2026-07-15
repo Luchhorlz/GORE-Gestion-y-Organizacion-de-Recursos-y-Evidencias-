@@ -485,6 +485,14 @@ type AIOperationsStatus = {
   }[];
   generatedAt: string;
 };
+type SecurityStatus = {
+  databaseIntegrity: "ok" | "review_required";
+  automaticBackups: number;
+  latestBackup: { name: string; size: number; updatedAt: string } | null;
+  evidence: { total: number; verified: number };
+  groqKeyProtected: boolean;
+  generatedAt: string;
+};
 type AISourcePreview = {
   sourceId: string;
   sourceType?: "evidence" | "whatsapp_chat";
@@ -6274,6 +6282,18 @@ function SettingsView({
     repeatPassword: "",
   });
   const [passwordMessage, setPasswordMessage] = useState("");
+  const [security, setSecurity] = useState<SecurityStatus | null>(null);
+  const [backupMessage, setBackupMessage] = useState("");
+  const [backupLoading, setBackupLoading] = useState(false);
+  const refreshSecurity = () =>
+    apiGet<SecurityStatus>("/api/security/status")
+      .then(setSecurity)
+      .catch(() => setBackupMessage("No pudimos comprobar la seguridad del almacenamiento."));
+  useEffect(() => {
+    apiGet<SecurityStatus>("/api/security/status")
+      .then(setSecurity)
+      .catch(() => setBackupMessage("No pudimos comprobar la seguridad del almacenamiento."));
+  }, []);
   const update = (key: keyof CaseConfig, value: string) =>
     setForm((prev) => ({ ...prev, [key]: value }));
   async function saveCase(event: React.FormEvent) {
@@ -6309,6 +6329,19 @@ function SettingsView({
       setPasswordMessage(
         "No se pudo cambiar. Revisá la contraseña actual y usá al menos 6 caracteres.",
       );
+    }
+  }
+  async function createBackup() {
+    setBackupLoading(true);
+    setBackupMessage("Creando y verificando la copia…");
+    try {
+      await apiPost("/api/security/backup", {});
+      await refreshSecurity();
+      setBackupMessage("Copia verificada correctamente.");
+    } catch {
+      setBackupMessage("No se pudo crear la copia de seguridad.");
+    } finally {
+      setBackupLoading(false);
     }
   }
   return (
@@ -6450,6 +6483,44 @@ function SettingsView({
             <LogOut size={16} /> Cerrar esta sesión
           </button>
         </form>
+        <article className="panel settings-card security-storage-card">
+          <div className="panel-head">
+            <div>
+              <h2>Integridad y copias de seguridad</h2>
+              <p>Control verificable del almacenamiento interno de GORE</p>
+            </div>
+            <FolderLock />
+          </div>
+          <div className="security-storage-grid">
+            <div>
+              <span>Base de datos</span>
+              <strong>{security?.databaseIntegrity === "ok" ? "Íntegra" : "Requiere revisión"}</strong>
+            </div>
+            <div>
+              <span>Copias automáticas</span>
+              <strong>{security?.automaticBackups ?? "—"}</strong>
+            </div>
+            <div>
+              <span>Evidencias verificadas</span>
+              <strong>{security ? `${security.evidence.verified} de ${security.evidence.total}` : "—"}</strong>
+            </div>
+            <div>
+              <span>Clave de GroqCloud</span>
+              <strong>{security?.groqKeyProtected ? "Protegida por Windows" : "Sin configurar"}</strong>
+            </div>
+          </div>
+          {security?.latestBackup && (
+            <small className="security-backup-detail">
+              Última copia: {format(new Date(security.latestBackup.updatedAt), "dd/MM/yyyy HH:mm")} · {Math.max(1, Math.round(security.latestBackup.size / 1024))} KB
+            </small>
+          )}
+          <div className="settings-actions">
+            <span>{backupMessage || "GORE crea una copia diaria al iniciar el servidor y conserva las 14 más recientes."}</span>
+            <button className="primary-button" type="button" disabled={backupLoading} onClick={createBackup}>
+              <Archive size={16} /> {backupLoading ? "Creando…" : "Crear copia ahora"}
+            </button>
+          </div>
+        </article>
       </div>
     </>
   );

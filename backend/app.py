@@ -69,11 +69,14 @@ AI_RATE_WINDOW_SECONDS = 10 * 60
 AI_RATE_MAX_REQUESTS = 30
 AI_RATE_LOCK = threading.Lock()
 ai_request_times: dict[str, list[float]] = {}
+RUNTIME_BACKUP_DIR = DATA_DIR / "backups" / "runtime"
+RUNTIME_BACKUP_RETENTION = 14
 
 
 @asynccontextmanager
 async def application_lifespan(_app: FastAPI):
     init_database()
+    create_runtime_database_backup()
     recover_interrupted_processing()
     start_processing_worker()
     start_ai_chat_worker()
@@ -128,7 +131,16 @@ async def require_private_session(request: Request, call_next):
                     return JSONResponse({"detail": "Alcanzaste el límite temporal de herramientas IA. Esperá unos minutos antes de volver a intentar."}, status_code=429, headers={"Retry-After": str(retry_after)})
                 recent.append(now)
                 ai_request_times[rate_key] = recent
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 
 @contextmanager
@@ -145,6 +157,38 @@ def database():
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def request_uses_https(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or forwarded_proto == "https"
+
+
+def create_runtime_database_backup(force: bool = False) -> Path:
+    """Create a consistent SQLite snapshot and validate it before retention."""
+    RUNTIME_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S" if force else "%Y%m%d")
+    target = RUNTIME_BACKUP_DIR / f"gore-runtime-{stamp}.db"
+    if target.is_file() and not force:
+        return target
+    temporary = target.with_suffix(".db.tmp")
+    temporary.unlink(missing_ok=True)
+    source = sqlite3.connect(DB_PATH)
+    destination = sqlite3.connect(temporary)
+    try:
+        source.backup(destination)
+        destination.commit()
+        check = destination.execute("PRAGMA integrity_check").fetchone()
+        if not check or check[0] != "ok":
+            raise sqlite3.DatabaseError("La copia de seguridad no superó la verificación de integridad")
+    finally:
+        destination.close()
+        source.close()
+    os.replace(temporary, target)
+    backups = sorted(RUNTIME_BACKUP_DIR.glob("gore-runtime-*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for expired in backups[RUNTIME_BACKUP_RETENTION:]:
+        expired.unlink(missing_ok=True)
+    return target
 
 
 def authorized_scope(request: Request, db: sqlite3.Connection) -> dict:
@@ -1108,6 +1152,38 @@ def health() -> dict:
     return {"status": "ok", "service": "GORE API"}
 
 
+@app.get("/api/security/status")
+def security_status(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        quick_check = db.execute("PRAGMA quick_check").fetchone()[0]
+        evidence = db.execute("SELECT COUNT(*) total,SUM(CASE WHEN processing_status='ready' THEN 1 ELSE 0 END) verified FROM evidence WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone()
+        encrypted_key = db.execute("SELECT length(api_key_encrypted) size FROM ai_settings WHERE id=1").fetchone()
+    backups = sorted(RUNTIME_BACKUP_DIR.glob("gore-runtime-*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+    latest = backups[0] if backups else None
+    return {
+        "databaseIntegrity": "ok" if quick_check == "ok" else "review_required",
+        "automaticBackups": len(backups),
+        "latestBackup": {"name": latest.name, "size": latest.stat().st_size, "updatedAt": datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc).isoformat()} if latest else None,
+        "evidence": {"total": int(evidence["total"] or 0), "verified": int(evidence["verified"] or 0)},
+        "groqKeyProtected": bool(encrypted_key and int(encrypted_key["size"] or 0) > 0),
+        "generatedAt": utc_now(),
+    }
+
+
+@app.post("/api/security/backup")
+def create_security_backup(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+    try:
+        backup = create_runtime_database_backup(force=True)
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(503, "No se pudo crear una copia de seguridad verificada") from error
+    with database() as db:
+        audit(db, "DATABASE_BACKUP_CREATED", "backup", backup.name, {"size": backup.stat().st_size, "integrity": "ok"}, scope)
+    return {"created": True, "name": backup.name, "size": backup.stat().st_size, "integrity": "ok", "createdAt": datetime.fromtimestamp(backup.stat().st_mtime, timezone.utc).isoformat()}
+
+
 @app.get("/api/auth/status")
 def auth_status(request: Request) -> dict:
     token = request.cookies.get("gore_session", "")
@@ -1135,7 +1211,7 @@ def login(payload: LoginRequest, request: Request):
         active_sessions[token] = {"expires_at": now + SESSION_SECONDS, "tenant_id": DEFAULT_TENANT_ID, "user_id": DEFAULT_USER_ID, "case_id": DEFAULT_CASE_ID}
         audit(db, "LOGIN_SUCCESS", "session", token[:10])
     response = JSONResponse({"authenticated": True})
-    response.set_cookie("gore_session", token, httponly=True, samesite="strict", max_age=8 * 60 * 60)
+    response.set_cookie("gore_session", token, httponly=True, secure=request_uses_https(request), samesite="strict", max_age=SESSION_SECONDS, path="/")
     return response
 
 
@@ -1143,7 +1219,7 @@ def login(payload: LoginRequest, request: Request):
 def logout(request: Request):
     active_sessions.pop(request.cookies.get("gore_session", ""), None)
     response = JSONResponse({"authenticated": False})
-    response.delete_cookie("gore_session")
+    response.delete_cookie("gore_session", secure=request_uses_https(request), httponly=True, samesite="strict", path="/")
     return response
 
 

@@ -21,6 +21,7 @@ class IsolationTests(unittest.TestCase):
         cls.client = cls.client_context.__enter__()
         password_file = Path(cls.temp.name) / "CONTRASENA_INICIAL.txt"
         password = next(line.split(":", 1)[1].strip() for line in password_file.read_text(encoding="utf-8").splitlines() if line.startswith("Contraseña:"))
+        cls.password = password
         response = cls.client.post("/api/auth/login", json={"password": password})
         assert response.status_code == 200, response.text
         with app_module.database() as db:
@@ -45,6 +46,23 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/events/EVT-FOREIGN").status_code, 404)
         self.assertEqual(self.client.get("/api/evidence/EVD-FOREIGN/download").status_code, 404)
         self.assertEqual(self.client.get("/api/whatsapp/chats/CHAT-FOREIGN").status_code, 404)
+
+    def test_security_headers_secure_cookie_and_verified_backup(self):
+        health = self.client.get("/api/health")
+        self.assertEqual(health.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(health.headers["x-frame-options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", health.headers["content-security-policy"])
+        secure_login = self.client.post("/api/auth/login", json={"password": self.password}, headers={"X-Forwarded-Proto": "https"})
+        self.assertIn("Secure", secure_login.headers["set-cookie"])
+        self.client.post("/api/auth/login", json={"password": self.password})
+        status = self.client.get("/api/security/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["databaseIntegrity"], "ok")
+        self.assertGreaterEqual(status.json()["automaticBackups"], 1)
+        backup = self.client.post("/api/security/backup", json={})
+        self.assertEqual(backup.status_code, 200, backup.text)
+        self.assertEqual(backup.json()["integrity"], "ok")
+        self.assertTrue((Path(self.temp.name) / "backups" / "runtime" / backup.json()["name"]).is_file())
 
     def test_session_without_membership_is_rejected(self):
         token = self.client.cookies.get("gore_session")
