@@ -1130,7 +1130,7 @@ def certify_whatsapp_analysis(db: sqlite3.Connection, chat_id: str, tenant_id: s
 def process_next_whatsapp_analysis_job() -> bool:
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
-        job = db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE status='pending' ORDER BY created_at LIMIT 1").fetchone()
+        job = db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE status='pending' ORDER BY updated_at,created_at LIMIT 1").fetchone()
         if not job:
             db.rollback(); return False
         now = utc_now()
