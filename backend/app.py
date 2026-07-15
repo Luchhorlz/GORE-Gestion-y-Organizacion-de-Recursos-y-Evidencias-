@@ -1157,13 +1157,13 @@ def connect_groq(payload: GroqConnectionPayload, request: Request) -> dict:
     if len(api_key) < 20:
         raise HTTPException(422, "La clave no parece pertenecer a GroqCloud")
     provider = GroqAIProvider(api_key)
+    required = AI_CONFIG.model_for("balanced")
     try:
-        models = provider.list_available_models()
+        verification = provider.generate("Respondé solamente con la palabra OK.", required, timeout=30)
     except AIProviderError as error:
         raise HTTPException(422, str(error)) from error
-    required = AI_CONFIG.model_for("balanced")
-    if required not in models:
-        raise HTTPException(409, "GroqCloud respondió, pero el modelo principal de GORE no está disponible")
+    if not verification:
+        raise HTTPException(409, "GroqCloud no devolvió una respuesta durante la verificación")
     encrypted = protect_secret(api_key)
     with database() as db:
         scope = authorized_scope(request, db)
