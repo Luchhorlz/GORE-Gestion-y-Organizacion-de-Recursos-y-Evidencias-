@@ -39,6 +39,7 @@ export async function apiUpload<T>(path: string, file: File, eventId?: string, f
 }
 
 export function evidenceDownloadUrl(id: string) {
+  if (!id) return '#whatsapp-chat'
   return `${API_BASE}/api/evidence/${encodeURIComponent(id)}/download`
 }
 

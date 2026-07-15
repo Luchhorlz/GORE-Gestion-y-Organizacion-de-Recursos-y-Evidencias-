@@ -24,8 +24,8 @@ type EventItem = {
 }
 type Evidence = { id: string; name: string; size: number; type: string; hash: string; addedAt: string; eventId?: string; factDate?: string; chatMessageRef?: string; matchConfidence?: string; matchDetails?: string; processingStatus?: string; detectedType?: string; processingError?: string; extractionStatus?: string; extractionError?: string; embeddingStatus?: string; embeddingError?: string }
 type ExtractedText = { evidenceId: string; status: string; error: string; summary: { character_count: number; section_count: number; engine: string; source_sha256: string } | null; chunks: { section_label: string; section_index: number; chunk_index: number; text: string; text_sha256: string; extraction_method: string }[] }
-type SemanticSearchResult = { score: number; evidenceId: string; evidenceName: string; evidenceHash: string; factDate: string; eventId?: string; sectionLabel: string; sectionIndex: number; chunkIndex: number; text: string; textHash: string; method: string }
-type SemanticSearchResponse = { query: string; model: string; indexedEvidence: number; results: SemanticSearchResult[] }
+type SemanticSearchResult = { score: number; sourceType?: 'evidence' | 'whatsapp_chat'; chatId?: string; evidenceId: string; evidenceName: string; evidenceHash: string; factDate: string; eventId?: string; sectionLabel: string; sectionIndex: number; chunkIndex: number; text: string; textHash: string; method: string }
+type SemanticSearchResponse = { query: string; model: string; indexedEvidence: number; indexedChats?: number; results: SemanticSearchResult[] }
 type AudioIndexStatus = { total: number; transcribed: number; empty: number; completed: number; indexed: number; queued: number; failed: number; percent: number; finished: boolean }
 type AssistantCitation = SemanticSearchResult & { sourceId: string }
 type AssistantAnswer = { question: string; answer: string; insufficientEvidence: boolean; caveats: string[]; citations: AssistantCitation[]; model: string; profile: string }
@@ -50,7 +50,7 @@ type StoredChat = Omit<StoredChatSummary, 'messageCount' | 'audioCount'> & { raw
 type AudioTranscription = { evidence_id: string; text: string; status: string; language: string; engine: string; updated_at: string }
 type AIStatus = { enabled: boolean; provider: string; available: boolean; version: string; activeProfile: string; activeModel: string; profiles: { id: string; model: string; installed: boolean }[]; embeddingModel: string; embeddingInstalled: boolean }
 type AIOperationsStatus = { ollamaAvailable: boolean; activeModel: string; processingJobs: Record<'pending' | 'processing' | 'completed' | 'failed', number>; chatJobs: Record<'pending' | 'processing' | 'completed' | 'failed', number>; averageChatSeconds: number; evidence: { total: number; extracting: number; failed: number }; completedAnalyses: number; reviewedResponses: number; latestChatJobs: { id: string; status: string; progress: number; stage: string; model: string; createdAt: string; updatedAt: string }[]; generatedAt: string }
-type AISourcePreview = { sourceId: string; evidenceId: string; evidenceName: string; sectionLabel?: string; text?: string; textHash?: string; method?: string }
+type AISourcePreview = { sourceId: string; sourceType?: 'evidence' | 'whatsapp_chat'; chatId?: string; evidenceId: string; evidenceName: string; sectionLabel?: string; text?: string; textHash?: string; method?: string }
 type AIHistoryItem = { id: string; type: string; status: string; profile: string; model: string; preview: string; sourceCount: number; sources: AISourcePreview[]; humanReviewRequired: boolean; generatedAt: string }
 type Workspace = { tenant: { id: string; name: string }; user: { id: string; displayName: string; role: string }; case: { id: string; code: string; title: string; status: string; role: string } }
 
@@ -502,7 +502,7 @@ function DraftsView() {
 }
 
 function AISourceReference({ source }: { source: AISourcePreview }) {
-  return <details className="ai-source-reference"><summary><span>{source.sourceId}</span>{source.evidenceName}</summary><div><strong>{source.sectionLabel || 'Fragmento utilizado por la IA'}</strong>{source.text ? <p>{source.text}</p> : <p>La vista previa textual no está disponible para esta fuente. Revisá el archivo original.</p>}{source.textHash && <code title={source.textHash}>SHA-256 del fragmento: {source.textHash}</code>}<footer><small>{source.method ? `Extracción local: ${source.method}` : 'Fuente preservada en la bóveda'}</small><a href={evidenceDownloadUrl(source.evidenceId)}><Download /> Abrir original</a></footer></div></details>
+  return <details className="ai-source-reference"><summary><span>{source.sourceId}</span>{source.evidenceName}</summary><div><strong>{source.sectionLabel || 'Fragmento utilizado por la IA'}</strong>{source.text ? <p>{source.text}</p> : <p>La vista previa textual no está disponible para esta fuente.</p>}{source.textHash && <code title={source.textHash}>SHA-256 del fragmento: {source.textHash}</code>}<footer><small>{source.sourceType === 'whatsapp_chat' ? 'Mensajes escritos preservados en el simulador' : source.method ? `Extracción local: ${source.method}` : 'Fuente preservada en la bóveda'}</small>{source.evidenceId && <a href={evidenceDownloadUrl(source.evidenceId)}><Download /> Abrir original</a>}</footer></div></details>
 }
 
 function AIMessageFeedback({ message, onSaved }: { message: AIChatMessage; onSaved: () => void }) {
@@ -737,8 +737,18 @@ function WhatsAppSimulator({ evidence, onEvidence, audioProgress, prepareAllAudi
   const [savedChats, setSavedChats] = useState<StoredChatSummary[]>([])
   const [transcriptions, setTranscriptions] = useState<Record<string, AudioTranscription>>({})
   const [bulkStarting, setBulkStarting] = useState(false)
+  const [writtenAnalysis, setWrittenAnalysis] = useState({ loading: false, message: '' })
   const senders = useMemo(() => Array.from(new Set(messages.filter(message => !message.system).map(message => message.sender))), [messages])
   async function refreshSavedChats(openLatest = false) { try { const rows = await apiGet<StoredChatSummary[]>('/api/whatsapp/chats'); setSavedChats(rows); if (openLatest && rows[0]) await loadSavedChat(rows[0].id) } catch { /* modo local */ } }
+  async function analyzeWrittenMessages() {
+    setWrittenAnalysis({ loading: true, message: '' })
+    try {
+      const result = await apiPost<{ proposals: ChronologyProposal[] }>('/api/ai/chronology/generate', {})
+      setWrittenAnalysis({ loading: false, message: result.proposals.length ? `${result.proposals.length} acontecimiento${result.proposals.length === 1 ? '' : 's'} propuesto${result.proposals.length === 1 ? '' : 's'} para revisar en Herramientas IA · Cronología asistida.` : 'No se detectaron acontecimientos suficientemente respaldados en esta revisión.' })
+    } catch {
+      setWrittenAnalysis({ loading: false, message: 'No se pudo completar el análisis. Verificá que Ollama esté activo y que el chat esté guardado.' })
+    }
+  }
   async function persistChat(id: string, display: string, ownName: string, sourceRaw: string, chatMessages: ChatMessage[], matches: AudioMatch[], sourceType = 'whatsapp_export') {
     if (!id || !chatMessages.length) return
     await apiPut(`/api/whatsapp/chats/${encodeURIComponent(id)}`, { id, displayName: display || 'Contacto', selfName: ownName, sourceType, rawText: sourceRaw, messages: chatMessages, audioMatches: matches.filter(item => item.evidence).map(item => ({ messageId: item.messageId, evidenceId: item.evidence?.id, confidence: item.confidence, reason: item.reason })) })
@@ -897,6 +907,7 @@ function WhatsAppSimulator({ evidence, onEvidence, audioProgress, prepareAllAudi
   useEffect(() => { const other = senders.find(sender => sender !== self); if (other) setContactName(other) }, [self, senders])
   return <>
     <section className="page-heading compact"><div><span className="eyebrow accent">RECONSTRUCCIÓN VISUAL AUXILIAR</span><h1>Simulador de chats de WhatsApp</h1><p>Importá el ZIP o TXT original, o pegá un fragmento, para reconstruirlo visualmente sin modificar la fuente.</p></div></section>
+    <section className="wa-transcription-progress"><div className="wa-progress-head"><div><strong>Análisis de mensajes escritos</strong><span>Ollama puede leer los textos guardados, detectar hechos y proponer su ubicación cronológica.</span></div><button type="button" disabled={writtenAnalysis.loading || messages.length === 0} onClick={analyzeWrittenMessages}>{writtenAnalysis.loading ? 'Analizando…' : 'Analizar mensajes escritos'}</button></div>{writtenAnalysis.message && <small>{writtenAnalysis.message} Nada se incorpora al calendario sin tu aprobación.</small>}</section>
     {audioProgress && audioProgress.total > 0 && <section className="wa-transcription-progress"><div className="wa-progress-head"><div><strong>Transcripción de todos los audios</strong><span>{audioProgress.completed} de {audioProgress.total} procesados{audioProgress.failed ? ` · ${audioProgress.failed} requieren revisión` : ''}</span></div><button type="button" disabled={bulkStarting || audioProgress.queued > 0 || audioProgress.finished} onClick={async () => { setBulkStarting(true); try { await prepareAllAudios() } finally { setBulkStarting(false) } }}>{audioProgress.finished ? 'Completado' : audioProgress.queued ? 'Trabajando en segundo plano' : bulkStarting ? 'Preparando…' : 'Transcribir todos los audios'}</button></div><div className="wa-progress-track"><span style={{ width: `${audioProgress.percent}%` }} /></div><small>{audioProgress.percent}% · Podés cambiar de pestaña o cerrar esta página. El servidor conservará y retomará el progreso.</small></section>}
     <div className="wa-workspace">
       <aside className="panel wa-import">

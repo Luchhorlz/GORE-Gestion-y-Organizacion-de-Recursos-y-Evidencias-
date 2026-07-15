@@ -71,6 +71,30 @@ class IsolationTests(unittest.TestCase):
             self.module.AI_RATE_MAX_REQUESTS = original_limit
             self.module.ai_request_times.clear()
 
+    def test_written_whatsapp_messages_are_searchable_ai_sources(self):
+        chat_id = "CHAT-WRITTEN-AI"
+        saved = self.client.put(f"/api/whatsapp/chats/{chat_id}", json={
+            "id": chat_id, "displayName": "Contacto de prueba", "selfName": "Yo",
+            "sourceType": "whatsapp_export", "rawText": "",
+            "messages": [
+                {"id": 1, "date": "14/07/2026", "time": "18:20", "sender": "Contacto", "text": "Confirmo la entrega escolar del martes", "system": False},
+                {"id": 2, "date": "14/07/2026", "time": "18:21", "sender": "Sistema", "text": "Multimedia omitido", "system": True},
+            ], "audioMatches": [],
+        })
+        self.assertEqual(saved.status_code, 200, saved.text)
+        result = self.client.post("/api/ai/search", json={"query": "entrega escolar martes", "limit": 8})
+        self.assertEqual(result.status_code, 200, result.text)
+        chat_sources = [item for item in result.json()["results"] if item.get("sourceType") == "whatsapp_chat" and item.get("chatId") == chat_id]
+        self.assertTrue(chat_sources)
+        self.assertIn("Confirmo la entrega escolar", chat_sources[0]["text"])
+        self.assertNotIn("Multimedia omitido", chat_sources[0]["text"])
+        self.assertEqual(chat_sources[0]["evidenceId"], "")
+        self.assertEqual(len(chat_sources[0]["textHash"]), 64)
+        self.assertGreaterEqual(result.json()["indexedChats"], 1)
+        unrelated = self.client.post("/api/ai/search", json={"query": "insulto", "limit": 8})
+        unrelated_chat_sources = [item for item in unrelated.json()["results"] if item.get("chatId") == chat_id]
+        self.assertEqual(unrelated_chat_sources, [])
+
     def test_ai_chat_rejects_foreign_attachment(self):
         response = self.client.post("/api/ai/chat/messages", json={"message": "Analizar adjunto", "evidenceIds": ["EVD-FOREIGN"]})
         self.assertEqual(response.status_code, 404)

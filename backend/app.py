@@ -760,6 +760,62 @@ def whatsapp_chat_dict(row: sqlite3.Row, include_content: bool = True) -> dict:
     return result
 
 
+def whatsapp_text_sources(db: sqlite3.Connection, scope: dict, query: str) -> list[dict]:
+    """Build traceable search chunks from written WhatsApp messages.
+
+    Chats remain preserved in their own table: these are derived reading aids,
+    not synthetic evidence files.  System notices and omitted-media labels are
+    excluded because they are not written statements by either participant.
+    """
+    query_terms = {
+        term for term in re.findall(r"[\wáéíóúüñ]+", query.lower())
+        if len(term) > 2 and term not in {"para", "como", "con", "del", "las", "los", "una", "que", "por", "sobre"}
+    }
+    analysis_terms = {"fechas", "horarios", "acontecimientos", "entregas", "comunicaciones", "acuerdos", "hechos", "personas", "conflictos", "evidencia", "compromisos"}
+    broad_agent_query = len(query_terms & analysis_terms) >= 2
+    rows = db.execute(
+        "SELECT id,display_name,source_type,messages_json,updated_at FROM whatsapp_chats WHERE tenant_id=? AND case_id=? ORDER BY updated_at DESC",
+        (scope["tenant_id"], scope["case_id"]),
+    ).fetchall()
+    results: list[dict] = []
+    for row in rows:
+        try:
+            messages = json.loads(row["messages_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        written = [
+            item for item in messages if isinstance(item, dict) and not item.get("system")
+            and str(item.get("text", "")).strip()
+            and "multimedia omitido" not in str(item.get("text", "")).lower()
+        ]
+        for chunk_index in range(0, len(written), 12):
+            group = written[chunk_index:chunk_index + 12]
+            lines = [
+                f"{item.get('date', 'sin fecha')} {item.get('time', '')} · {item.get('sender', 'Participante')}: {str(item.get('text', '')).strip()}"
+                for item in group
+            ]
+            text_value = "\n".join(lines).strip()
+            if not text_value:
+                continue
+            lowered = text_value.lower()
+            matches = sum(1 for term in query_terms if term in lowered)
+            # Broad case agents must inspect the chat corpus. Interactive
+            # searches, however, need an actual word match to prevent neutral
+            # messages from appearing for queries such as "insulto".
+            score = min(0.92, (0.56 + matches * 0.09) if broad_agent_query else matches * 0.50)
+            first_date = str(group[0].get("date", "")).strip()
+            digest = hashlib.sha256(text_value.encode("utf-8")).hexdigest()
+            results.append({
+                "score": round(score, 6), "sourceType": "whatsapp_chat", "chatId": row["id"],
+                "evidenceId": "", "evidenceName": f"Chat con {row['display_name']}", "evidenceHash": "",
+                "factDate": first_date, "eventId": "", "sectionLabel": "Mensajes escritos de WhatsApp",
+                "sectionIndex": 1, "chunkIndex": chunk_index // 12 + 1, "text": text_value,
+                "textHash": digest, "method": f"{row['source_type']}:mensajes_guardados",
+                "messageIds": [item.get("id") for item in group],
+            })
+    return results
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_database()
@@ -991,9 +1047,19 @@ def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
     query = payload.query.strip()
     with database() as db:
         scope = authorized_scope(request, db)
+        chat_results = whatsapp_text_sources(db, scope, query)
+        indexed_chats = db.execute("SELECT COUNT(*) FROM whatsapp_chats WHERE tenant_id=? AND case_id=? AND messages_json<>'[]'", (scope["tenant_id"], scope["case_id"])).fetchone()[0]
+        indexed_evidence = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND embedding_status='ready'", (scope["tenant_id"], scope["case_id"])).fetchone()[0]
     try:
         query_vector = ai_provider().create_embeddings([query], AI_CONFIG.embedding_model)[0]
     except (AIProviderError, IndexError, ValueError) as error:
+        if chat_results:
+            chat_results.sort(key=lambda item: item["score"], reverse=True)
+            selected = [item for item in chat_results if item["score"] >= SEMANTIC_MIN_SCORE][:payload.limit]
+            with database() as db:
+                scope = authorized_scope(request, db)
+                audit(db, "SEMANTIC_SEARCH_EXECUTED", "case", scope["case_id"], {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(), "results": len(selected), "model": "whatsapp_text_lexical", "embedding_unavailable": True}, scope)
+            return {"query": query, "model": "whatsapp_text_lexical", "indexedEvidence": indexed_evidence, "indexedChats": indexed_chats, "minimumScore": SEMANTIC_MIN_SCORE, "results": selected}
         raise HTTPException(503, "La búsqueda local no está disponible. Comprobá que Ollama y el modelo de embeddings estén activos") from error
     query_vector = [float(value) for value in query_vector]
     query_norm = math.sqrt(sum(value * value for value in query_vector))
@@ -1009,7 +1075,7 @@ def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
                WHERE x.tenant_id=? AND x.case_id=? AND x.model=? AND e.embedding_status='ready'""",
             (scope["tenant_id"], scope["case_id"], AI_CONFIG.embedding_model),
         ).fetchall()
-        results = []
+        results = list(chat_results)
         for row in rows:
             if row["dimensions"] != len(query_vector) or row["vector_norm"] <= 0:
                 continue
@@ -1017,6 +1083,7 @@ def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
             score = sum(left * float(right) for left, right in zip(query_vector, vector)) / (query_norm * row["vector_norm"])
             results.append({
                 "score": round(max(-1.0, min(1.0, score)), 6),
+                "sourceType": "evidence",
                 "evidenceId": row["evidence_id"], "evidenceName": row["original_name"], "evidenceHash": row["evidence_sha256"],
                 "factDate": row["fact_date"], "eventId": row["event_id"], "sectionLabel": row["section_label"],
                 "sectionIndex": row["section_index"], "chunkIndex": row["chunk_index"], "text": row["text"],
@@ -1025,8 +1092,7 @@ def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
         results.sort(key=lambda item: item["score"], reverse=True)
         selected = [item for item in results if item["score"] >= SEMANTIC_MIN_SCORE][:payload.limit]
         audit(db, "SEMANTIC_SEARCH_EXECUTED", "case", scope["case_id"], {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(), "results": len(selected), "model": AI_CONFIG.embedding_model}, scope)
-        indexed_evidence = db.execute("SELECT COUNT(*) FROM evidence WHERE tenant_id=? AND case_id=? AND embedding_status='ready'", (scope["tenant_id"], scope["case_id"])).fetchone()[0]
-        return {"query": query, "model": AI_CONFIG.embedding_model, "indexedEvidence": indexed_evidence, "minimumScore": SEMANTIC_MIN_SCORE, "results": selected}
+        return {"query": query, "model": AI_CONFIG.embedding_model, "indexedEvidence": indexed_evidence, "indexedChats": indexed_chats, "minimumScore": SEMANTIC_MIN_SCORE, "results": selected}
 
 
 @app.post("/api/ai/ask")
@@ -1138,6 +1204,7 @@ def list_ai_analysis_history(request: Request, limit: int = 50) -> list[dict]:
             "preview": re.sub(r"\s+", " ", preview).strip()[:320], "sourceCount": len(sources),
             "sources": [{
                 "sourceId": item.get("sourceId", ""), "evidenceId": item.get("evidenceId", ""), "evidenceName": item.get("evidenceName", ""),
+                "sourceType": item.get("sourceType", "evidence"), "chatId": item.get("chatId", ""),
                 "sectionLabel": item.get("sectionLabel", ""), "text": str(item.get("text", ""))[:1400], "textHash": item.get("textHash", ""), "method": item.get("method", ""),
             } for item in sources],
             "humanReviewRequired": bool(row["human_review_required"]), "generatedAt": row["created_at"],
@@ -1210,7 +1277,7 @@ def list_chronology_proposals(request: Request) -> list[dict]:
 
 @app.post("/api/ai/chronology/generate")
 def generate_chronology_proposals(request: Request) -> dict:
-    retrieval = semantic_search(SemanticSearchPayload(query="fechas horarios acontecimientos entregas comunicaciones acuerdos", limit=2), request)
+    retrieval = semantic_search(SemanticSearchPayload(query="fechas horarios acontecimientos entregas comunicaciones acuerdos", limit=4), request)
     sources = retrieval["results"]
     if not sources:
         raise HTTPException(422, "Todavía no hay evidencias indexadas suficientes para proponer una cronología")
@@ -1219,7 +1286,7 @@ def generate_chronology_proposals(request: Request) -> dict:
         setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone()
         profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
     source_map = {f"S{index}": source for index, source in enumerate(sources, start=1)}
-    context = "\n\n".join(f"[{sid}] Archivo: {source['evidenceName']} | Fecha del archivo: {source['factDate'] or 'sin fecha'} | SHA: {source['textHash']}\n{source['text'][:1000]}" for sid, source in source_map.items())
+    context = "\n\n".join(f"[{sid}] Fuente: {source['evidenceName']} | Fecha registrada: {source['factDate'] or 'sin fecha'} | SHA del fragmento: {source['textHash']}\n{source['text'][:1000]}" for sid, source in source_map.items())
     model = AI_CONFIG.model_for(profile)
     try:
         raw = ai_provider().generate_structured(build_chronology_prompt(context), model, CHRONOLOGY_SCHEMA)
