@@ -18,7 +18,6 @@ def _env_bool(name: str, default: bool) -> bool:
 class AIConfig:
     enabled: bool
     provider: str
-    ollama_base_url: str
     chat_models: dict[str, str]
     embedding_model: str
     default_profile: str
@@ -32,13 +31,12 @@ class AIConfig:
 
 
 def load_ai_config() -> AIConfig:
-    profile = os.environ.get("OLLAMA_CHAT_PROFILE", "balanced").strip().lower()
+    profile = os.environ.get("AI_CHAT_PROFILE", "balanced").strip().lower()
     if profile not in PROFILE_NAMES:
         profile = "balanced"
     return AIConfig(
         enabled=_env_bool("AI_FEATURE_ENABLED", True),
         provider=os.environ.get("AI_PROVIDER", "groq").strip().lower(),
-        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
         chat_models={
             "fast": os.environ.get("GROQ_CHAT_MODEL_FAST", "openai/gpt-oss-20b").strip(),
             "balanced": os.environ.get("GROQ_CHAT_MODEL_BALANCED", "openai/gpt-oss-120b").strip(),

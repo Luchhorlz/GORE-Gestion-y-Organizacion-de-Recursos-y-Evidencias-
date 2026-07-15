@@ -462,7 +462,8 @@ type AIStatus = {
   embeddingInstalled: boolean;
 };
 type AIOperationsStatus = {
-  ollamaAvailable: boolean;
+  providerAvailable: boolean;
+  provider: string;
   activeModel: string;
   processingJobs: Record<
     "pending" | "processing" | "completed" | "failed",
@@ -1452,7 +1453,7 @@ function DatesView({
       setProposals((previous) => [...result.proposals, ...previous]);
     } catch {
       setError(
-        "No se pudieron detectar fechas. Verificá las evidencias indexadas y que Ollama esté activo.",
+        "No se pudieron detectar fechas. Verificá las evidencias indexadas y la conexión con GroqCloud.",
       );
     } finally {
       setLoading(false);
@@ -1621,7 +1622,7 @@ function ChronologyAIView({
       setProposals((previous) => [...result.proposals, ...previous]);
     } catch {
       setError(
-        "No se pudieron generar propuestas. Verificá Ollama y las evidencias indexadas.",
+        "No se pudieron generar propuestas. Verificá GroqCloud y las evidencias indexadas.",
       );
     } finally {
       setLoading(false);
@@ -2091,7 +2092,7 @@ function EvidenceView({
       );
     } catch {
       setSemanticError(
-        "No se pudo realizar la búsqueda. Comprobá que Ollama esté activo y que existan documentos indexados.",
+        "No se pudo realizar la búsqueda. Comprobá que existan documentos indexados e intentá nuevamente.",
       );
     } finally {
       setSemanticLoading(false);
@@ -2530,7 +2531,7 @@ function AIAssistantView({
       setQuestion("");
     } catch {
       setError(
-        "No se pudo generar la respuesta. Comprobá que Ollama esté activo e intentá nuevamente.",
+        "No se pudo generar la respuesta. Comprobá la conexión con GroqCloud e intentá nuevamente.",
       );
     } finally {
       setLoading(false);
@@ -2669,7 +2670,7 @@ function EvidenceAnalysisView() {
       );
     } catch {
       setError(
-        "No se pudo organizar la evidencia. Verificá que existan archivos indexados y que Ollama esté activo.",
+        "No se pudo organizar la evidencia. Verificá que existan archivos indexados y que GroqCloud esté conectado.",
       );
     } finally {
       setLoading(false);
@@ -2830,7 +2831,7 @@ function ContradictionsView() {
       );
     } catch {
       setError(
-        "No se pudo completar la comparación. Se necesitan al menos dos evidencias distintas indexadas y Ollama activo.",
+        "No se pudo completar la comparación. Se necesitan al menos dos evidencias distintas indexadas y GroqCloud conectado.",
       );
     } finally {
       setLoading(false);
@@ -2986,7 +2987,7 @@ function DraftsView() {
       setInstructions("");
     } catch {
       setError(
-        "No se pudo generar el borrador. Revisá las indicaciones, las evidencias indexadas y Ollama.",
+        "No se pudo generar el borrador. Revisá las indicaciones, las evidencias indexadas y GroqCloud.",
       );
     } finally {
       setLoading(false);
@@ -3494,7 +3495,7 @@ function AIChatView() {
       refreshList();
     } catch {
       setError(
-        "No se pudo subir algún adjunto o poner el mensaje en la cola local. Revisá el archivo, Ollama e intentá nuevamente.",
+        "No se pudo subir algún adjunto o poner el mensaje en espera. Revisá el archivo y la conexión con GroqCloud.",
       );
     } finally {
       setSending(false);
@@ -3537,7 +3538,7 @@ function AIChatView() {
       );
       refreshList();
     } catch {
-      setError("No se pudo reintentar. Comprobá que Ollama esté activo.");
+      setError("No se pudo reintentar. Comprobá la conexión con GroqCloud.");
     } finally {
       setSending(false);
     }
@@ -5393,7 +5394,7 @@ function ReportsView({
               ))}
             </div>
             <small className="summary-date">
-              Generado localmente el{" "}
+              Generado con asistencia de IA el{" "}
               {format(
                 new Date(summary.generatedAt),
                 "dd/MM/yyyy 'a las' HH:mm",
@@ -5784,7 +5785,7 @@ function AIHistoryView() {
           </span>
           <h1>Historial de análisis</h1>
           <p>
-            Consultá resultados ya guardados sin volver a ocupar Ollama ni
+            Consultá resultados guardados sin consumir nuevas solicitudes ni
             modificar el expediente.
           </p>
         </div>
@@ -5917,11 +5918,11 @@ function AIOperationsView() {
     <>
       <section className="page-heading compact with-action">
         <div>
-          <span className="eyebrow accent">CONTROL LOCAL Y PRIVADO</span>
+          <span className="eyebrow accent">CONTROL DE SERVICIOS Y TAREAS</span>
           <h1>Estado de la IA</h1>
           <p>
-            Comprobá qué está haciendo Ollama, cuántas tareas quedan pendientes
-            y si algún archivo necesita atención.
+            Comprobá qué está haciendo GroqCloud, cuántas tareas quedan
+            pendientes y si algún archivo necesita atención.
           </p>
         </div>
         <button className="primary-button" onClick={refresh}>
@@ -5932,14 +5933,14 @@ function AIOperationsView() {
       <section className="summary-grid ai-operations-summary">
         <article className="summary-card">
           <div
-            className={`summary-icon ${status?.ollamaAvailable ? "green" : "amber"}`}
+            className={`summary-icon ${status?.providerAvailable ? "green" : "amber"}`}
           >
             <Sparkles />
           </div>
           <div>
-            <span>Ollama</span>
+            <span>GroqCloud</span>
             <strong>
-              {status?.ollamaAvailable ? "Conectado" : "Sin conexión"}
+              {status?.providerAvailable ? "Conectado" : "Sin conexión"}
             </strong>
             <small>{status?.activeModel ?? "Comprobando modelo…"}</small>
           </div>
@@ -6004,7 +6005,7 @@ function AIOperationsView() {
         <article className="panel ai-operations-card">
           <div className="panel-head">
             <div>
-              <h2>Últimas respuestas de Ollama</h2>
+              <h2>Últimas respuestas de la IA</h2>
               <p>El estado se actualiza automáticamente cada 5 segundos</p>
             </div>
             <Clock3 />
@@ -6146,7 +6147,7 @@ function GroqConnectCard() {
 
 function AISettingsCard() {
   const [status, setStatus] = useState<AIStatus | null>(null);
-  const [message, setMessage] = useState("Comprobando Ollama…");
+  const [message, setMessage] = useState("Comprobando GroqCloud…");
   const labels: Record<string, { name: string; description: string }> = {
     fast: { name: "Rápido", description: "Clasificación y tareas sencillas" },
     balanced: {
@@ -6164,11 +6165,11 @@ function AISettingsCard() {
       setStatus(result);
       setMessage(
         result.available
-          ? `Ollama ${result.version} disponible`
-          : "Ollama no está disponible en esta computadora.",
+          ? `${result.version} disponible`
+          : "GroqCloud no está conectado.",
       );
     } catch {
-      setMessage("No pudimos consultar el estado de la IA local.");
+      setMessage("No pudimos consultar el estado de GroqCloud.");
     }
   }
   useEffect(() => {
@@ -6183,17 +6184,17 @@ function AISettingsCard() {
       setStatus(result);
       setMessage(`Perfil ${labels[profile]?.name.toLowerCase()} activado.`);
     } catch {
-      setMessage("No se pudo activar ese modelo. Verificá que esté instalado.");
+      setMessage("No se pudo activar ese perfil. Verificá la conexión con GroqCloud.");
     }
   }
   return (
     <section className="panel settings-card ai-settings-card">
       <div className="panel-head">
         <div>
-          <h2>Inteligencia artificial local</h2>
+          <h2>Perfiles de inteligencia artificial</h2>
           <p>
-            Elegí el nivel de análisis. Los documentos permanecen en esta
-            computadora.
+            Elegí el nivel de análisis según la tarea. GORE envía únicamente el
+            contexto necesario al proveedor configurado.
           </p>
         </div>
         <Sparkles />
@@ -6202,7 +6203,7 @@ function AISettingsCard() {
         <span />
         <div>
           <strong>
-            {status?.available ? "Ollama conectado" : "IA local no disponible"}
+            {status?.available ? "GroqCloud conectado" : "GroqCloud no disponible"}
           </strong>
           <small>{message}</small>
         </div>

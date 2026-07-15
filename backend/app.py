@@ -32,7 +32,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from backend.ai import LocalAIProvider, MockAIProvider, load_ai_config
+from backend.ai import MockAIProvider, load_ai_config
 from backend.ai.providers import AIProviderError, GroqAIProvider
 from backend.secure_store import protect_secret, unprotect_secret
 from backend.ai.config import PROFILE_NAMES
@@ -520,7 +520,7 @@ def ai_chat_progress_ticker(job_id: str, stop: threading.Event) -> None:
         progress = min(90, progress + 2)
         elapsed_minutes = max(1, round((time.monotonic() - started) / 60))
         with database() as db:
-            db.execute("UPDATE ai_chat_jobs SET progress=?,stage=?,updated_at=? WHERE id=? AND status='processing'", (progress, f"Ollama sigue analizando · {elapsed_minutes} min", utc_now(), job_id))
+            db.execute("UPDATE ai_chat_jobs SET progress=?,stage=?,updated_at=? WHERE id=? AND status='processing'", (progress, f"GroqCloud sigue analizando · {elapsed_minutes} min", utc_now(), job_id))
 
 
 def process_next_ai_chat_job() -> bool:
@@ -588,7 +588,7 @@ CONVERSACIÓN:
 """
     stop = threading.Event(); ticker = threading.Thread(target=ai_chat_progress_ticker, args=(job["id"], stop), daemon=True); ticker.start()
     try:
-        with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=50,stage='Analizando con el modelo local',updated_at=? WHERE id=?", (utc_now(), job["id"]))
+        with database() as db: db.execute("UPDATE ai_chat_jobs SET progress=50,stage='Analizando con GroqCloud',updated_at=? WHERE id=?", (utc_now(), job["id"]))
         generation_started = time.perf_counter()
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
         context_size = 4_096 if len(prompt) <= 11_000 else 8_192 if len(prompt) <= 25_000 else 16_384
@@ -1220,7 +1220,7 @@ def ai_provider():
         try: api_key = unprotect_secret(row["api_key_encrypted"]) if row and row["api_key_encrypted"] else ""
         except OSError: api_key = ""
         return GroqAIProvider(api_key)
-    return LocalAIProvider(AI_CONFIG)
+    raise RuntimeError(f"Proveedor de IA no compatible: {AI_CONFIG.provider}")
 
 
 def ai_status_payload() -> dict:
@@ -1301,7 +1301,7 @@ def get_ai_operations_status(request: Request) -> dict:
     status = ai_status_payload()
     counts = lambda row: {key: int(row[key] or 0) for key in ("pending", "processing", "completed", "failed")}
     return {
-        "ollamaAvailable": status["available"], "activeModel": status["activeModel"],
+        "providerAvailable": status["available"], "provider": status["provider"], "activeModel": status["activeModel"],
         "processingJobs": counts(processing), "chatJobs": counts(chats),
         "averageChatSeconds": round(float(chats["average_seconds"] or 0), 1),
         "evidence": {"total": int(evidence["total"] or 0), "extracting": int(evidence["extracting"] or 0), "failed": int(evidence["failed"] or 0)},
@@ -1367,11 +1367,11 @@ def semantic_search(payload: SemanticSearchPayload, request: Request) -> dict:
                 scope = authorized_scope(request, db)
                 audit(db, "SEMANTIC_SEARCH_EXECUTED", "case", scope["case_id"], {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(), "results": len(selected), "model": "whatsapp_text_lexical", "embedding_unavailable": True}, scope)
             return {"query": query, "model": "whatsapp_text_lexical", "indexedEvidence": indexed_evidence, "indexedChats": indexed_chats, "minimumScore": SEMANTIC_MIN_SCORE, "results": selected}
-        raise HTTPException(503, "La búsqueda local no está disponible. Comprobá que Ollama y el modelo de embeddings estén activos") from error
+        raise HTTPException(503, "La búsqueda inteligente no está disponible en este momento") from error
     query_vector = [float(value) for value in query_vector]
     query_norm = math.sqrt(sum(value * value for value in query_vector))
     if not query_vector or query_norm <= 0:
-        raise HTTPException(503, "El modelo local no pudo interpretar la consulta")
+        raise HTTPException(503, "La búsqueda inteligente no pudo interpretar la consulta")
     with database() as db:
         rows = db.execute(
             """SELECT x.vector_json,x.vector_norm,x.dimensions,c.text,c.text_sha256,c.section_label,c.section_index,c.chunk_index,c.extraction_method,
@@ -1464,7 +1464,7 @@ FUENTES:
     try:
         generated = ai_provider().generate_structured(prompt, model, schema)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo generar la respuesta local") from error
+        raise HTTPException(503, "GroqCloud no pudo generar la respuesta en este momento") from error
     cited_ids = []
     for source_id in generated.get("source_ids", []):
         if source_id in source_map and source_id not in cited_ids:
@@ -1551,7 +1551,7 @@ def generate_case_summary(request: Request) -> dict:
     try:
         raw = ai_provider().generate_structured(build_summary_prompt(context), model, SUMMARY_SCHEMA)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo generar el resumen local") from error
+        raise HTTPException(503, "GroqCloud no pudo generar el resumen en este momento") from error
     result = normalize_summary(raw, set(source_map))
     cited_sources = [{"sourceId": source_id, **source_map[source_id]} for source_id in result["sourceIds"]]
     analysis_id, now = f"ANL-{uuid.uuid4().hex[:12].upper()}", utc_now()
@@ -1600,7 +1600,7 @@ def generate_chronology_proposals(request: Request) -> dict:
     try:
         raw = ai_provider().generate_structured(build_chronology_prompt(context), model, CHRONOLOGY_SCHEMA)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo generar las propuestas cronológicas") from error
+        raise HTTPException(503, "GroqCloud no pudo generar las propuestas cronológicas") from error
     accepted: list[dict] = []
     now = utc_now()
     with database() as db:
@@ -1691,7 +1691,7 @@ def generate_contradictions_analysis(request: Request) -> dict:
     try:
         raw = ai_provider().generate_structured(build_contradictions_prompt(context), model, CONTRADICTIONS_SCHEMA)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo comparar las evidencias localmente") from error
+        raise HTTPException(503, "GroqCloud no pudo comparar las evidencias en este momento") from error
     contradictions: list[dict] = []
     cited_ids: list[str] = []
     for item in raw.get("contradictions", [])[:3] if isinstance(raw.get("contradictions"), list) else []:
@@ -1751,7 +1751,7 @@ def generate_evidence_analysis(request: Request) -> dict:
     try:
         raw = ai_provider().generate_structured(build_evidence_analysis_prompt(context), model, EVIDENCE_ANALYSIS_SCHEMA)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo organizar las evidencias localmente") from error
+        raise HTTPException(503, "GroqCloud no pudo organizar las evidencias en este momento") from error
     items: list[dict] = []
     cited_ids: list[str] = []
     classification_map = {"favorable": "favorable", "favourable": "favorable", "unfavorable": "desfavorable", "unfavourable": "desfavorable", "desfavorable": "desfavorable", "neutral": "neutral"}
@@ -1812,7 +1812,7 @@ def generate_date_proposals(request: Request) -> dict:
     try:
         raw = ai_provider().generate_structured(build_dates_prompt(context), model, DATES_SCHEMA)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo detectar fechas localmente") from error
+        raise HTTPException(503, "GroqCloud no pudo detectar fechas en este momento") from error
     accepted: list[dict] = []; now = utc_now()
     allowed_types = {"audiencia", "presentación", "pago", "citación", "compromiso", "entrega", "fecha contractual"}
     warning = "Propuesta auxiliar: confirmar fecha, alcance y posible cómputo con un profesional antes de incorporarla al calendario."
@@ -1902,13 +1902,13 @@ def generate_ai_draft(payload: AIDraftPayload, request: Request) -> dict:
     try:
         raw = ai_provider().generate_structured(build_draft_prompt(draft_types[payload.draftType], payload.instructions.strip(), context), model, DRAFT_SCHEMA)
     except AIProviderError as error:
-        raise HTTPException(503, "Ollama no pudo generar el borrador local") from error
+        raise HTTPException(503, "GroqCloud no pudo generar el borrador en este momento") from error
     source_ids = list(dict.fromkeys(str(value) for value in raw.get("source_ids", []) if str(value) in source_map)) if isinstance(raw.get("source_ids"), list) else []
     if not source_ids:
         raise HTTPException(422, "El modelo no pudo respaldar el borrador con fuentes válidas")
     def clean_list(value: object, limit: int = 8) -> list[str]:
         return [str(item).strip()[:400] for item in value[:limit] if str(item).strip()] if isinstance(value, list) else []
-    result = {"draftType": payload.draftType, "draftTypeLabel": draft_types[payload.draftType], "title": str(raw.get("title", "")).strip()[:200] or draft_types[payload.draftType], "body": str(raw.get("body", "")).strip()[:12_000], "unconfirmedInformation": clean_list(raw.get("unconfirmed_information")), "reviewFields": clean_list(raw.get("review_fields")), "sourceIds": source_ids, "humanReviewRequired": True, "disclaimer": "Borrador generado localmente. Debe ser revisado antes de copiar, exportar, enviar o presentar."}
+    result = {"draftType": payload.draftType, "draftTypeLabel": draft_types[payload.draftType], "title": str(raw.get("title", "")).strip()[:200] or draft_types[payload.draftType], "body": str(raw.get("body", "")).strip()[:12_000], "unconfirmedInformation": clean_list(raw.get("unconfirmed_information")), "reviewFields": clean_list(raw.get("review_fields")), "sourceIds": source_ids, "humanReviewRequired": True, "disclaimer": "Borrador generado con asistencia de IA. Debe ser revisado antes de copiar, exportar, enviar o presentar."}
     if not result["body"]:
         raise HTTPException(422, "El modelo no produjo un borrador utilizable")
     cited_sources = [{"sourceId": source_id, **source_map[source_id]} for source_id in source_ids]

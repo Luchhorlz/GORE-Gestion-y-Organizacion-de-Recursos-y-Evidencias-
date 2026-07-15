@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 import hashlib
@@ -9,9 +8,6 @@ import math
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Callable
-
-from .config import AIConfig
-
 
 class AIProviderError(RuntimeError):
     """Error seguro que no incluye contenido jurídico ni secretos."""
@@ -32,81 +28,6 @@ class AIProvider(ABC):
 
     @abstractmethod
     def create_embeddings(self, texts: list[str], model: str) -> list[list[float]]: ...
-
-
-class LocalAIProvider(AIProvider):
-    def __init__(self, config: AIConfig):
-        self.config = config
-
-    def _request(self, path: str, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
-        request = urllib.request.Request(
-            f"{self.config.ollama_base_url}{path}", data=data,
-            headers={"Content-Type": "application/json"} if data else {},
-            method="POST" if data else "GET",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout or self.config.request_timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            raise AIProviderError("Ollama no está disponible o no respondió a tiempo") from error
-
-    def health_check(self) -> dict[str, Any]:
-        try:
-            version = self._request("/api/version", timeout=5).get("version", "")
-            return {"available": True, "version": str(version)}
-        except AIProviderError:
-            return {"available": False, "version": ""}
-
-    def list_available_models(self) -> list[str]:
-        result = self._request("/api/tags", timeout=10)
-        return sorted(str(item.get("name", "")) for item in result.get("models", []) if item.get("name"))
-
-    def generate(self, prompt: str, model: str, *, think: bool = False, context_size: int = 3072, cancel_check: Callable[[], bool] | None = None, timeout: int | None = None) -> str:
-        payload = {
-            "model": model, "prompt": prompt, "stream": False, "think": think,
-            "keep_alive": "30s",
-            "options": {"temperature": 0, "num_predict": 240, "num_ctx": context_size, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
-        }
-        if cancel_check is not None:
-            payload["stream"] = True
-            request = urllib.request.Request(f"{self.config.ollama_base_url}/api/generate", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
-            fragments: list[str] = []
-            try:
-                with urllib.request.urlopen(request, timeout=timeout or self.config.request_timeout) as response:
-                    for raw_line in response:
-                        if cancel_check():
-                            response.close()
-                            raise AIProviderError("Generación cancelada por el usuario")
-                        if raw_line.strip(): fragments.append(str(json.loads(raw_line.decode("utf-8")).get("response", "")))
-                return "".join(fragments).strip()
-            except AIProviderError: raise
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-                raise AIProviderError("Ollama no está disponible o no respondió a tiempo") from error
-        result = self._request("/api/generate", payload)
-        return str(result.get("response", "")).strip()
-
-    def generate_structured(self, prompt: str, model: str, schema: dict[str, Any]) -> dict[str, Any]:
-        token_limit = 700 if "body" in schema.get("properties", {}) else 520 if "items" in schema.get("properties", {}) or "dates" in schema.get("properties", {}) else 500 if "contradictions" in schema.get("properties", {}) else 420 if "executive_summary" in schema.get("properties", {}) or "events" in schema.get("properties", {}) else 180
-        result = self._request("/api/generate", {
-            "model": model, "prompt": prompt, "stream": False, "think": False,
-            "keep_alive": "30s", "format": schema,
-            "options": {"temperature": 0, "num_predict": token_limit, "num_ctx": 3072, "num_batch": 32, "num_thread": max(1, (os.cpu_count() or 4) // 2)},
-        })
-        try:
-            parsed = json.loads(str(result.get("response", "")))
-        except json.JSONDecodeError as error:
-            raise AIProviderError("El modelo no devolvió una respuesta estructurada válida") from error
-        if not isinstance(parsed, dict):
-            raise AIProviderError("El resultado estructurado no es un objeto")
-        return parsed
-
-    def create_embeddings(self, texts: list[str], model: str) -> list[list[float]]:
-        result = self._request("/api/embed", {"model": model, "input": texts})
-        embeddings = result.get("embeddings", [])
-        if len(embeddings) != len(texts):
-            raise AIProviderError("Ollama devolvió una cantidad inesperada de vectores")
-        return embeddings
 
 
 class GroqAIProvider(AIProvider):
