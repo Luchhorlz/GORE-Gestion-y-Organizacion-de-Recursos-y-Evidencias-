@@ -123,12 +123,14 @@ class IsolationTests(unittest.TestCase):
     def test_ai_history_is_scoped_and_returns_safe_metadata(self):
         now = self.module.utc_now()
         with self.module.database() as db:
-            db.execute("INSERT INTO ai_analyses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ANL-HISTORY-LOCAL", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "case_summary", "completed", "balanced", "mock-chat", '{"executiveSummary":"Resumen local comprobable"}', '[]', 1, self.module.DEFAULT_USER_ID, now, now))
+            db.execute("INSERT INTO ai_analyses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ANL-HISTORY-LOCAL", self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, "case_summary", "completed", "balanced", "mock-chat", '{"executiveSummary":"Resumen local comprobable"}', '[{"sourceId":"S1","evidenceId":"EVD-LOCAL","evidenceName":"local.pdf","sectionLabel":"Página 2","text":"Fragmento verificable","textHash":"abc123","method":"pdf_text"}]', 1, self.module.DEFAULT_USER_ID, now, now))
             db.execute("INSERT INTO ai_analyses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ANL-HISTORY-FOREIGN", "TENANT-OTHER", "CASE-OTHER", "case_summary", "completed", "balanced", "mock-chat", '{"executiveSummary":"Contenido ajeno secreto"}', '[]', 1, "USER-OTHER", now, now))
         response = self.client.get("/api/ai/history")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("ANL-HISTORY-LOCAL", response.text)
         self.assertIn("Resumen local comprobable", response.text)
+        self.assertIn("Fragmento verificable", response.text)
+        self.assertIn("Página 2", response.text)
         self.assertNotIn("ANL-HISTORY-FOREIGN", response.text)
         self.assertNotIn("Contenido ajeno secreto", response.text)
 

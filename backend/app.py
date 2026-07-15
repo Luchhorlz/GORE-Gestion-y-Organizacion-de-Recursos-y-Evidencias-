@@ -613,7 +613,10 @@ CONVERSACIÓN:
 
 def ai_chat_worker() -> None:
     while True:
-        if not process_next_ai_chat_job(): time.sleep(1.5)
+        try:
+            if not process_next_ai_chat_job(): time.sleep(1.5)
+        except sqlite3.Error:
+            time.sleep(2)
 
 
 def start_ai_chat_worker() -> None:
@@ -1129,7 +1132,10 @@ def list_ai_analysis_history(request: Request, limit: int = 50) -> list[dict]:
         history.append({
             "id": row["id"], "type": row["analysis_type"], "status": row["status"], "profile": row["profile"], "model": row["model"],
             "preview": re.sub(r"\s+", " ", preview).strip()[:320], "sourceCount": len(sources),
-            "sources": [{"sourceId": item.get("sourceId", ""), "evidenceId": item.get("evidenceId", ""), "evidenceName": item.get("evidenceName", "")} for item in sources],
+            "sources": [{
+                "sourceId": item.get("sourceId", ""), "evidenceId": item.get("evidenceId", ""), "evidenceName": item.get("evidenceName", ""),
+                "sectionLabel": item.get("sectionLabel", ""), "text": str(item.get("text", ""))[:1400], "textHash": item.get("textHash", ""), "method": item.get("method", ""),
+            } for item in sources],
             "humanReviewRequired": bool(row["human_review_required"]), "generatedAt": row["created_at"],
         })
     return history
