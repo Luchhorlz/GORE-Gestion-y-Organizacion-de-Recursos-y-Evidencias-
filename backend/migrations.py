@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 14
 
 
 def _utc_now() -> str:
@@ -437,6 +437,23 @@ def _migration_013_remote_ai_provider(db: sqlite3.Connection) -> None:
     _add_column(db, "ai_settings", "remote_model TEXT NOT NULL DEFAULT 'openai/gpt-oss-120b'")
 
 
+def _migration_014_ai_action_proposals(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ai_action_proposals (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES law_firms(id),
+            case_id TEXT NOT NULL REFERENCES cases(id), conversation_id TEXT NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+            assistant_message_id TEXT NOT NULL REFERENCES ai_chat_messages(id) ON DELETE CASCADE,
+            action_type TEXT NOT NULL, payload_json TEXT NOT NULL, source_ids_json TEXT NOT NULL DEFAULT '[]',
+            rationale TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending_review',
+            approved_entity_id TEXT, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_action_proposals_message ON ai_action_proposals(assistant_message_id,status);
+        CREATE INDEX IF NOT EXISTS idx_ai_action_proposals_scope ON ai_action_proposals(tenant_id,case_id,status,created_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -451,6 +468,7 @@ MIGRATIONS = {
     11: _migration_011_ai_conversation_archiving,
     12: _migration_012_whatsapp_incremental_analysis,
     13: _migration_013_remote_ai_provider,
+    14: _migration_014_ai_action_proposals,
 }
 
 

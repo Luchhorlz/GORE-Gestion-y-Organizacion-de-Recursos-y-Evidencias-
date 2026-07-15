@@ -147,12 +147,9 @@ class GroqAIProvider(AIProvider):
             raise AIProviderError("GroqCloud no está disponible o no respondió a tiempo") from error
 
     def health_check(self) -> dict[str, Any]:
-        if not self.api_key: return {"available": False, "version": ""}
-        try:
-            self._request("/models", timeout=15)
-            return {"available": True, "version": "GroqCloud"}
-        except AIProviderError:
-            return {"available": False, "version": ""}
+        # La clave ya se valida con una generación real al guardarla. Evitamos
+        # consultar /models: algunos proyectos gratuitos bloquean ese listado.
+        return {"available": bool(self.api_key), "version": "GroqCloud" if self.api_key else ""}
 
     def list_available_models(self) -> list[str]:
         return sorted(str(item.get("id", "")) for item in self._request("/models", timeout=20).get("data", []) if item.get("id"))

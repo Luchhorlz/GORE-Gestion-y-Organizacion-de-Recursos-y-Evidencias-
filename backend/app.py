@@ -571,6 +571,8 @@ REGLAS:
 - Si el usuario responde incógnitas, enumerá qué quedó aclarado por él y qué sigue pendiente, indicando expresamente su origen.
 - No inventes hechos, normas, delitos, diagnósticos ni intenciones. No des asesoramiento jurídico definitivo.
 - Citá S1/S2 cuando afirmes algo proveniente de una evidencia. Diferenciá transcripciones auxiliares del original.
+- Tenés acceso de lectura a configuración, acontecimientos, bóveda, WhatsApp, transcripciones y auditoría incluidos como fuentes.
+- Sólo proponé crear acontecimientos cuando el usuario lo pida expresamente. Nunca modifiques ni elimines evidencia original.
 - No reveles razonamiento interno. Ofrecé una respuesta final y, cuando corresponda, listas concretas.
 
 EVIDENCIAS:
@@ -591,13 +593,40 @@ CONVERSACIÓN:
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
         context_size = 4_096 if len(prompt) <= 11_000 else 8_192 if len(prompt) <= 25_000 else 16_384
         generation_timeout = 600 if context_size == 4_096 else 720 if context_size == 8_192 else 900
-        answer = ai_provider().generate(prompt, job["model"], think=False, context_size=context_size, cancel_check=cancel_event.is_set, timeout=generation_timeout)
+        chat_schema = {
+            "type": "object", "properties": {
+                "answer": {"type": "string"},
+                "proposed_actions": {"type": "array", "items": {"type": "object", "properties": {
+                    "action_type": {"type": "string", "enum": ["create_event"]},
+                    "date": {"type": "string"}, "time": {"type": "string"}, "category": {"type": "string"},
+                    "title": {"type": "string"}, "description": {"type": "string"},
+                    "expected": {"type": "string"}, "actual": {"type": "string"},
+                    "rationale": {"type": "string"}, "source_ids": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["action_type", "date", "time", "category", "title", "description", "expected", "actual", "rationale", "source_ids"]}},
+            }, "required": ["answer", "proposed_actions"],
+        }
+        raw = ai_provider().generate_structured(prompt + "\nDevolvé JSON con answer y proposed_actions. Si no pidieron organizar o registrar, proposed_actions debe ser [].", job["model"], chat_schema)
+        answer = str(raw.get("answer", "")).strip()
         if cancel_event.is_set(): raise AIProviderError("Generación cancelada por el usuario")
         duration_ms = round((time.perf_counter() - generation_started) * 1000)
         if not answer: raise AIProviderError("Respuesta vacía")
         now = utc_now()
         with database() as db:
             db.execute("UPDATE ai_chat_messages SET content=?,sources_json=?,status='completed',updated_at=? WHERE id=?", (answer[:20_000], json.dumps(context_items.get("sources", []), ensure_ascii=False), now, job["assistant_message_id"]))
+            valid_source_ids = {item["sourceId"] for item in context_items.get("sources", [])}
+            for item in raw.get("proposed_actions", [])[:8] if isinstance(raw.get("proposed_actions"), list) else []:
+                if item.get("action_type") != "create_event": continue
+                date_value, title, description = str(item.get("date", "")).strip(), str(item.get("title", "")).strip()[:180], str(item.get("description", "")).strip()[:3000]
+                try: datetime.strptime(date_value, "%Y-%m-%d")
+                except ValueError: continue
+                if not title or not description: continue
+                time_value = str(item.get("time", "")).strip()
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_value): time_value = "12:00"
+                source_ids = [value for value in dict.fromkeys(str(value) for value in item.get("source_ids", [])) if value in valid_source_ids]
+                if not source_ids: continue
+                proposal_id = f"ACT-{uuid.uuid4().hex[:12].upper()}"
+                payload = {"date": date_value, "time": time_value, "category": str(item.get("category", "Acontecimiento")).strip()[:80] or "Acontecimiento", "title": title, "description": description, "expected": str(item.get("expected", "")).strip()[:1000], "actual": str(item.get("actual", "")).strip()[:1000]}
+                db.execute("INSERT INTO ai_action_proposals (id,tenant_id,case_id,conversation_id,assistant_message_id,action_type,payload_json,source_ids_json,rationale,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (proposal_id, job["tenant_id"], job["case_id"], job["conversation_id"], job["assistant_message_id"], "create_event", json.dumps(payload, ensure_ascii=False), json.dumps(source_ids), str(item.get("rationale", "")).strip()[:1000], "pending_review", DEFAULT_USER_ID, now, now))
             db.execute("UPDATE ai_chat_jobs SET status='completed',progress=100,stage='Respuesta guardada',completed_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
             db.execute("UPDATE ai_conversations SET updated_at=? WHERE id=?", (now, job["conversation_id"]))
             scope = {"tenant_id": job["tenant_id"], "case_id": job["case_id"], "user_id": DEFAULT_USER_ID}
@@ -823,6 +852,53 @@ def whatsapp_text_sources(db: sqlite3.Connection, scope: dict, query: str) -> li
                 "textHash": digest, "method": f"{row['source_type']}:mensajes_guardados",
                 "messageIds": [item.get("id") for item in group],
             })
+    return results
+
+
+def case_overview_sources(db: sqlite3.Connection, scope: dict, query: str) -> list[dict]:
+    """Return compact, traceable records from every editable area of the case."""
+    results: list[dict] = []
+
+    def add(source_type: str, name: str, label: str, text: str, *, source_id: str = "", fact_date: str = "", score: float = 0.72) -> None:
+        value = text.strip()
+        if not value:
+            return
+        results.append({
+            "score": score, "sourceType": source_type, "evidenceId": source_id,
+            "evidenceName": name, "evidenceHash": "", "factDate": fact_date,
+            "eventId": source_id if source_type == "event" else "", "sectionLabel": label,
+            "sectionIndex": 1, "chunkIndex": 1, "text": value[:1800],
+            "textHash": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            "method": "gore_database_record",
+        })
+
+    case = db.execute("SELECT * FROM case_config WHERE tenant_id=? AND case_id=?", (scope["tenant_id"], scope["case_id"])).fetchone()
+    if case:
+        add("case", "Datos del expediente", "Configuración del caso", f"Código: {case['case_code']}\nTítulo: {case['title']}\nEstado: {case['status']}\nHito principal: {case['main_milestone'] or 'sin registrar'}\nModalidad anterior: {case['previous_modality'] or 'sin registrar'}", source_id=scope["case_id"], score=0.65)
+
+    event_rows = db.execute("SELECT * FROM events WHERE tenant_id=? AND case_id=? ORDER BY date DESC,time DESC LIMIT 30", (scope["tenant_id"], scope["case_id"])).fetchall()
+    event_lines = [f"{row['date']} {row['time']} · {row['category']} · {row['title']}: {row['description']} | Previsto: {row['expected'] or 'sin dato'} | Efectivo: {row['actual'] or 'sin dato'} | Estado: {row['status']}" for row in event_rows]
+    if event_lines:
+        add("events", "Acontecimientos", "Cronología registrada", "\n".join(event_lines), score=0.82)
+
+    transcript_rows = db.execute(
+        """SELECT e.id,e.original_name,e.fact_date,e.chat_message_ref,e.sha256,t.text,t.engine
+             FROM audio_transcriptions t JOIN evidence e ON e.id=t.evidence_id AND e.tenant_id=t.tenant_id AND e.case_id=t.case_id
+            WHERE t.tenant_id=? AND t.case_id=? AND t.status='completed' AND trim(t.text)<>''
+            ORDER BY t.updated_at DESC LIMIT 12""",
+        (scope["tenant_id"], scope["case_id"]),
+    ).fetchall()
+    for row in transcript_rows:
+        add("audio_transcription", row["original_name"], "Transcripción auxiliar de audio", f"Fecha: {row['fact_date'] or 'sin fecha'}\nReferencia WhatsApp: {row['chat_message_ref'] or 'sin referencia'}\nTexto transcripto: {row['text']}", source_id=row["id"], fact_date=row["fact_date"], score=0.8)
+
+    evidence_rows = db.execute("SELECT id,original_name,media_type,sha256,fact_date,event_id,match_confidence,added_at FROM evidence WHERE tenant_id=? AND case_id=? ORDER BY added_at DESC LIMIT 20", (scope["tenant_id"], scope["case_id"])).fetchall()
+    if evidence_rows:
+        lines = [f"{row['id']} · {row['original_name']} · {row['media_type']} · fecha {row['fact_date'] or 'sin fecha'} · acontecimiento {row['event_id'] or 'sin asociar'} · coincidencia {row['match_confidence'] or 'sin confirmar'} · SHA-256 {row['sha256']}" for row in evidence_rows]
+        add("vault", "Bóveda de evidencias", "Inventario preservado", "\n".join(lines), score=0.62)
+
+    audit_rows = db.execute("SELECT occurred_at,actor,action,entity_type,entity_id FROM audit_log WHERE tenant_id=? AND case_id=? ORDER BY id DESC LIMIT 15", (scope["tenant_id"], scope["case_id"])).fetchall()
+    if audit_rows:
+        add("audit", "Auditoría", "Actividad reciente", "\n".join(f"{row['occurred_at']} · {row['actor']} · {row['action']} · {row['entity_type']} {row['entity_id']}" for row in audit_rows), score=0.5)
     return results
 
 
@@ -1751,7 +1827,11 @@ def ai_conversation_dict(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
         FROM ai_chat_messages m LEFT JOIN ai_chat_jobs j ON j.assistant_message_id=m.id
         LEFT JOIN ai_feedback f ON f.target_type='chat_message' AND f.target_id=m.id AND f.tenant_id=m.tenant_id AND f.case_id=m.case_id
         WHERE m.conversation_id=? ORDER BY m.created_at""", (row["id"],)).fetchall()
-    return {**ai_conversation_summary(row), "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "status": item["status"], "feedback": {"rating": item["feedback_rating"], "comment": item["feedback_comment"], "updatedAt": item["feedback_updated_at"]} if item["feedback_rating"] else None, "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
+    action_rows = db.execute("SELECT * FROM ai_action_proposals WHERE conversation_id=? ORDER BY created_at", (row["id"],)).fetchall()
+    actions_by_message: dict[str, list[dict]] = {}
+    for action in action_rows:
+        actions_by_message.setdefault(action["assistant_message_id"], []).append({"id": action["id"], "actionType": action["action_type"], "payload": json.loads(action["payload_json"]), "sourceIds": json.loads(action["source_ids_json"]), "rationale": action["rationale"], "status": action["status"], "approvedEntityId": action["approved_entity_id"]})
+    return {**ai_conversation_summary(row), "messages": [{"id": item["id"], "role": item["role"], "content": item["content"], "userProvided": bool(item["user_provided"]), "sources": json.loads(item["sources_json"]), "actions": actions_by_message.get(item["id"], []), "status": item["status"], "feedback": {"rating": item["feedback_rating"], "comment": item["feedback_comment"], "updatedAt": item["feedback_updated_at"]} if item["feedback_rating"] else None, "job": {"id": item["job_id"], "progress": item["progress"], "stage": item["stage"], "status": item["job_status"], "model": item["model"]} if item["job_id"] else None, "createdAt": item["created_at"]} for item in messages]}
 
 
 @app.get("/api/ai/chat/conversations")
@@ -1819,15 +1899,21 @@ def get_ai_conversation(conversation_id: str, request: Request) -> dict:
 def queue_ai_chat_message(payload: AIChatMessagePayload, request: Request) -> dict:
     message = payload.message.strip()
     try:
-        retrieval = semantic_search(SemanticSearchPayload(query=message, limit=4), request)
+        retrieval = semantic_search(SemanticSearchPayload(query=message, limit=8), request)
     except HTTPException as error:
         if error.status_code != 503: raise
         retrieval = {"results": []}
+    with database() as db:
+        preview_scope = authorized_scope(request, db)
+        overview = case_overview_sources(db, preview_scope, message)
     sources: list[dict] = []; seen: set[str] = set()
-    for source in retrieval["results"]:
-        if source["evidenceId"] not in seen:
-            sources.append({"sourceId": f"S{len(sources)+1}", **source}); seen.add(source["evidenceId"])
-        if len(sources) == 3: break
+    for source in [*retrieval["results"][:6], *overview]:
+        identity = "|".join(str(source.get(key, "")) for key in ("sourceType", "chatId", "evidenceId", "textHash"))
+        if identity in seen:
+            continue
+        sources.append({"sourceId": f"S{len(sources)+1}", **source}); seen.add(identity)
+        if len(sources) == 14:
+            break
     now = utc_now()
     with database() as db:
         scope = authorized_scope(request, db)
@@ -1874,10 +1960,36 @@ def cancel_ai_chat_job(job_id: str, request: Request) -> dict:
         db.execute("UPDATE ai_chat_jobs SET status='cancelled',stage='Cancelado por el usuario',error_code='user_cancelled',completed_at=?,updated_at=? WHERE id=?", (now, now, job_id))
         db.execute("UPDATE ai_chat_messages SET content='Análisis cancelado por el usuario.',status='cancelled',updated_at=? WHERE id=?", (now, job["assistant_message_id"]))
         audit(db, "AI_CHAT_RESPONSE_CANCELLED", "ai_chat_job", job_id, {"model": job["model"]}, scope)
-    with AI_CHAT_CANCEL_LOCK:
-        event = AI_CHAT_CANCEL_EVENTS.get(job_id)
-        if event: event.set()
-    return {"id": job_id, "status": "cancelled", "cancelled": True}
+        with AI_CHAT_CANCEL_LOCK:
+            event = AI_CHAT_CANCEL_EVENTS.get(job_id)
+            if event: event.set()
+        return {"id": job_id, "status": "cancelled", "cancelled": True}
+
+
+@app.post("/api/ai/chat/actions/{proposal_id}/approve")
+def approve_ai_chat_action(proposal_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        proposal = db.execute("SELECT * FROM ai_action_proposals WHERE id=? AND tenant_id=? AND case_id=?", (proposal_id, scope["tenant_id"], scope["case_id"])).fetchone()
+        if not proposal: raise HTTPException(404, "Propuesta no encontrada")
+        if proposal["status"] != "pending_review": raise HTTPException(409, "La propuesta ya fue revisada")
+        if proposal["action_type"] != "create_event": raise HTTPException(422, "Acción no permitida")
+        payload, now = json.loads(proposal["payload_json"]), utc_now()
+        event_id = f"EVT-{payload['date'].replace('-', '')}-{uuid.uuid4().hex[:6].upper()}"
+        db.execute("INSERT INTO events (id,date,time,category,title,description,private_notes,expected,actual,status,created_at,updated_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (event_id, payload["date"], payload["time"], payload["category"], payload["title"], payload["description"], "Propuesto por IA y aprobado por el usuario.", payload["expected"], payload["actual"], "Borrador", now, now, scope["tenant_id"], scope["case_id"], scope["user_id"]))
+        db.execute("UPDATE ai_action_proposals SET status='approved',approved_entity_id=?,updated_at=? WHERE id=?", (event_id, now, proposal_id))
+        audit(db, "AI_CHAT_ACTION_APPROVED", "event", event_id, {"proposal_id": proposal_id, "source_ids": json.loads(proposal["source_ids_json"])}, scope)
+        return {"id": proposal_id, "status": "approved", "approvedEntityId": event_id}
+
+
+@app.post("/api/ai/chat/actions/{proposal_id}/reject")
+def reject_ai_chat_action(proposal_id: str, request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        updated = db.execute("UPDATE ai_action_proposals SET status='rejected',updated_at=? WHERE id=? AND tenant_id=? AND case_id=? AND status='pending_review'", (utc_now(), proposal_id, scope["tenant_id"], scope["case_id"])).rowcount
+        if not updated: raise HTTPException(404, "Propuesta pendiente no encontrada")
+        audit(db, "AI_CHAT_ACTION_REJECTED", "ai_action_proposal", proposal_id, {}, scope)
+        return {"id": proposal_id, "status": "rejected"}
 
 
 @app.post("/api/ai/chat/messages/{message_id}/feedback")
