@@ -119,7 +119,12 @@ class GroqAIProvider(AIProvider):
         request = urllib.request.Request(
             self.BASE_URL + path,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 GORE/1.0",
+            },
             method="POST" if payload is not None else "GET",
         )
         try:
