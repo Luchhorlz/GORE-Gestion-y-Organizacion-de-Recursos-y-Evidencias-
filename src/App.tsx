@@ -72,6 +72,7 @@ type View =
   | "inicio"
   | "calendario"
   | "acontecimientos"
+  | "revision"
   | "cronologia-ia"
   | "fechas"
   | "evidencias"
@@ -334,6 +335,30 @@ type AIActionProposal = {
   rationale: string;
   status: string;
   approvedEntityId?: string;
+};
+type AIReviewItem = {
+  id: string;
+  kind: "chronology" | "date" | "action";
+  actionType?: AIActionProposal["actionType"];
+  label: string;
+  title: string;
+  description: string;
+  date: string;
+  time: string;
+  confidence: number | null;
+  dateBasis?: string;
+  warning?: string;
+  sources: AssistantCitation[];
+  sourceIds: string[];
+  payload?: AIActionProposal["payload"];
+  editable: boolean;
+  conversationTitle?: string;
+  createdAt: string;
+};
+type AIReviewQueue = {
+  items: AIReviewItem[];
+  counts: { chronology: number; date: number; action: number; total: number };
+  generatedAt: string;
 };
 type AIChatMessage = {
   id: string;
@@ -598,6 +623,7 @@ const navItems: { id: View; label: string; icon: typeof Home }[] = [
   { id: "inicio", label: "Inicio", icon: Home },
   { id: "calendario", label: "Calendario", icon: CalendarDays },
   { id: "acontecimientos", label: "Acontecimientos", icon: Clock3 },
+  { id: "revision", label: "Pendientes de revisiÃ³n", icon: CheckCheck },
   { id: "evidencias", label: "Bóveda de evidencias", icon: FolderLock },
   { id: "comunicaciones", label: "Comunicaciones", icon: MessageCircle },
   { id: "whatsapp", label: "Simulador WhatsApp", icon: Phone },
@@ -679,6 +705,7 @@ function App() {
     updatedAt: "",
   });
   const [caseManagerOpen, setCaseManagerOpen] = useState(false);
+  const [reviewPendingCount, setReviewPendingCount] = useState(0);
   const [audioProgress, setAudioProgress] = useState<AudioIndexStatus | null>(
     null,
   );
@@ -710,8 +737,9 @@ function App() {
       apiGet<Workspace>("/api/workspace"),
       apiGet<LegajoSummary[]>("/api/cases"),
       apiGet<CaseContext>("/api/case/context"),
+      apiGet<AIReviewQueue>("/api/ai/review-queue"),
     ])
-      .then(([serverEvents, serverEvidence, serverCase, serverWorkspace, serverCases, serverContext]) => {
+      .then(([serverEvents, serverEvidence, serverCase, serverWorkspace, serverCases, serverContext, reviewQueue]) => {
         setBackendOnline(true);
         setEvents(serverEvents);
         setEvidence(serverEvidence);
@@ -719,6 +747,7 @@ function App() {
         setWorkspace(serverWorkspace);
         setCases(serverCases);
         setCaseContext(serverContext);
+        setReviewPendingCount(reviewQueue.counts.total);
       })
       .catch(() => setBackendOnline(false));
   }, [authenticated]);
@@ -952,6 +981,8 @@ function App() {
               openModal={openNewEvent}
               backendOnline={backendOnline}
               openEvent={openEvent}
+              caseConfig={caseConfig}
+              reviewPendingCount={reviewPendingCount}
             />
           )}
           {view === "calendario" && (
@@ -969,6 +1000,12 @@ function App() {
               openModal={openNewEvent}
               openEvent={openEvent}
               caseConfig={caseConfig}
+            />
+          )}
+          {view === "revision" && (
+            <AIReviewQueueView
+              onEventApproved={(event) => setEvents((previous) => [event, ...previous.filter((item) => item.id !== event.id)])}
+              onCountChanged={setReviewPendingCount}
             />
           )}
           {view === "cronologia-ia" && (
@@ -1254,6 +1291,8 @@ function Dashboard({
   openModal,
   backendOnline,
   openEvent,
+  caseConfig,
+  reviewPendingCount,
 }: {
   events: EventItem[];
   evidence: Evidence[];
@@ -1261,6 +1300,8 @@ function Dashboard({
   openModal: () => void;
   backendOnline: boolean;
   openEvent: (event: EventItem) => void;
+  caseConfig: CaseConfig;
+  reviewPendingCount: number;
 }) {
   const recent = [...events]
     .sort((a, b) => `${b.date}${b.time}`.localeCompare(`${a.date}${a.time}`))
@@ -1269,7 +1310,7 @@ function Dashboard({
     <>
       <section className="page-heading">
         <div>
-          <span className="eyebrow accent">EXPEDIENTE GORE-2026-001</span>
+          <span className="eyebrow accent">EXPEDIENTE {caseConfig.caseCode}</span>
           <h1>Todo lo importante, claro y en orden.</h1>
           <p>
             Un espacio privado para preservar hechos, organizar documentación y
@@ -1328,11 +1369,11 @@ function Dashboard({
           <div>
             <span>Pendientes de revisión</span>
             <strong>
-              {events.filter((e) => e.status !== "Revisado").length}
+              {reviewPendingCount}
             </strong>
             <small>requieren atención</small>
           </div>
-          <button onClick={() => go("acontecimientos")}>
+          <button onClick={() => go("revision")}>
             <ArrowRight />
           </button>
         </article>
@@ -1734,6 +1775,64 @@ function DatesView({
       </div>
     </>
   );
+}
+
+function AIReviewQueueView({ onEventApproved, onCountChanged }: { onEventApproved: (event: EventItem) => void; onCountChanged: (count: number) => void }) {
+  const [queue, setQueue] = useState<AIReviewQueue | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [workingId, setWorkingId] = useState("");
+  const [editing, setEditing] = useState<AIReviewItem | null>(null);
+  const [correction, setCorrection] = useState({ date: "", time: "", description: "", reason: "" });
+  const [error, setError] = useState("");
+  const applyQueue = (value: AIReviewQueue) => { setQueue(value); onCountChanged(value.counts.total); };
+  const refresh = () => apiGet<AIReviewQueue>("/api/ai/review-queue").then(applyQueue);
+  useEffect(() => {
+    apiGet<AIReviewQueue>("/api/ai/review-queue")
+      .then((value) => { setQueue(value); onCountChanged(value.counts.total); })
+      .catch(() => setError("No se pudo cargar la bandeja."))
+      .finally(() => setLoading(false));
+  }, [onCountChanged]);
+
+  async function review(item: AIReviewItem, decision: "approve" | "reject") {
+    setWorkingId(item.id); setError("");
+    try {
+      const base = item.kind === "chronology" ? "/api/ai/chronology/proposals" : item.kind === "date" ? "/api/ai/dates/proposals" : "/api/ai/chat/actions";
+      const result = await apiPost<{ event?: EventItem }>(`${base}/${item.id}/${decision}`, {});
+      if (decision === "approve" && result.event) onEventApproved(result.event);
+      await refresh();
+    } catch { setError("No se pudo revisar la propuesta. Puede haber sido procesada desde otra pantalla."); }
+    finally { setWorkingId(""); }
+  }
+  function beginEdit(item: AIReviewItem) {
+    setEditing(item);
+    setCorrection({ date: item.date, time: item.time, description: item.description, reason: "CorrecciÃ³n realizada por el usuario antes de aprobar" });
+  }
+  async function saveCorrection(event: React.FormEvent) {
+    event.preventDefault(); if (!editing) return;
+    setWorkingId(editing.id); setError("");
+    try {
+      const updated = await apiPut<AIReviewQueue>(`/api/ai/review-queue/${editing.kind}/${editing.id}`, correction);
+      applyQueue(updated); setEditing(null);
+    } catch { setError("No se pudo guardar la correcciÃ³n. RevisÃ¡ la fecha, la hora y la descripciÃ³n."); }
+    finally { setWorkingId(""); }
+  }
+  return <>
+    <section className="page-heading compact"><div><span className="eyebrow accent">CONTROL HUMANO OBLIGATORIO</span><h1>Pendientes de revisiÃ³n</h1><p>La IA sÃ³lo propone. AcÃ¡ decidÃ­s quÃ© se incorpora al legajo y podÃ©s corregirlo antes de aprobar.</p></div></section>
+    {queue && <section className="review-summary">
+      <div><strong>{queue.counts.total}</strong><span>Total pendiente</span></div><div><strong>{queue.counts.chronology}</strong><span>Acontecimientos</span></div><div><strong>{queue.counts.date}</strong><span>Fechas</span></div><div><strong>{queue.counts.action}</strong><span>Acciones del chat</span></div>
+    </section>}
+    {error && <p className="form-error">{error}</p>}
+    {loading ? <div className="empty-inline">Cargando propuestasâ€¦</div> : !queue?.items.length ? <div className="panel empty-inline">No hay propuestas pendientes en este legajo.</div> : <section className="review-queue">
+      {queue.items.map((item) => <article className="review-card" key={`${item.kind}-${item.id}`}>
+        <header><span>{item.label}</span><small>{item.date || "Sin fecha"}{item.time ? ` Â· ${item.time}` : ""}</small></header>
+        <h2>{item.title}</h2><p>{item.description || "Sin justificaciÃ³n adicional."}</p>
+        <div className="review-meta">{item.confidence !== null && <span>Confianza: {Math.round(item.confidence * 100)}%</span>}{item.dateBasis && <span>Base temporal: {item.dateBasis}</span>}<span>{item.sourceIds.length} fuentes citadas</span>{item.conversationTitle && <span>Chat IA: {item.conversationTitle}</span>}</div>
+        {item.warning && <small className="review-warning">{item.warning}</small>}
+        <footer>{item.editable && <button disabled={!!workingId} onClick={() => beginEdit(item)}><Pencil size={14}/> Corregir</button>}<button disabled={!!workingId} onClick={() => review(item, "reject")}>Descartar</button><button className="primary-button" disabled={!!workingId} onClick={() => review(item, "approve")}><Check size={14}/> Aprobar</button></footer>
+      </article>)}
+    </section>}
+    {editing && <div className="modal-backdrop"><form className="modal review-edit-modal" onSubmit={saveCorrection}><header className="modal-head"><div><span className="eyebrow">CORRECCIÃ“N HUMANA</span><h2>Revisar antes de aprobar</h2><p>La correcciÃ³n quedarÃ¡ registrada en AuditorÃ­a.</p></div><button type="button" onClick={() => setEditing(null)}><X/></button></header><div className="form-grid"><label>Fecha<input type="date" required value={correction.date} onChange={(e) => setCorrection({...correction,date:e.target.value})}/></label><label>Hora<input type="time" value={correction.time} onChange={(e) => setCorrection({...correction,time:e.target.value})}/></label><label className="full">DescripciÃ³n<textarea required value={correction.description} onChange={(e) => setCorrection({...correction,description:e.target.value})}/></label></div><footer className="modal-actions"><button type="button" onClick={() => setEditing(null)}>Cancelar</button><button className="primary-button" disabled={workingId===editing.id}><Check size={14}/> Guardar correcciÃ³n</button></footer></form></div>}
+  </>;
 }
 
 function ChronologyAIView({

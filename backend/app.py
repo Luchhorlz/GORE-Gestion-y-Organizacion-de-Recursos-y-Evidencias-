@@ -893,6 +893,13 @@ class AIFeedbackPayload(BaseModel):
     comment: str = Field(default="", max_length=1000)
 
 
+class AIReviewCorrectionPayload(BaseModel):
+    date: str = Field(default="", max_length=10)
+    time: str = Field(default="", max_length=5)
+    description: str = Field(default="", max_length=3000)
+    reason: str = Field(default="", max_length=3000)
+
+
 class AdvancedReportPayload(BaseModel):
     reportType: str = Field(min_length=3, max_length=80)
 
@@ -1798,6 +1805,48 @@ def chronology_proposal_dict(row: sqlite3.Row) -> dict:
         "sources": json.loads(row["sources_json"]), "status": row["status"],
         "approvedEventId": row["approved_event_id"], "createdAt": row["created_at"],
     }
+
+
+@app.get("/api/ai/review-queue")
+def ai_review_queue(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        chronology = db.execute("SELECT * FROM chronology_proposals WHERE tenant_id=? AND case_id=? AND status='pending_review' ORDER BY proposed_date,created_at", (scope["tenant_id"], scope["case_id"])).fetchall()
+        dates = db.execute("SELECT * FROM date_proposals WHERE tenant_id=? AND case_id=? AND status='pending_review' ORDER BY proposed_date,created_at", (scope["tenant_id"], scope["case_id"])).fetchall()
+        actions = db.execute("SELECT p.*,c.title conversation_title FROM ai_action_proposals p JOIN ai_conversations c ON c.id=p.conversation_id WHERE p.tenant_id=? AND p.case_id=? AND p.status='pending_review' ORDER BY p.created_at", (scope["tenant_id"], scope["case_id"])).fetchall()
+        items: list[dict] = []
+        for row in chronology:
+            sources = json.loads(row["sources_json"])
+            items.append({"id": row["id"], "kind": "chronology", "label": "Acontecimiento propuesto", "title": row["description"][:180], "description": row["description"], "date": row["proposed_date"], "time": row["proposed_time"], "confidence": float(row["certainty"]), "dateBasis": row["date_basis"], "sources": sources, "sourceIds": [item.get("sourceId", "") for item in sources], "editable": True, "createdAt": row["created_at"]})
+        for row in dates:
+            sources = json.loads(row["sources_json"])
+            items.append({"id": row["id"], "kind": "date", "label": "Fecha sugerida", "title": row["reason"][:180], "description": row["reason"], "date": row["proposed_date"], "time": row["proposed_time"], "confidence": float(row["certainty"]), "dateBasis": row["date_basis"], "warning": row["warning"], "sources": sources, "sourceIds": [item.get("sourceId", "") for item in sources], "editable": True, "createdAt": row["created_at"]})
+        labels = {"create_event": "Crear acontecimiento", "link_evidence_to_event": "Asociar evidencia", "update_event_category": "Reclasificar acontecimiento", "update_event_details": "Corregir acontecimiento", "update_report": "Actualizar informe"}
+        for row in actions:
+            payload = json.loads(row["payload_json"]); source_ids = json.loads(row["source_ids_json"])
+            title = payload.get("title") or payload.get("eventTitle") or payload.get("newTitle") or payload.get("evidenceName") or labels.get(row["action_type"], "AcciÃ³n propuesta")
+            items.append({"id": row["id"], "kind": "action", "actionType": row["action_type"], "label": labels.get(row["action_type"], "AcciÃ³n propuesta"), "title": str(title)[:180], "description": row["rationale"], "date": payload.get("date", ""), "time": payload.get("time", ""), "confidence": None, "sources": [], "sourceIds": source_ids, "payload": payload, "editable": False, "conversationTitle": row["conversation_title"], "createdAt": row["created_at"]})
+        items.sort(key=lambda item: item["createdAt"])
+        counts = {"chronology": len(chronology), "date": len(dates), "action": len(actions)}
+        return {"items": items, "counts": {**counts, "total": len(items)}, "generatedAt": utc_now()}
+
+
+@app.put("/api/ai/review-queue/{kind}/{proposal_id}")
+def correct_ai_review_item(kind: str, proposal_id: str, payload: AIReviewCorrectionPayload, request: Request) -> dict:
+    if kind not in {"chronology", "date"}: raise HTTPException(422, "Esta propuesta debe corregirse desde su herramienta de origen")
+    if not payload.date or not payload.description.strip(): raise HTTPException(422, "CompletÃ¡ la fecha y la descripciÃ³n")
+    try: datetime.strptime(payload.date, "%Y-%m-%d")
+    except ValueError: raise HTTPException(422, "La fecha no es vÃ¡lida")
+    if payload.time and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", payload.time): raise HTTPException(422, "La hora no es vÃ¡lida")
+    with database() as db:
+        scope, now = authorized_scope(request, db), utc_now()
+        if kind == "chronology":
+            updated = db.execute("UPDATE chronology_proposals SET proposed_date=?,proposed_time=?,description=?,updated_at=? WHERE id=? AND tenant_id=? AND case_id=? AND status='pending_review'", (payload.date, payload.time, payload.description.strip(), now, proposal_id, scope["tenant_id"], scope["case_id"])).rowcount
+        else:
+            updated = db.execute("UPDATE date_proposals SET proposed_date=?,proposed_time=?,reason=?,updated_at=? WHERE id=? AND tenant_id=? AND case_id=? AND status='pending_review'", (payload.date, payload.time, payload.description.strip(), now, proposal_id, scope["tenant_id"], scope["case_id"])).rowcount
+        if not updated: raise HTTPException(404, "Propuesta pendiente no encontrada")
+        audit(db, "AI_REVIEW_ITEM_CORRECTED", f"{kind}_proposal", proposal_id, {"date": payload.date, "time": payload.time, "description_sha256": hashlib.sha256(payload.description.strip().encode()).hexdigest()}, scope)
+    return ai_review_queue(request)
 
 
 @app.get("/api/ai/chronology/proposals")

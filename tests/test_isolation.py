@@ -122,6 +122,22 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("Informe actualizado", report["result_json"])
         self.assertEqual(versions, 1)
 
+    def test_unified_review_queue_supports_audited_correction(self):
+        now = self.module.utc_now(); scope = (self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, self.module.DEFAULT_USER_ID)
+        with self.module.database() as db:
+            db.execute("INSERT INTO chronology_proposals (id,tenant_id,case_id,proposed_date,proposed_time,description,people_json,certainty,date_basis,sources_json,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("CHR-QUEUE-TEST", scope[0], scope[1], "2026-07-10", "10:00", "DescripciÃ³n inicial", "[]", 0.8, "explicit", "[]", "pending_review", scope[2], now, now))
+        queue = self.client.get("/api/ai/review-queue")
+        self.assertEqual(queue.status_code, 200, queue.text)
+        self.assertTrue(any(item["id"] == "CHR-QUEUE-TEST" for item in queue.json()["items"]))
+        corrected = self.client.put("/api/ai/review-queue/chronology/CHR-QUEUE-TEST", json={"date": "2026-07-11", "time": "11:30", "description": "DescripciÃ³n corregida", "reason": "CorrecciÃ³n humana"})
+        self.assertEqual(corrected.status_code, 200, corrected.text)
+        with self.module.database() as db:
+            row = db.execute("SELECT proposed_date,proposed_time,description FROM chronology_proposals WHERE id='CHR-QUEUE-TEST'").fetchone()
+            audit_count = db.execute("SELECT COUNT(*) FROM audit_log WHERE action='AI_REVIEW_ITEM_CORRECTED' AND entity_id='CHR-QUEUE-TEST'").fetchone()[0]
+        self.assertEqual(tuple(row), ("2026-07-11", "11:30", "DescripciÃ³n corregida"))
+        self.assertEqual(audit_count, 1)
+        self.assertEqual(self.client.post("/api/ai/chronology/proposals/CHR-QUEUE-TEST/reject", json={}).status_code, 200)
+
     def test_ai_rate_limit_returns_safe_retry_response(self):
         original_limit = self.module.AI_RATE_MAX_REQUESTS
         self.module.AI_RATE_MAX_REQUESTS = 1
