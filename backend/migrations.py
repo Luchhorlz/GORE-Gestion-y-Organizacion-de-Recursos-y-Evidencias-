@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 17
+LATEST_SCHEMA_VERSION = 18
 
 
 def _utc_now() -> str:
@@ -530,6 +530,23 @@ def _migration_017_report_versions(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_018_whatsapp_analysis_certificates(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_analysis_certificates (
+            id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES whatsapp_chats(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            corpus_hash TEXT NOT NULL, total_messages INTEGER NOT NULL, covered_messages INTEGER NOT NULL,
+            segment_count INTEGER NOT NULL, transcript_sources INTEGER NOT NULL,
+            gaps_json TEXT NOT NULL DEFAULT '[]', overlaps_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL, generated_at TEXT NOT NULL,
+            UNIQUE(chat_id,corpus_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_certificates_scope ON whatsapp_analysis_certificates(tenant_id,case_id,chat_id,generated_at);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -548,6 +565,7 @@ MIGRATIONS = {
     15: _migration_015_whatsapp_analysis_segments,
     16: _migration_016_multiple_cases_and_context,
     17: _migration_017_report_versions,
+    18: _migration_018_whatsapp_analysis_certificates,
 }
 
 

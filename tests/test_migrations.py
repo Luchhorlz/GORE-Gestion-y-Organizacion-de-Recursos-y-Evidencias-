@@ -32,7 +32,7 @@ class MigrationTests(unittest.TestCase):
                 db.commit()
                 before = path.read_bytes()
                 completed = apply_migrations(db, path, root / "backups")
-                self.assertEqual(completed, list(range(1, 18)))
+                self.assertEqual(completed, list(range(1, 19)))
                 event = db.execute("SELECT tenant_id,case_id,created_by,title FROM events WHERE id='EVT-1'").fetchone()
                 self.assertEqual(event, (DEFAULT_TENANT_ID, DEFAULT_CASE_ID, DEFAULT_USER_ID, "Hecho existente"))
                 evidence = db.execute("SELECT tenant_id,case_id,sha256 FROM evidence WHERE id='EVD-1'").fetchone()

@@ -1104,6 +1104,29 @@ def whatsapp_message_key(item: dict) -> str:
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 
+def certify_whatsapp_analysis(db: sqlite3.Connection, chat_id: str, tenant_id: str, case_id: str, messages: list[dict], now: str) -> dict:
+    segments = db.execute("SELECT start_index,end_index,sources_json FROM whatsapp_analysis_segments WHERE chat_id=? AND tenant_id=? AND case_id=? ORDER BY start_index,end_index", (chat_id, tenant_id, case_id)).fetchall()
+    cursor, covered, transcript_sources = 0, 0, 0
+    gaps: list[list[int]] = []; overlaps: list[list[int]] = []
+    for segment in segments:
+        start, end = int(segment["start_index"]), int(segment["end_index"])
+        if start > cursor: gaps.append([cursor, start])
+        if start < cursor: overlaps.append([start, cursor])
+        if end > cursor: covered += end - max(start, cursor)
+        cursor = max(cursor, end)
+        try: transcript_sources += sum(1 for source in json.loads(segment["sources_json"]) if source.get("sourceType") == "audio_transcription")
+        except (TypeError, json.JSONDecodeError): gaps.append([start, end])
+    if cursor < len(messages): gaps.append([cursor, len(messages)])
+    corpus_material = "\n".join(whatsapp_message_key(item) for item in messages)
+    corpus_hash = hashlib.sha256(corpus_material.encode("utf-8")).hexdigest()
+    status = "certified" if covered == len(messages) and not gaps and not overlaps and len({(int(row["start_index"]), int(row["end_index"])) for row in segments}) == len(segments) else "review_required"
+    certificate_id = f"WAC-{hashlib.sha256(f'{chat_id}|{corpus_hash}'.encode()).hexdigest()[:16].upper()}"
+    db.execute("""INSERT INTO whatsapp_analysis_certificates (id,chat_id,tenant_id,case_id,corpus_hash,total_messages,covered_messages,segment_count,transcript_sources,gaps_json,overlaps_json,status,generated_at)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id,corpus_hash) DO UPDATE SET covered_messages=excluded.covered_messages,segment_count=excluded.segment_count,transcript_sources=excluded.transcript_sources,gaps_json=excluded.gaps_json,overlaps_json=excluded.overlaps_json,status=excluded.status,generated_at=excluded.generated_at""",
+               (certificate_id, chat_id, tenant_id, case_id, corpus_hash, len(messages), covered, len(segments), transcript_sources, json.dumps(gaps), json.dumps(overlaps), status, now))
+    return {"id": certificate_id, "corpusHash": corpus_hash, "totalMessages": len(messages), "coveredMessages": covered, "segmentCount": len(segments), "transcriptSources": transcript_sources, "gaps": gaps, "overlaps": overlaps, "status": status, "generatedAt": now}
+
+
 def process_next_whatsapp_analysis_job() -> bool:
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -1188,6 +1211,9 @@ def process_next_whatsapp_analysis_job() -> bool:
             next_cursor = cursor + len(batch); complete = next_cursor >= len(messages); progress = 100 if complete else max(1, round(next_cursor / len(messages) * 100)); status = "completed" if complete else "pending"; last_key = whatsapp_message_key(messages[next_cursor - 1])
             db.execute("UPDATE whatsapp_analysis_jobs SET status=?,cursor_index=?,processed_messages=?,proposals_created=proposals_created+?,progress=?,stage=?,completed_at=?,updated_at=? WHERE id=?", (status, next_cursor, next_cursor - job["start_index"], created, progress, "Análisis incremental completo" if complete else f"{next_cursor} de {len(messages)} mensajes revisados", now if complete else None, now, job["id"]))
             db.execute("INSERT INTO whatsapp_analysis_state (chat_id,tenant_id,case_id,last_message_key,analyzed_messages,total_messages,status,last_job_id,last_completed_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_message_key=excluded.last_message_key,analyzed_messages=excluded.analyzed_messages,total_messages=excluded.total_messages,status=excluded.status,last_job_id=excluded.last_job_id,last_completed_at=excluded.last_completed_at,updated_at=excluded.updated_at", (job["chat_id"], job["tenant_id"], job["case_id"], last_key, next_cursor, len(messages), status, job["id"], now if complete else None, now))
+            if complete:
+                certificate = certify_whatsapp_analysis(db, job["chat_id"], job["tenant_id"], job["case_id"], messages, now)
+                if certificate["status"] != "certified": raise ValueError("analysis_coverage_invalid")
             audit(db, "WHATSAPP_TEXT_BATCH_ANALYZED", "whatsapp_chat", job["chat_id"], {"job_id": job["id"], "from": cursor, "to": next_cursor, "proposals": created, "complete": complete}, scope)
         return True
     except Exception as error:
@@ -3003,6 +3029,18 @@ def whatsapp_analysis_status(request: Request, chatId: str | None = None) -> dic
             segments = db.execute("SELECT COUNT(*) FROM whatsapp_analysis_segments WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()[0]
             items.append(whatsapp_analysis_status_dict(chat, state, job, segments))
         return {"items": items, "totalChats": len(items), "completeChats": sum(1 for item in items if item["totalMessages"] == item["analyzedMessages"] and item["totalMessages"] > 0), "pendingMessages": sum(item["pendingMessages"] for item in items)}
+
+
+@app.get("/api/ai/whatsapp-analysis/certificates")
+def whatsapp_analysis_certificates(request: Request) -> dict:
+    with database() as db:
+        scope = authorized_scope(request, db)
+        chats = db.execute("SELECT id,display_name FROM whatsapp_chats WHERE tenant_id=? AND case_id=? ORDER BY created_at", (scope["tenant_id"], scope["case_id"])).fetchall()
+        items = []
+        for chat in chats:
+            row = db.execute("SELECT * FROM whatsapp_analysis_certificates WHERE chat_id=? AND tenant_id=? AND case_id=? ORDER BY generated_at DESC LIMIT 1", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()
+            items.append({"chatId": chat["id"], "displayName": chat["display_name"], "status": row["status"] if row else "pending", "corpusHash": row["corpus_hash"] if row else "", "totalMessages": int(row["total_messages"]) if row else 0, "coveredMessages": int(row["covered_messages"]) if row else 0, "segmentCount": int(row["segment_count"]) if row else 0, "transcriptSources": int(row["transcript_sources"]) if row else 0, "gaps": json.loads(row["gaps_json"]) if row else [], "overlaps": json.loads(row["overlaps_json"]) if row else [], "generatedAt": row["generated_at"] if row else ""})
+        return {"items": items, "certifiedChats": sum(1 for item in items if item["status"] == "certified"), "totalChats": len(items), "allCertified": bool(items) and all(item["status"] == "certified" for item in items)}
 
 
 @app.post("/api/ai/whatsapp-analysis/{chat_id}/start")

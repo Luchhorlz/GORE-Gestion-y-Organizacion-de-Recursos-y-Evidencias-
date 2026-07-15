@@ -188,6 +188,19 @@ type WhatsAppAnalysisStatus = {
   summarySegments?: number;
   updatedAt: string;
 };
+type WhatsAppAnalysisCertificate = {
+  chatId: string;
+  displayName: string;
+  status: "pending" | "certified" | "review_required";
+  corpusHash: string;
+  totalMessages: number;
+  coveredMessages: number;
+  segmentCount: number;
+  transcriptSources: number;
+  gaps: number[][];
+  overlaps: number[][];
+  generatedAt: string;
+};
 type AssistantCitation = SemanticSearchResult & { sourceId: string };
 type AssistantAnswer = {
   question: string;
@@ -4458,6 +4471,7 @@ function WhatsAppSimulator({
   const [bulkStarting, setBulkStarting] = useState(false);
   const [writtenAnalysis, setWrittenAnalysis] =
     useState<WhatsAppAnalysisStatus | null>(null);
+  const [analysisCertificate, setAnalysisCertificate] = useState<WhatsAppAnalysisCertificate | null>(null);
   const [writtenStarting, setWrittenStarting] = useState(false);
   const refreshSavedChatsRef = useRef<
     (openLatest?: boolean) => Promise<void>
@@ -4517,15 +4531,18 @@ function WhatsAppSimulator({
   useEffect(() => {
     if (!chatId) {
       setWrittenAnalysis(null);
+      setAnalysisCertificate(null);
       return;
     }
     let active = true;
-    const refresh = () =>
-      apiGet<{ items: WhatsAppAnalysisStatus[] }>(
-        `/api/ai/whatsapp-analysis/status?chatId=${encodeURIComponent(chatId)}`,
-      )
-        .then((result) => active && setWrittenAnalysis(result.items[0] ?? null))
-        .catch(() => undefined);
+    const refresh = () => Promise.all([
+      apiGet<{ items: WhatsAppAnalysisStatus[] }>(`/api/ai/whatsapp-analysis/status?chatId=${encodeURIComponent(chatId)}`),
+      apiGet<{ items: WhatsAppAnalysisCertificate[] }>("/api/ai/whatsapp-analysis/certificates"),
+    ]).then(([status, certificates]) => {
+      if (!active) return;
+      setWrittenAnalysis(status.items[0] ?? null);
+      setAnalysisCertificate(certificates.items.find((item) => item.chatId === chatId) ?? null);
+    }).catch(() => undefined);
     refresh();
     const timer = window.setInterval(refresh, 2_000);
     return () => {
@@ -5024,6 +5041,8 @@ function WhatsAppSimulator({
             </small>
           </>
         )}
+        {analysisCertificate?.status === "certified" && <div className="analysis-certificate"><ShieldCheck size={17}/><span><strong>AnÃ¡lisis completo certificado</strong><small>{analysisCertificate.coveredMessages} de {analysisCertificate.totalMessages} mensajes cubiertos Â· {analysisCertificate.segmentCount} bloques Â· sin huecos ni duplicados</small></span><code>{analysisCertificate.corpusHash.slice(0, 12)}â€¦</code></div>}
+        {analysisCertificate?.status === "review_required" && <div className="analysis-certificate warning"><Info size={17}/><span><strong>La cobertura requiere revisiÃ³n</strong><small>Se detectaron huecos o superposiciones; GORE no considerarÃ¡ completo este chat.</small></span></div>}
       </section>
       {audioProgress && audioProgress.total > 0 && (
         <section className="wa-transcription-progress">

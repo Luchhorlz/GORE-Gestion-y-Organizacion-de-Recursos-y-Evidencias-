@@ -202,6 +202,14 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(completed["analyzedMessages"], 30)
         self.assertEqual(completed["pendingMessages"], 0)
         self.assertEqual(completed["summarySegments"], 2)
+        certificates = self.client.get("/api/ai/whatsapp-analysis/certificates")
+        self.assertEqual(certificates.status_code, 200, certificates.text)
+        certificate = next(item for item in certificates.json()["items"] if item["chatId"] == chat_id)
+        self.assertEqual(certificate["status"], "certified")
+        self.assertEqual(certificate["coveredMessages"], 30)
+        self.assertEqual(certificate["gaps"], [])
+        self.assertEqual(certificate["overlaps"], [])
+        self.assertEqual(certificate["transcriptSources"], 1)
         with self.module.database() as db:
             first_job = db.execute("SELECT start_index,cursor_index,status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at LIMIT 1", (chat_id,)).fetchone()
             self.assertEqual(tuple(first_job), (0, 30, "completed"))
@@ -220,6 +228,8 @@ class IsolationTests(unittest.TestCase):
         completed = wait_complete()
         self.assertEqual(completed["analyzedMessages"], 35)
         self.assertEqual(completed["summarySegments"], 3)
+        certificate = next(item for item in self.client.get("/api/ai/whatsapp-analysis/certificates").json()["items"] if item["chatId"] == chat_id)
+        self.assertEqual((certificate["status"], certificate["coveredMessages"], certificate["segmentCount"]), ("certified", 35, 3))
         with self.module.database() as db:
             latest_job = db.execute("SELECT start_index,cursor_index,processed_messages,status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at DESC LIMIT 1", (chat_id,)).fetchone()
             self.assertEqual(tuple(latest_job), (30, 35, 5, "completed"))
