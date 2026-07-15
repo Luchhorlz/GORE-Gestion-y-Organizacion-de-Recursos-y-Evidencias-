@@ -931,11 +931,24 @@ def case_overview_sources(db: sqlite3.Connection, scope: dict, query: str) -> li
         """SELECT e.id,e.original_name,e.fact_date,e.chat_message_ref,e.sha256,t.text,t.engine
              FROM audio_transcriptions t JOIN evidence e ON e.id=t.evidence_id AND e.tenant_id=t.tenant_id AND e.case_id=t.case_id
             WHERE t.tenant_id=? AND t.case_id=? AND t.status='completed' AND trim(t.text)<>''
-            ORDER BY t.updated_at DESC LIMIT 12""",
+            ORDER BY t.updated_at DESC LIMIT 4""",
         (scope["tenant_id"], scope["case_id"]),
     ).fetchall()
     for row in transcript_rows:
         add("audio_transcription", row["original_name"], "Transcripción auxiliar de audio", f"Fecha: {row['fact_date'] or 'sin fecha'}\nReferencia WhatsApp: {row['chat_message_ref'] or 'sin referencia'}\nTexto transcripto: {row['text']}", source_id=row["id"], fact_date=row["fact_date"], score=0.8)
+
+    segment_rows = db.execute(
+        """SELECT s.*,c.display_name FROM whatsapp_analysis_segments s
+             JOIN whatsapp_chats c ON c.id=s.chat_id AND c.tenant_id=s.tenant_id AND c.case_id=s.case_id
+            WHERE s.tenant_id=? AND s.case_id=? ORDER BY s.updated_at DESC LIMIT 12""",
+        (scope["tenant_id"], scope["case_id"]),
+    ).fetchall()
+    query_lower = query.lower()
+    for row in segment_rows:
+        summary = json.loads(row["summary_json"])
+        name_match = row["display_name"].lower() in query_lower
+        text = f"Segmento {row['id']} · mensajes {row['start_index'] + 1} a {row['end_index']}\nResumen: {summary.get('summary', '')}\nTemas: {', '.join(summary.get('themes', []))}\nSituaciones relevantes: " + " | ".join(str(item.get("description", "")) for item in summary.get("relevant_situations", [])) + "\nPreguntas pendientes: " + " | ".join(summary.get("pending_questions", []))
+        add("whatsapp_analysis", f"Análisis completo · Chat con {row['display_name']}", "Resumen incremental trazable", text, score=0.95 if name_match else 0.84)
 
     evidence_rows = db.execute("SELECT id,original_name,media_type,sha256,fact_date,event_id,match_confidence,added_at FROM evidence WHERE tenant_id=? AND case_id=? ORDER BY added_at DESC LIMIT 20", (scope["tenant_id"], scope["case_id"])).fetchall()
     if evidence_rows:
@@ -984,14 +997,52 @@ def process_next_whatsapp_analysis_job() -> bool:
                 db.execute("UPDATE whatsapp_analysis_jobs SET status='completed',progress=100,stage='Análisis incremental completo',completed_at=?,updated_at=? WHERE id=?", (now, now, job["id"]))
                 db.execute("INSERT INTO whatsapp_analysis_state (chat_id,tenant_id,case_id,last_message_key,analyzed_messages,total_messages,status,last_job_id,last_completed_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_message_key=excluded.last_message_key,analyzed_messages=excluded.analyzed_messages,total_messages=excluded.total_messages,status=excluded.status,last_job_id=excluded.last_job_id,last_completed_at=excluded.last_completed_at,updated_at=excluded.updated_at", (job["chat_id"], job["tenant_id"], job["case_id"], last_key, len(messages), len(messages), "completed", job["id"], now, now))
             return True
-        text_value = "\n".join(f"{item.get('date', 'sin fecha')} {item.get('time', '')} · {item.get('sender', 'Participante')}: {str(item.get('text', '')).strip()}" for item in batch)
+        message_ids = {str(item.get("id", "")) for item in batch}
+        with database() as db:
+            transcript_rows = db.execute(
+                """SELECT e.id,e.original_name,e.chat_message_ref,e.sha256,t.text,t.engine
+                     FROM evidence e JOIN audio_transcriptions t ON t.evidence_id=e.id AND t.tenant_id=e.tenant_id AND t.case_id=e.case_id
+                    WHERE e.tenant_id=? AND e.case_id=? AND e.chat_message_ref LIKE ?
+                      AND t.status='completed' AND trim(t.text)<>'' ORDER BY e.added_at""",
+                (job["tenant_id"], job["case_id"], f"{job['chat_id']}:%"),
+            ).fetchall()
+        transcripts_by_message: dict[str, list[sqlite3.Row]] = {}
+        for row in transcript_rows:
+            reference_id = str(row["chat_message_ref"]).rsplit(":", 1)[-1]
+            if reference_id in message_ids:
+                transcripts_by_message.setdefault(reference_id, []).append(row)
+        lines: list[str] = []
+        audio_sources: list[dict] = []
+        for item in batch:
+            message_id = str(item.get("id", ""))
+            lines.append(f"{item.get('date', 'sin fecha')} {item.get('time', '')} · {item.get('sender', 'Participante')}: {str(item.get('text', '')).strip()}")
+            for transcript in transcripts_by_message.get(message_id, [])[:2]:
+                source_id = f"S{len(audio_sources) + 2}"
+                lines.append(f"  [{source_id} TRANSCRIPCIÓN AUXILIAR DEL AUDIO {transcript['original_name']}]: {transcript['text'][:800]}")
+                audio_sources.append({"sourceId": source_id, "sourceType": "audio_transcription", "chatId": job["chat_id"], "evidenceId": transcript["id"], "evidenceName": transcript["original_name"], "evidenceHash": transcript["sha256"], "factDate": str(item.get("date", "")), "eventId": "", "sectionLabel": "Transcripción auxiliar vinculada al mensaje", "sectionIndex": 1, "chunkIndex": 1, "text": transcript["text"][:1200], "textHash": hashlib.sha256(transcript["text"].encode("utf-8")).hexdigest(), "method": transcript["engine"]})
+        text_value = "\n".join(lines)
         digest = hashlib.sha256(text_value.encode("utf-8")).hexdigest()
         source = {"sourceId": "S1", "sourceType": "whatsapp_chat", "chatId": job["chat_id"], "evidenceId": "", "evidenceName": f"Chat con {chat['display_name']}", "evidenceHash": "", "factDate": str(batch[0].get("date", "")), "eventId": "", "sectionLabel": "Mensajes escritos de WhatsApp", "sectionIndex": 1, "chunkIndex": cursor // 24 + 1, "text": text_value, "textHash": digest, "method": f"{chat['source_type']}:analisis_incremental", "messageIds": [item.get("id") for item in batch]}
         with database() as db:
             setting = db.execute("SELECT active_profile FROM ai_settings WHERE id=1").fetchone(); profile = setting["active_profile"] if setting and setting["active_profile"] in PROFILE_NAMES else AI_CONFIG.default_profile
-        raw = ai_provider().generate_structured(build_chronology_prompt(f"[S1] Fuente: {source['evidenceName']} | SHA: {digest}\n{text_value}"), AI_CONFIG.model_for(profile), CHRONOLOGY_SCHEMA)
+        segment_schema = {
+            "type": "object", "properties": {
+                "summary": {"type": "string"}, "themes": {"type": "array", "items": {"type": "string"}},
+                "relevant_situations": {"type": "array", "items": {"type": "object", "properties": {"category": {"type": "string"}, "date": {"type": "string"}, "description": {"type": "string"}, "source_refs": {"type": "array", "items": {"type": "string"}}}, "required": ["category", "date", "description", "source_refs"]}},
+                "pending_questions": {"type": "array", "items": {"type": "string"}},
+                "events": CHRONOLOGY_SCHEMA["properties"]["events"],
+            }, "required": ["summary", "themes", "relevant_situations", "pending_questions", "events"],
+        }
+        segment_prompt = build_chronology_prompt(f"[S1] Fuente: {source['evidenceName']} | SHA: {digest}\n{text_value}") + "\nAdemás de events, resumí este bloque sin conclusiones jurídicas. Identificá temas y situaciones observables como impedimentos de comunicación, insultos o descalificaciones, acuerdos, entregas, salud y escuela. source_refs debe usar S1 para mensajes escritos y el identificador de cada transcripción cuando corresponda."
+        model = AI_CONFIG.model_for(profile)
+        raw = ai_provider().generate_structured(segment_prompt, model, segment_schema)
         created = 0; now = utc_now()
         with database() as db:
+            segment_seed = f"{job['chat_id']}|{cursor}|{digest}"
+            segment_id = f"WAS-{hashlib.sha256(segment_seed.encode()).hexdigest()[:16].upper()}"
+            segment_sources = [source, *audio_sources]
+            summary = {"summary": str(raw.get("summary", "")).strip()[:1800], "themes": [str(value).strip()[:100] for value in raw.get("themes", [])[:12] if str(value).strip()], "relevant_situations": [{"category": str(value.get("category", "")).strip()[:80], "date": str(value.get("date", "")).strip()[:30], "description": str(value.get("description", "")).strip()[:500], "source_refs": [str(ref) for ref in value.get("source_refs", []) if str(ref) in {item["sourceId"] for item in segment_sources}]} for value in raw.get("relevant_situations", [])[:12] if isinstance(value, dict) and str(value.get("description", "")).strip()], "pending_questions": [str(value).strip()[:300] for value in raw.get("pending_questions", [])[:10] if str(value).strip()]}
+            db.execute("INSERT INTO whatsapp_analysis_segments (id,chat_id,tenant_id,case_id,start_index,end_index,source_hash,summary_json,sources_json,model,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET summary_json=excluded.summary_json,sources_json=excluded.sources_json,model=excluded.model,updated_at=excluded.updated_at", (segment_id, job["chat_id"], job["tenant_id"], job["case_id"], cursor, cursor + len(batch), digest, json.dumps(summary, ensure_ascii=False), json.dumps(segment_sources, ensure_ascii=False), model, now, now))
             for item in raw.get("events", [])[:3] if isinstance(raw.get("events"), list) else []:
                 date = str(item.get("date", "")).strip(); description = str(item.get("description", "")).strip()[:500]
                 try: datetime.strptime(date, "%Y-%m-%d")
@@ -2508,10 +2559,10 @@ def delete_whatsapp_chat(chat_id: str, request: Request) -> dict:
     return {"deleted": True}
 
 
-def whatsapp_analysis_status_dict(chat: sqlite3.Row, state: sqlite3.Row | None, job: sqlite3.Row | None) -> dict:
+def whatsapp_analysis_status_dict(chat: sqlite3.Row, state: sqlite3.Row | None, job: sqlite3.Row | None, summary_segments: int = 0) -> dict:
     total = len(written_whatsapp_messages(chat)); analyzed = min(int(state["analyzed_messages"]), total) if state else 0
     status = job["status"] if job else (state["status"] if state else "not_started")
-    return {"chatId": chat["id"], "displayName": chat["display_name"], "status": status, "totalMessages": total, "analyzedMessages": analyzed, "pendingMessages": max(0, total - analyzed), "percent": 100 if total == 0 else round(analyzed / total * 100), "jobId": job["id"] if job else (state["last_job_id"] if state else None), "stage": job["stage"] if job else ("Análisis completo" if total and analyzed == total else "Pendiente"), "proposalsCreated": int(job["proposals_created"]) if job else 0, "updatedAt": (job["updated_at"] if job else state["updated_at"] if state else chat["updated_at"])}
+    return {"chatId": chat["id"], "displayName": chat["display_name"], "status": status, "totalMessages": total, "analyzedMessages": analyzed, "pendingMessages": max(0, total - analyzed), "percent": 100 if total == 0 else round(analyzed / total * 100), "jobId": job["id"] if job else (state["last_job_id"] if state else None), "stage": job["stage"] if job else ("Análisis completo" if total and analyzed == total else "Pendiente"), "proposalsCreated": int(job["proposals_created"]) if job else 0, "summarySegments": summary_segments, "updatedAt": (job["updated_at"] if job else state["updated_at"] if state else chat["updated_at"])}
 
 
 @app.get("/api/ai/whatsapp-analysis/status")
@@ -2523,7 +2574,8 @@ def whatsapp_analysis_status(request: Request, chatId: str | None = None) -> dic
         for chat in chats:
             state = db.execute("SELECT * FROM whatsapp_analysis_state WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()
             job = db.execute("SELECT * FROM whatsapp_analysis_jobs WHERE chat_id=? AND tenant_id=? AND case_id=? ORDER BY created_at DESC LIMIT 1", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()
-            items.append(whatsapp_analysis_status_dict(chat, state, job))
+            segments = db.execute("SELECT COUNT(*) FROM whatsapp_analysis_segments WHERE chat_id=? AND tenant_id=? AND case_id=?", (chat["id"], scope["tenant_id"], scope["case_id"])).fetchone()[0]
+            items.append(whatsapp_analysis_status_dict(chat, state, job, segments))
         return {"items": items, "totalChats": len(items), "completeChats": sum(1 for item in items if item["totalMessages"] == item["analyzedMessages"] and item["totalMessages"] > 0), "pendingMessages": sum(item["pendingMessages"] for item in items)}
 
 

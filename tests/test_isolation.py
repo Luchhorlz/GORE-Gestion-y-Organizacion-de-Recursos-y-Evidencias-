@@ -111,14 +111,22 @@ class IsolationTests(unittest.TestCase):
                 time.sleep(0.05)
             self.fail(f"El análisis incremental no finalizó: {latest}")
         save(30)
+        with self.module.database() as db:
+            now = self.module.utc_now()
+            db.execute("INSERT INTO evidence (id,original_name,stored_name,media_type,size,sha256,chat_message_ref,added_at,tenant_id,case_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("EVD-WA-SEGMENT-AUDIO", "audio-chat.opus", "wa-segment-audio.original", "audio/ogg", 20, "c" * 64, f"{chat_id}:2", now, self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID, self.module.DEFAULT_USER_ID))
+            db.execute("INSERT INTO audio_transcriptions (evidence_id,text,status,language,engine,updated_at,tenant_id,case_id) VALUES (?,?,?,?,?,?,?,?)", ("EVD-WA-SEGMENT-AUDIO", "Transcripción auxiliar de una entrega acordada", "completed", "es", "test", now, self.module.DEFAULT_TENANT_ID, self.module.DEFAULT_CASE_ID))
         first = self.client.post(f"/api/ai/whatsapp-analysis/{chat_id}/start", json={})
         self.assertEqual(first.status_code, 200, first.text)
         completed = wait_complete()
         self.assertEqual(completed["analyzedMessages"], 30)
         self.assertEqual(completed["pendingMessages"], 0)
+        self.assertEqual(completed["summarySegments"], 2)
         with self.module.database() as db:
             first_job = db.execute("SELECT start_index,cursor_index,status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at LIMIT 1", (chat_id,)).fetchone()
             self.assertEqual(tuple(first_job), (0, 30, "completed"))
+            segments = db.execute("SELECT start_index,end_index,sources_json FROM whatsapp_analysis_segments WHERE chat_id=? ORDER BY start_index", (chat_id,)).fetchall()
+            self.assertEqual([(row["start_index"], row["end_index"]) for row in segments], [(0, 24), (24, 30)])
+            self.assertIn("EVD-WA-SEGMENT-AUDIO", segments[0]["sources_json"])
             db.execute("UPDATE whatsapp_analysis_jobs SET status='processing' WHERE id=(SELECT id FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at DESC LIMIT 1)", (chat_id,))
         self.module.recover_interrupted_processing()
         with self.module.database() as db:
@@ -130,9 +138,11 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200, second.text)
         completed = wait_complete()
         self.assertEqual(completed["analyzedMessages"], 35)
+        self.assertEqual(completed["summarySegments"], 3)
         with self.module.database() as db:
             latest_job = db.execute("SELECT start_index,cursor_index,processed_messages,status FROM whatsapp_analysis_jobs WHERE chat_id=? ORDER BY created_at DESC LIMIT 1", (chat_id,)).fetchone()
             self.assertEqual(tuple(latest_job), (30, 35, 5, "completed"))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM whatsapp_analysis_segments WHERE chat_id=?", (chat_id,)).fetchone()[0], 3)
 
     def test_ai_chat_rejects_foreign_attachment(self):
         response = self.client.post("/api/ai/chat/messages", json={"message": "Analizar adjunto", "evidenceIds": ["EVD-FOREIGN"]})

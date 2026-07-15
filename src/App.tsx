@@ -184,6 +184,7 @@ type WhatsAppAnalysisStatus = {
   jobId?: string;
   stage: string;
   proposalsCreated: number;
+  summarySegments?: number;
   updatedAt: string;
 };
 type AssistantCitation = SemanticSearchResult & { sourceId: string };
@@ -4218,7 +4219,7 @@ function WhatsAppSimulator({
       );
     } catch {
       setError(
-        "No se pudo iniciar el análisis incremental. Verificá que el chat esté guardado y Ollama activo.",
+        "No se pudo iniciar el análisis incremental. Verificá que el chat esté guardado y GroqCloud conectado.",
       );
     } finally {
       setWrittenStarting(false);
@@ -4690,7 +4691,7 @@ function WhatsAppSimulator({
             <span>
               {writtenAnalysis
                 ? `${writtenAnalysis.analyzedMessages} de ${writtenAnalysis.totalMessages} analizados · ${writtenAnalysis.pendingMessages} nuevos o pendientes`
-                : "Ollama revisará el chat completo y después solamente los mensajes nuevos."}
+                : "La IA creará un mapa trazable del chat completo y después revisará solamente los mensajes nuevos."}
             </span>
           </div>
           <button
@@ -4714,7 +4715,7 @@ function WhatsAppSimulator({
                   ? "Todo actualizado"
                   : writtenAnalysis?.status === "failed"
                     ? "Reintentar análisis"
-                    : "Analizar mensajes escritos"}
+                    : "Analizar chat y transcripciones"}
           </button>
         </div>
         {writtenAnalysis && (
@@ -4726,6 +4727,9 @@ function WhatsAppSimulator({
               {writtenAnalysis.percent}% · {writtenAnalysis.stage}
               {writtenAnalysis.proposalsCreated
                 ? ` · ${writtenAnalysis.proposalsCreated} propuestas creadas`
+                : ""}
+              {writtenAnalysis.summarySegments
+                ? ` · ${writtenAnalysis.summarySegments} bloques disponibles para el Chat del expediente`
                 : ""}
               . Podés cerrar GORE; continuará al volver a iniciar el servidor.
               Nada pasa al calendario sin aprobación.

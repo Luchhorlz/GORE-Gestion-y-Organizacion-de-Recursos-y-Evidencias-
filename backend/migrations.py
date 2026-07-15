@@ -9,7 +9,7 @@ from pathlib import Path
 DEFAULT_TENANT_ID = "TENANT-LOCAL"
 DEFAULT_USER_ID = "USER-OWNER"
 DEFAULT_CASE_ID = "CASE-PRIMARY"
-LATEST_SCHEMA_VERSION = 14
+LATEST_SCHEMA_VERSION = 15
 
 
 def _utc_now() -> str:
@@ -454,6 +454,22 @@ def _migration_014_ai_action_proposals(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_015_whatsapp_analysis_segments(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_analysis_segments (
+            id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES whatsapp_chats(id) ON DELETE CASCADE,
+            tenant_id TEXT NOT NULL REFERENCES law_firms(id), case_id TEXT NOT NULL REFERENCES cases(id),
+            start_index INTEGER NOT NULL, end_index INTEGER NOT NULL, source_hash TEXT NOT NULL,
+            summary_json TEXT NOT NULL, sources_json TEXT NOT NULL DEFAULT '[]', model TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(chat_id,start_index,end_index,source_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_segments_scope ON whatsapp_analysis_segments(tenant_id,case_id,chat_id,start_index);
+        """
+    )
+
+
 MIGRATIONS = {
     1: _migration_001_workspace_isolation,
     2: _migration_002_evidence_processing_queue,
@@ -469,6 +485,7 @@ MIGRATIONS = {
     12: _migration_012_whatsapp_incremental_analysis,
     13: _migration_013_remote_ai_provider,
     14: _migration_014_ai_action_proposals,
+    15: _migration_015_whatsapp_analysis_segments,
 }
 
 
